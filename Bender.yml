@@ -1,0 +1,60 @@
+package:
+  name: insitu-cache
+  authors:
+    - "Chi Zhang <chizhang@ethz.ch>"
+
+dependencies:
+  axi:          { git: "https://github.com/pulp-platform/axi.git",                version: 0.39.0-beta.2 }
+  common_cells: { git: "https://github.com/pulp-platform/common_cells.git",       version: 1.26.0        }
+  register_interface: { git: "https://github.com/pulp-platform/register_interface.git", version: 0.3.6 }
+
+export_include_dirs:
+- include
+
+sources:
+
+  - target: rtl
+    defines:
+      ENABLE_MULTI_READ_PEND: ~
+      INSITU_CACHE_CORE_USE_MSHR_PADING: ~
+    files:
+    #level1
+    - src/insitu_cache/insitu_cache_pkg.sv
+    - src/utilities/pseudo_dual_port_bank.sv
+    - src/utilities/pseudo_dual_port_way.sv
+    - src/utilities/pseudo_dual_port_fifo.sv
+    - src/utilities/cache_to_axi.sv
+    - src/utilities/decouple_channels_adapter.sv
+    - src/utilities/decouple_queue_sync.sv
+    - src/utilities/id_buffer.sv
+    #level2
+    - src/coalesce_unit/par_coalescer/non_coalescer.sv
+    - src/coalesce_unit/par_coalescer/req_coalescer_v2.sv
+    - src/coalesce_unit/par_coalescer/rsp_spliter_v2.sv
+    - src/coalesce_unit/par_coalescer/par_coalescer_equal_window.sv
+    - src/coalesce_unit/par_coalescer/par_coalescer_extend_window.sv
+    - src/coalesce_unit/par_coalescer/par_coalescer_top.sv
+    - src/coalesce_unit/seq_coalescer/seq_coalescer_req_merger.sv
+    - src/coalesce_unit/seq_coalescer/seq_coalescer_multi_req_merger.sv
+    - src/coalesce_unit/seq_coalescer/seq_coalescer_top.sv
+    - src/coalesce_unit/wirte_merger/write_through_merger.sv
+    #level3
+    - src/insitu_cache/insitu_cache_decoder.sv
+    - src/insitu_cache/insitu_cache_encoder.sv
+    - src/insitu_cache/insitu_cache_core.sv
+    - src/insitu_cache/insitu_cache_top.sv
+    - src/insitu_cache/insitu_cache_tcdm_wrapper.sv
+    - src/insitu_cache/insitu_cache_tcdm_wrapper_partitionable_flushable.sv
+    #level4
+    - src/flamingo/flamingo_spatz_cache_ctrl.sv
+    - src/cachepool/cachepool_cache_ctrl.sv
+  
+  - target: insitu_test
+    files:
+      #dramsys
+      - src/dep/dram_rtl_sim/src/sim_dram.sv
+      - src/dep/dram_rtl_sim/src/axi_dram_sim.sv
+      - src/dep/dram_rtl_sim/src/dram_sim_engine.sv
+      #testbench
+      - test/tb_insitu_cache.sv
+

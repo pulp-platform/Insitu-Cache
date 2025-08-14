@@ -1,0 +1,1449 @@
+// Copyright 2023 ETH Zurich and 
+// University of Bologna
+
+// Solderpad Hardware License
+// Version 0.51, see LICENSE for details.
+
+// SPDX-License-Identifier: SHL-0.51
+
+// Author: Chi Zhang <chizhang@iis.ee.ethz.ch>, ETH Zurich
+// Date: 21.Dec.2023
+
+// Insitu-Cache tcdm wrapper
+//  TCDM organization (for data banks):
+//                    |<-   SetAssociativity   ->|
+//         |<- NumPseudoDualBanks ->|<- NumPseudoDualBanks ->|
+//      ---       Bank     Bank            Bank     Bank
+//       ^        Bank     Bank            Bank     Bank
+//       |        Bank     Bank            Bank     Bank
+//    Word Per    Bank     Bank            Bank     Bank
+//   Cache Line   Bank     Bank            Bank     Bank
+//       |        Bank     Bank            Bank     Bank
+//       v        Bank     Bank            Bank     Bank
+//      ---       Bank     Bank            Bank     Bank
+//
+//  TCDM organization (for meta banks):
+//                    |<-   SetAssociativity   ->|
+//         |<- NumPseudoDualBanks ->|<- NumPseudoDualBanks ->|
+//      ---       Bank     Bank            Bank     Bank
+
+
+`include "common_cells/registers.svh"
+`include "insitu_cache/hash.svh"
+module insitu_cache_tcdm_wrapper
+  import insitu_cache_pkg::*;
+  #(
+    /// Address width of both upstream narrow request and downstream wide request
+    parameter int unsigned ReqAddrWidth             = 32,
+    /// Information payload needed for each narrow data
+    parameter type         info_t                   = logic,
+    /// Word width of cache line (512b default)
+    parameter int unsigned CacheLineWidth           = 512,
+    /// Number of Cache entries
+    parameter int unsigned NumCacheEntry            = 512,
+    /// Number of Associatity
+    parameter int unsigned SetAssociativity         = 2,
+    /// Number of Pseudo-Dual Banks
+    parameter int unsigned NumPseudoDualBanks       = 1,
+    /// Width of word (granularity of non-blocking write)
+    parameter int unsigned WordWidth                = 32,
+    /// Log Debug information for questa-sim.
+    parameter int unsigned LogDebug                 = 1,
+    /// Counter cache line life cycle information for questa-sim.
+    parameter int unsigned LogLifeCycle             = 0,
+    /// Depth of Write Through Fifo.
+    parameter int unsigned WriteThroughFifoDepth    = 4,
+    /// Depth of Write Info Fifo.
+    parameter int unsigned WRespFifoDepth           = 4,
+    /// Depth of Retrieve Fifo.
+    parameter int unsigned RetrFifoDepth            = 4,
+    /// Depth of Response Fifo.
+    parameter int unsigned RespFifoDepth            = 4,
+    /// Depth of Miss Fifo.
+    parameter int unsigned MissFifoDepth            = 4,
+    /// Depth of Eviction Fifo.
+    parameter int unsigned EvicFifoDepth            = 4,
+    /// Address Hashing Field Length.
+    parameter int unsigned AddrHashLength           = 0,
+    /// Whether the cache is in Write-Through mode
+    /// Otherwise the cache is defualtly in Write-Back mode
+    parameter bit          WriteThroughMode         = 0,
+`ifndef TARGET_SYNTHESIS
+    /// Name the cache
+    parameter string       ModeleName               = "none",
+`endif
+    /// Word width of narrow data to upstream
+    parameter int unsigned UpstreamWidth            = CacheLineWidth,
+    /// Word width of wide data from downsteam
+    parameter int unsigned DownstreamWidth          = CacheLineWidth,
+    // Dependent parameter, do not override. Depth of cache bank.
+    localparam int unsigned CacheBankDepth          = NumCacheEntry/SetAssociativity,
+    // Dependent parameter, do not override. Number of data bank per way.
+    localparam int unsigned NumDataBankPerWay       = NumPseudoDualBanks * (CacheLineWidth/WordWidth),
+    // Dependent parameter, do not override. Number of meta bank per way.
+    localparam int unsigned NumMetaBankPerWay       = NumPseudoDualBanks,
+    // Dependent parameter, do not override. Address type.
+    localparam type tcdm_bank_addr_t                = logic [$clog2(CacheBankDepth)-$clog2(NumPseudoDualBanks)-1:0],
+    /// Dependent parameter, do not override. word type
+    localparam type word_t                          = logic [WordWidth-1:0],
+    /// Dependent parameter, do not override. word type
+    localparam type tcdm_meta_data_t                = logic [63:0],
+    // Dependent parameter, do not override. set ptr type.
+    localparam type way_ptr_t                       = logic [$clog2(SetAssociativity)-1:0],
+    // Dependent parameter, do not override. Address type.
+    localparam type addr_t                          = logic [ReqAddrWidth-1:0],
+    // Dependent parameter, do not override. Narrow word type.
+    localparam type upstream_data_t                 = logic [UpstreamWidth-1:0],
+    // Dependent parameter, do not override. Wide word type.
+    localparam type downstream_data_t               = logic [DownstreamWidth-1:0],
+    // Dependent parameter, do not override. Wide word type.
+    localparam type cache_data_t                    = logic [DownstreamWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type cache_mask_t                    = logic [DownstreamWidth/WordWidth-1:0],
+    // Dependent parameter, do not override. tag type.
+    localparam type cache_tag_t                     = logic [ReqAddrWidth-$clog2(DownstreamWidth/8)-$clog2(CacheBankDepth)-1:0],
+    // Dependent parameter, do not override. bank depth ptr type.
+    localparam type cache_bank_depth_ptr_t          = logic [$clog2(CacheBankDepth)-1:0],
+    // Dependent parameter, do not override. Byte offset type.
+    localparam type byte_offset_t                   = logic [$clog2(CacheLineWidth/8)-1:0],
+    // Dependent parameter, do not override. Downstream request payload.
+    localparam type downstream_info_t               = struct packed {logic for_write_pend; cache_bank_depth_ptr_t depth; way_ptr_t way;},
+    // Dependent parameter, do not override. Downstream request payload.
+    localparam type miss_meta_t                     = struct packed {logic is_full; logic is_prime; logic link_enable; way_ptr_t link_ptr;}
+    )(
+    /// Clock, positive edge triggered.
+    input  logic                                    clk_i,
+    /// Reset, active low.
+    input  logic                                    rst_ni,
+
+    /// Sync Control Signals
+    input  logic                                    cache_sync_valid_i,
+    output logic                                    cache_sync_ready_o,
+    /*  0-> flush+invalidation
+        1-> flush only
+        2-> invalidation only*/
+    input  logic [1:0]                              cache_sync_insn_i,
+
+    /// Partition Base for Cache
+    input cache_bank_depth_ptr_t                    cache_part_base_i,
+
+    /// Upstream request
+    input  logic                                    upstream_req_valid_i,
+    output logic                                    upstream_req_ready_o,
+    input  addr_t                                   upstream_req_addr_i,
+    input  info_t                                   upstream_req_info_i,
+    input  logic                                    upstream_req_write_i,
+    input  upstream_data_t                          upstream_req_wdata_i,
+    input  cache_mask_t                             upstream_req_wmask_i,
+
+    /// Upstream response
+    output logic                                    upstream_resp_valid_o,
+    input  logic                                    upstream_resp_ready_i,
+    output logic                                    upstream_resp_write_o,
+    output upstream_data_t                          upstream_resp_data_o,
+    output info_t                                   upstream_resp_info_o,
+
+    /// Downstream request
+    output logic                                    downstream_req_valid_o,
+    input  logic                                    downstream_req_ready_i,
+    output addr_t                                   downstream_req_addr_o,
+    output downstream_info_t                        downstream_req_info_o,
+    output logic                                    downstream_req_write_o,
+    output downstream_data_t                        downstream_req_wdata_o,
+    output cache_mask_t                             downstream_req_wmask_o,
+ 
+    /// Downsteam response
+    input  logic                                    downstream_resp_valid_i,
+    output logic                                    downstream_resp_ready_o,
+    input  downstream_data_t                        downstream_resp_data_i,
+    input  downstream_info_t                        downstream_resp_info_i,
+    input  logic                                    downstream_resp_write_i,
+
+    /// Meta Banks
+    output logic             [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_req_o,
+    output logic             [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_we_o,
+    output tcdm_bank_addr_t  [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_addr_o,
+    output tcdm_meta_data_t  [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_wdata_o,
+    output logic             [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_be_o,
+    input  tcdm_meta_data_t  [SetAssociativity-1:0][NumMetaBankPerWay-1:0]   tcdm_meta_bank_rdata_i,
+
+    /// Data Banks
+    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_req_o,
+    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_we_o,
+    output tcdm_bank_addr_t  [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_addr_o,
+    output word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_wdata_o,
+    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_be_o,
+    input  word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_rdata_i,
+
+    /// Data Bank Request GNT for Cache
+    input  logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_gnt_i
+    
+);
+
+    //////////////////////////////////////
+    //        Types Definition          //
+    //////////////////////////////////////
+
+    typedef logic [$bits(cache_status_t) + 1 + $bits(miss_meta_t) + $bits(cache_mask_t) + $bits(cache_tag_t) + $bits(way_ptr_t) - 1 : 0] cache_meta_t;
+
+    typedef struct packed {
+        cache_data_t                                        data;
+        info_t                                              info;
+        logic                                               write;
+    } cache_resp_t;
+
+    typedef struct packed {
+        addr_t                                              addr;
+        info_t                                              info;
+        logic                                               write;
+        upstream_data_t                                     wdata;
+        cache_mask_t                                        wmask;
+    } up_req_t;
+
+    typedef struct packed {
+        addr_t                                              addr;
+        downstream_info_t                                   info;
+        logic                                               write;
+        downstream_data_t                                   wdata;
+        cache_mask_t                                        wmask;
+    } down_req_t;
+
+    typedef enum logic[2:0] {
+        SYNC_CTRL_IDLE = '0,
+        SYNC_CTRL_READ_BANK,
+        SYNC_CTRL_INIT,
+        SYNC_CTRL_CHECK_PEND,
+        SYNC_CTRL_FLUSH,
+        SYNC_CTRL_INVALID,
+        SYNC_CTRL_FINISH
+    } cache_sync_ctrl_status_t;
+
+    //////////////////////////////////////
+    //        Signal Definition         //
+    //////////////////////////////////////
+
+    /*********************************/
+    /*  WriteThrough Related Signals */
+    /*********************************/
+
+    logic                                                   upstream_req_to_cache_valid;
+    logic                                                   upstream_req_to_cache_ready;
+    up_req_t                                                upstream_req_to_cache_payload;
+
+    logic                                                   write_through_valid;
+    logic                                                   write_through_ready;
+    down_req_t                                              write_through_req_payload;
+
+    /**************************/
+    /*  Cache Write Response  */
+    /**************************/
+
+    info_t                                                  winfo_fifo_in;
+    logic                                                   winfo_fifo_full;
+    logic                                                   winfo_fifo_push;
+    info_t                                                  winfo_fifo_out;
+    logic                                                   winfo_fifo_empty;
+    logic                                                   winfo_fifo_pop;
+    logic                                                   wresp_valid;
+    logic                                                   wresp_ready;
+    cache_resp_t                                            wresp_in;
+
+
+    /*************************/
+    /*  Cache Read Response  */
+    /*************************/
+
+    logic                                                   core_resp_valid;
+    logic                                                   core_resp_ready;
+    cache_data_t                                            core_resp_data;
+    info_t                                                  core_resp_info;
+    cache_resp_t                                            rresp_in;
+    cache_resp_t                                            resp_out;
+
+    /********************/
+    /*  Cache Miss Req  */
+    /********************/
+
+    logic                                                   core_miss_valid;
+    logic                                                   core_miss_ready;
+    addr_t                                                  core_miss_addr;
+    downstream_info_t                                       core_miss_info;
+    down_req_t                                              miss_req_payload;
+
+    /********************/
+    /*  Cache Evic Req  */
+    /********************/
+
+    logic                                                   core_evic_valid;
+    logic                                                   core_evic_ready;
+    addr_t                                                  core_evic_addr;
+    downstream_data_t                                       core_evic_data;
+    cache_mask_t                                            core_evic_mask;
+    down_req_t                                              evic_req_payload;
+    down_req_t                                              down_req_payload;
+
+    /***********************/
+    /*  Cache refill Resp  */
+    /***********************/
+
+    logic                                                   core_refill_valid;
+    logic                                                   core_refill_ready;
+    downstream_data_t                                       core_refill_data;
+    downstream_info_t                                       core_refill_info;
+
+
+    /*****************/
+    /*  Cache Banks  */
+    /*****************/
+
+
+    cache_meta_t            [SetAssociativity - 1 : 0]      cache_meta_read_data;
+    cache_meta_t            [SetAssociativity - 1 : 0]      cache_meta_write_data;
+
+
+    cache_bank_depth_ptr_t                                  bank_read_cache_addr;
+    logic                                                   bank_read_cache_valid;
+    logic                                                   bank_read_cache_ready;
+    logic                   [SetAssociativity - 1 : 0]      bank_read_cache_ready_per_way;
+    cache_status_t          [SetAssociativity - 1 : 0]      bank_read_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      bank_read_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      bank_read_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      bank_read_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      bank_read_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      bank_read_cache_data;
+    way_ptr_t               [SetAssociativity - 1 : 0]      bank_read_cache_LRU;
+    
+
+    cache_bank_depth_ptr_t                                  bank_write_cache_addr;
+    logic                                                   bank_write_cache_req;
+    cache_status_t          [SetAssociativity - 1 : 0]      bank_write_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      bank_write_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      bank_write_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      bank_write_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      bank_write_cache_data;
+    logic                                                   bank_write_LRU_req;
+    way_ptr_t               [SetAssociativity - 1 : 0]      bank_write_cache_LRU;
+
+    /****************/
+    /*  Cache Proc  */
+    /****************/
+    cache_bank_depth_ptr_t                                  proc_read_cache_addr;
+    logic                                                   proc_read_cache_valid;
+    logic                                                   proc_read_cache_ready;
+    cache_status_t          [SetAssociativity - 1 : 0]      proc_read_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      proc_read_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      proc_read_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      proc_read_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      proc_read_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      proc_read_cache_data;
+    way_ptr_t               [SetAssociativity - 1 : 0]      proc_read_cache_LRU;
+    
+
+    cache_bank_depth_ptr_t                                  proc_write_cache_addr;
+    logic                                                   proc_write_cache_req;
+    cache_status_t          [SetAssociativity - 1 : 0]      proc_write_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      proc_write_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      proc_write_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      proc_write_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      proc_write_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      proc_write_cache_data;
+    logic                                                   proc_write_LRU_req;
+    way_ptr_t               [SetAssociativity - 1 : 0]      proc_write_cache_LRU;
+
+    logic                                                   proc_write_select;
+
+    /*****************/
+    /*  Cache Flush  */
+    /*****************/
+    cache_bank_depth_ptr_t                                  flush_read_cache_addr;
+    logic                                                   flush_read_cache_valid;
+    logic                                                   flush_read_cache_ready;
+    cache_status_t          [SetAssociativity - 1 : 0]      flush_read_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      flush_read_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      flush_read_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      flush_read_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      flush_read_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      flush_read_cache_data;
+    way_ptr_t               [SetAssociativity - 1 : 0]      flush_read_cache_LRU;
+    
+
+    cache_bank_depth_ptr_t                                  flush_write_cache_addr;
+    logic                                                   flush_write_cache_req_valid;
+    logic                                                   flush_write_cache_req_ready;
+    cache_status_t          [SetAssociativity - 1 : 0]      flush_write_cache_status;
+    logic                   [SetAssociativity - 1 : 0]      flush_write_cache_dirty;
+    miss_meta_t             [SetAssociativity - 1 : 0]      flush_write_cache_miss_meta;
+    cache_mask_t            [SetAssociativity - 1 : 0]      flush_write_cache_mask;
+    cache_tag_t             [SetAssociativity - 1 : 0]      flush_write_cache_tag;
+    cache_data_t            [SetAssociativity - 1 : 0]      flush_write_cache_data;
+    way_ptr_t               [SetAssociativity - 1 : 0]      flush_write_cache_LRU;
+
+    logic                                                   flush_read_select_q, flush_read_select_d;
+    `FFARN (flush_read_select_q, flush_read_select_d,       '0, clk_i, rst_ni)
+
+    logic                                                   sync_ctrl_still_pending;
+    logic                                                   sync_ctrl_has_dirty_line;
+    way_ptr_t                                               sync_ctrl_dirty_line;
+    cache_sync_ctrl_status_t                                sync_ctrl_status_q, sync_ctrl_status_d;
+    logic [1:0]                                             sync_ctrl_insn_q, sync_ctrl_insn_d;
+    cache_bank_depth_ptr_t                                  sync_ctrl_ptr_q,sync_ctrl_ptr_d;
+    down_req_t                                              sync_ctrl_payload_q,sync_ctrl_payload_d;
+    `FFARN (sync_ctrl_status_q, sync_ctrl_status_d,         SYNC_CTRL_IDLE, clk_i, rst_ni)
+    `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
+    `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
+    `FFARN (sync_ctrl_payload_q,sync_ctrl_payload_d,        '0, clk_i, rst_ni)
+
+    /////////////////////////////////////
+    //        Instance Modules         //
+    /////////////////////////////////////
+
+    /***************************************/
+    /*  Write-through / Write-back Logics  */
+    /***************************************/
+
+    if (WriteThroughMode) begin
+
+        up_req_t                                req_fifo_wt_in;
+        logic                                   req_fifo_wt_full;
+        logic                                   req_fifo_wt_push;
+        up_req_t                                req_fifo_wt_out;
+        logic                                   req_fifo_wt_empty;
+        logic                                   req_fifo_wt_pop;
+
+        logic                                   write_through_merger_valid;
+        logic                                   write_through_merger_ready;
+
+        logic                                   write_through_valid_cut0;
+        logic                                   write_through_ready_cut0;
+        down_req_t                              write_through_req_payload_cut0;
+
+        fifo_v3 #(
+            .FALL_THROUGH                       (1'b0                       ),
+            .DEPTH                              (WriteThroughFifoDepth      ),
+            .dtype                              (up_req_t                   )
+        ) i_cache_req_fifo_wt (
+            .clk_i,
+            .rst_ni,
+            .flush_i                            (1'b0                       ),
+            .testmode_i                         (1'b0                       ),
+            .full_o                             (req_fifo_wt_full           ),
+            .empty_o                            (req_fifo_wt_empty          ),
+            .usage_o                            (/*open*/                   ),
+            .data_i                             (req_fifo_wt_in             ),
+            .push_i                             (req_fifo_wt_push           ),
+            .data_o                             (req_fifo_wt_out            ),
+            .pop_i                              (req_fifo_wt_pop            )
+        );
+
+        write_through_merger #(
+            .ReqAddrWidth                       (ReqAddrWidth),
+            .info_t                             (info_t),
+            .downstream_info_t                  (downstream_info_t),
+            .CacheLineWidth                     (CacheLineWidth),
+            .WordWidth                          (WordWidth)
+        ) i_write_through_merger (
+            .clk_i,
+            .rst_ni,
+            .upstream_req_valid_i  (write_through_merger_valid  ),
+            .upstream_req_ready_o  (write_through_merger_ready  ),
+            .upstream_req_addr_i   (cache_addr_hashing(
+                                        upstream_req_addr_i,
+                                        $clog2(DownstreamWidth/8),
+                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                        AddrHashLength
+                                    )),
+            .upstream_req_wdata_i,
+            .upstream_req_wmask_i,
+
+            .mon_read_handshaked_i (upstream_req_valid_i & upstream_req_ready_o & ~upstream_req_write_i),
+            .mon_read_addr_i       (cache_addr_hashing(
+                                        upstream_req_addr_i,
+                                        $clog2(DownstreamWidth/8),
+                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                        AddrHashLength
+                                    )),
+
+            .downstream_req_valid_o(write_through_valid_cut0),
+            .downstream_req_ready_i(write_through_ready_cut0),
+            .downstream_req_addr_o (write_through_req_payload_cut0.addr ),
+            .downstream_req_info_o (write_through_req_payload_cut0.info ),
+            .downstream_req_write_o(write_through_req_payload_cut0.write),
+            .downstream_req_wdata_o(write_through_req_payload_cut0.wdata),
+            .downstream_req_wmask_o(write_through_req_payload_cut0.wmask)
+        );
+
+
+        spill_register #(.T(down_req_t), .Bypass('0)) i_write_through_spill_register (
+            .clk_i,
+            .rst_ni,
+            .valid_i(write_through_valid_cut0       ),
+            .ready_o(write_through_ready_cut0       ),
+            .data_i (write_through_req_payload_cut0 ),
+            .valid_o(write_through_valid            ),
+            .ready_i(write_through_ready            ),
+            .data_o (write_through_req_payload      )
+        );
+
+
+        //datapath
+        assign upstream_req_to_cache_payload = req_fifo_wt_out;
+
+        assign req_fifo_wt_in = '{
+            addr:  cache_addr_hashing(
+                        upstream_req_addr_i,
+                        $clog2(DownstreamWidth/8),
+                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                        AddrHashLength
+                    ),
+            info:  upstream_req_info_i,
+            write: upstream_req_write_i,
+            wdata: upstream_req_wdata_i,
+            wmask: upstream_req_wmask_i
+        };
+
+        assign winfo_fifo_in = upstream_req_info_i;
+
+        //control logic
+        assign upstream_req_to_cache_valid = ~req_fifo_wt_empty;
+        assign req_fifo_wt_pop = upstream_req_to_cache_valid & upstream_req_to_cache_ready;
+
+        assign write_through_merger_valid = upstream_req_write_i & upstream_req_valid_i & ~req_fifo_wt_full & ~winfo_fifo_full;
+
+        assign upstream_req_ready_o =   upstream_req_write_i?
+                                        write_through_merger_valid & write_through_merger_ready:
+                                        upstream_req_valid_i & ~req_fifo_wt_full;
+
+        assign req_fifo_wt_push =       upstream_req_valid_i & upstream_req_ready_o;
+
+        assign winfo_fifo_push =        ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
+
+    end else begin
+        assign upstream_req_to_cache_valid =    upstream_req_write_i?
+                                                ~winfo_fifo_full & upstream_req_valid_i:
+                                                upstream_req_valid_i;
+        assign upstream_req_ready_o        =    upstream_req_to_cache_valid & upstream_req_to_cache_ready;
+
+        assign winfo_fifo_push             =    ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
+        assign winfo_fifo_in               =    upstream_req_info_i;
+
+        assign upstream_req_to_cache_payload.addr = cache_addr_hashing(
+                                                        upstream_req_addr_i,
+                                                        $clog2(DownstreamWidth/8),
+                                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                                        AddrHashLength
+                                                    );
+        assign upstream_req_to_cache_payload.info = upstream_req_info_i;
+        assign upstream_req_to_cache_payload.write = upstream_req_write_i;
+        assign upstream_req_to_cache_payload.wdata = upstream_req_wdata_i;
+        assign upstream_req_to_cache_payload.wmask = upstream_req_wmask_i;
+
+        /***************************************/
+        /*  Cache Flush + Invalidation Process */
+        /***************************************/
+
+        //SynC CTRL FSM
+        always_comb begin : gen_sync_ctrl_fsm
+            //Default value
+            sync_ctrl_has_dirty_line    = 1'b0;
+            sync_ctrl_dirty_line        = '0;
+            sync_ctrl_status_d          = sync_ctrl_status_q;
+            sync_ctrl_insn_d            = sync_ctrl_insn_q;
+            sync_ctrl_ptr_d             = sync_ctrl_ptr_q;
+            sync_ctrl_payload_d         = sync_ctrl_payload_q;
+
+            flush_read_cache_valid      = '0;
+            flush_read_cache_addr       = '0;
+            flush_write_cache_req_valid = '0;
+            flush_write_cache_addr      = '0;
+
+            flush_write_cache_status    = flush_read_cache_status;
+            flush_write_cache_dirty     = flush_read_cache_dirty;
+            flush_write_cache_miss_meta = flush_read_cache_miss_meta;
+            flush_write_cache_mask      = flush_read_cache_mask;
+            flush_write_cache_tag       = flush_read_cache_tag;
+            flush_write_cache_data      = flush_read_cache_data;
+            flush_write_cache_LRU       = flush_read_cache_LRU;
+
+            write_through_req_payload   = '0;
+            write_through_valid         = '0;
+
+            cache_sync_ready_o          = '0;
+
+            //FSM
+            case (sync_ctrl_status_q)
+
+                SYNC_CTRL_IDLE : begin
+                    if (cache_sync_valid_i) begin
+                        sync_ctrl_insn_d = cache_sync_insn_i;
+                        sync_ctrl_ptr_d = cache_part_base_i;
+                        if (cache_sync_insn_i == 2'b11) begin
+                            sync_ctrl_ptr_d = '0;
+                        end
+                        sync_ctrl_status_d = SYNC_CTRL_READ_BANK;
+                    end
+                end
+
+                SYNC_CTRL_READ_BANK : begin
+                    flush_read_cache_addr = sync_ctrl_ptr_q;
+                    flush_read_cache_valid = 1'b1;
+                    if (flush_read_cache_ready) begin
+                        if (sync_ctrl_insn_q == 2'b11) begin
+                            sync_ctrl_status_d = SYNC_CTRL_INIT;
+                        end else begin : proc_sync_ctrl_init
+                            sync_ctrl_status_d = SYNC_CTRL_CHECK_PEND;
+                        end
+                    end
+                end
+
+                SYNC_CTRL_INIT : begin
+                    flush_write_cache_addr      = sync_ctrl_ptr_q;
+                    flush_write_cache_status    = '0;
+                    flush_write_cache_dirty     = '0;
+                    flush_write_cache_miss_meta = '0;
+                    flush_write_cache_mask      = '0;
+                    flush_write_cache_tag       = '0;
+                    flush_write_cache_LRU       = '0;
+
+                    flush_write_cache_req_valid = 1'b1;
+                    if (flush_write_cache_req_ready) begin
+                        sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
+                        if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
+                            sync_ctrl_status_d = SYNC_CTRL_FINISH;
+                        end
+                    end
+                end
+
+                SYNC_CTRL_CHECK_PEND : begin
+                    if (~sync_ctrl_still_pending) begin
+                        sync_ctrl_status_d = SYNC_CTRL_FLUSH;
+                        sync_ctrl_ptr_d = cache_part_base_i;
+                        flush_read_cache_addr = sync_ctrl_ptr_d;
+                        flush_read_cache_valid = 1'b1;
+                    end
+                end
+
+                SYNC_CTRL_FLUSH : begin
+                    automatic byte_offset_t _ofst = '0;
+                    //Check Dirty Line
+                    for (int i = 0; i < SetAssociativity; i++) begin
+                        if ((flush_read_cache_status[i] == VALID) && (flush_read_cache_dirty[i] == 1'b1)) begin
+                            sync_ctrl_has_dirty_line = 1'b1;
+                            sync_ctrl_dirty_line = i;
+                            break;
+                        end
+                    end
+
+                    if (sync_ctrl_has_dirty_line) begin
+                        //Try to evict dirty line
+                        write_through_req_payload.addr  = {flush_read_cache_tag[sync_ctrl_dirty_line], sync_ctrl_ptr_q, _ofst};
+                        write_through_req_payload.info  = '0;
+                        write_through_req_payload.write = 1'b1;
+                        write_through_req_payload.wdata = flush_read_cache_data[sync_ctrl_dirty_line];
+                        write_through_req_payload.wmask = flush_read_cache_mask[sync_ctrl_dirty_line];
+                        write_through_valid = 1'b1;
+                        if (write_through_ready) begin
+                            //clean up the dirty line
+                            flush_write_cache_addr                          = sync_ctrl_ptr_q;
+                            flush_write_cache_status[sync_ctrl_dirty_line]  = INVALID;
+                            flush_write_cache_dirty[sync_ctrl_dirty_line]   = 1'b0;
+                            flush_write_cache_req_valid                     = 1'b1;
+                        end
+                    end else begin
+                        //clean up whole way
+                        flush_write_cache_addr      = sync_ctrl_ptr_q;
+                        flush_write_cache_status    = '0;
+                        flush_write_cache_dirty     = '0;
+                        flush_write_cache_miss_meta = '0;
+                        flush_write_cache_mask      = '0;
+                        flush_write_cache_tag       = '0;
+                        flush_write_cache_LRU       = '0;
+
+                        flush_write_cache_req_valid = 1'b1;
+                        sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
+                        if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
+                            sync_ctrl_status_d = SYNC_CTRL_FINISH;
+                        end
+                    end
+
+                    //Read Bank at Background
+                    flush_read_cache_addr = sync_ctrl_ptr_d;
+                    flush_read_cache_valid = 1'b1;
+
+                end
+
+                SYNC_CTRL_INVALID : begin
+                end
+
+                SYNC_CTRL_FINISH : begin
+                    cache_sync_ready_o = 1'b1;
+                    sync_ctrl_status_d = SYNC_CTRL_IDLE;
+                end
+
+                default : begin
+                    sync_ctrl_status_d = SYNC_CTRL_IDLE;
+                end
+            endcase
+        end
+    end
+
+    /****************/
+    /*  Cache Core  */
+    /****************/
+
+    insitu_cache_core #(
+        .ReqAddrWidth    (ReqAddrWidth),
+        .CacheLineWidth  (CacheLineWidth),
+        .info_t          (info_t),
+        .NumCacheEntry   (NumCacheEntry),
+        .SetAssociativity(SetAssociativity),
+        .WordWidth       (WordWidth),
+        .LogDebug        (LogDebug),
+        .LogLifeCycle    (LogLifeCycle),
+        .RespFifoDepth   (RespFifoDepth),
+        .RetrFifoDepth   (RetrFifoDepth),
+        .MissFifoDepth   (MissFifoDepth),
+        .EvicFifoDepth   (EvicFifoDepth),
+        .WriteThroughMode(WriteThroughMode),
+`ifndef TARGET_SYNTHESIS
+        .ModeleName      (ModeleName),
+`endif
+        .ShowDebug       (0)
+    ) i_insitu_cache_core (
+        .clk_i,
+        .rst_ni,
+        .has_pend_line_o                (sync_ctrl_still_pending),
+
+        .upstream_req_valid_i           (upstream_req_to_cache_valid),
+        .upstream_req_ready_o           (upstream_req_to_cache_ready),
+        .upstream_req_addr_i            (upstream_req_to_cache_payload.addr),
+        .upstream_req_info_i            (upstream_req_to_cache_payload.info),
+        .upstream_req_write_i           (upstream_req_to_cache_payload.write),
+        .upstream_req_wdata_i           (upstream_req_to_cache_payload.wdata),
+        .upstream_req_wmask_i           (upstream_req_to_cache_payload.wmask),
+
+        .upstream_resp_valid_o          (core_resp_valid    ),
+        .upstream_resp_ready_i          (core_resp_ready    ),
+        .upstream_resp_data_o           (core_resp_data     ),
+        .upstream_resp_info_o           (core_resp_info     ),
+
+        .downstream_req_evic_valid_o    (core_evic_valid    ),
+        .downstream_req_evic_ready_i    (core_evic_ready | WriteThroughMode   ),
+        .downstream_req_evic_addr_o     (core_evic_addr     ),
+        .downstream_req_evic_data_o     (core_evic_data     ),
+        .downstream_req_evic_mask_o     (core_evic_mask     ),
+
+
+        .downstream_req_miss_valid_o    (core_miss_valid    ),
+        .downstream_req_miss_ready_i    (core_miss_ready    ),
+        .downstream_req_miss_addr_o     (core_miss_addr     ),
+        .downstream_req_miss_info_o     (core_miss_info     ),
+
+        .downstream_resp_refill_valid_i (core_refill_valid  ),
+        .downstream_resp_refill_ready_o (core_refill_ready  ),
+        .downstream_resp_refill_info_i  (core_refill_info   ),
+        .downstream_resp_refill_data_i  (core_refill_data   ),
+
+        //Bank
+        .bank_read_addr_o               (proc_read_cache_addr),
+        .bank_read_valid_o              (proc_read_cache_valid),
+        .bank_read_ready_i              (proc_read_cache_ready),
+        .bank_read_cache_status_i       (proc_read_cache_status),
+        .bank_read_cache_dirty_i        (proc_read_cache_dirty),
+        .bank_read_cache_miss_meta_i    (proc_read_cache_miss_meta),
+        .bank_read_cache_mask_i         (proc_read_cache_mask),
+        .bank_read_cache_tag_i          (proc_read_cache_tag),
+        .bank_read_cache_data_i         (proc_read_cache_data),
+        .bank_read_cache_LRU_i          (proc_read_cache_LRU),
+
+        .bank_write_req_o               (proc_write_cache_req),
+        .bank_write_addr_o              (proc_write_cache_addr),
+        .bank_write_way_o               (/*open*/),
+        .bank_write_cache_status_o      (proc_write_cache_status),
+        .bank_write_cache_dirty_o       (proc_write_cache_dirty),
+        .bank_write_cache_miss_meta_o   (proc_write_cache_miss_meta),
+        .bank_write_cache_mask_o        (proc_write_cache_mask),
+        .bank_write_cache_tag_o         (proc_write_cache_tag),
+        .bank_write_cache_data_o        (proc_write_cache_data),
+        .bank_write_LRU_req_o           (proc_write_LRU_req),
+        .bank_write_cache_LRU_o         (proc_write_cache_LRU)
+    );
+
+    /***************************/
+    /*  Cache Response Logics  */
+    /***************************/
+
+    //Cache response write info Fifo
+    fifo_v3 #(
+        .FALL_THROUGH                       (1'b0                       ),
+        .DEPTH                              (WRespFifoDepth             ),
+        .dtype                              (info_t                     )
+    ) i_cache_winfo_fifo (
+        .clk_i,
+        .rst_ni,
+        .flush_i                            (1'b0                       ),
+        .testmode_i                         (1'b0                       ),
+        .full_o                             (winfo_fifo_full            ),
+        .empty_o                            (winfo_fifo_empty           ),
+        .usage_o                            (/*open*/                   ),
+        .data_i                             (winfo_fifo_in              ),
+        .push_i                             (winfo_fifo_push            ),
+        .data_o                             (winfo_fifo_out             ),
+        .pop_i                              (winfo_fifo_pop             )
+    );
+
+    assign wresp_valid = ~winfo_fifo_empty;
+    assign winfo_fifo_pop = wresp_valid & wresp_ready;
+    assign wresp_in = '{
+        data: '0,
+        info: winfo_fifo_out,
+        write: 1'b1
+    };
+
+    assign rresp_in = '{
+        data: core_resp_data,
+        info: core_resp_info,
+        write: 1'b0
+    };
+
+    stream_arbiter #(.DATA_T(cache_resp_t), .N_INP(2)) i_cache_resp_arbiter (
+        .clk_i,
+        .rst_ni,
+        .inp_data_i ({wresp_in,    rresp_in}),
+        .inp_valid_i({wresp_valid, core_resp_valid}),
+        .inp_ready_o({wresp_ready, core_resp_ready}),
+        .oup_data_o (resp_out),
+        .oup_valid_o(upstream_resp_valid_o),
+        .oup_ready_i(upstream_resp_ready_i)
+    );
+
+    assign {upstream_resp_data_o, upstream_resp_info_o, upstream_resp_write_o} = resp_out;
+
+
+    /*************************/
+    /*  Miss & Evic Logics  */
+    /************************/
+
+    assign miss_req_payload = '{
+        addr:  core_miss_addr,
+        info:  core_miss_info,
+        write: 1'b0,
+        wdata: '0,
+        wmask: '0
+    };
+
+    assign evic_req_payload = '{
+        addr:  core_evic_addr,
+        info:  '0,
+        write: 1'b1,
+        wdata: core_evic_data,
+        wmask: core_evic_mask
+    };
+
+    stream_arbiter #(.DATA_T(down_req_t), .N_INP(3)) i_cache_miss_evic_arbiter (
+        .clk_i,
+        .rst_ni,
+        .inp_data_i ({miss_req_payload,     evic_req_payload                    ,   write_through_req_payload}),
+        .inp_valid_i({core_miss_valid,      core_evic_valid & ~ WriteThroughMode,   write_through_valid}),
+        .inp_ready_o({core_miss_ready,      core_evic_ready                     ,   write_through_ready}),
+        .oup_data_o (down_req_payload),
+        .oup_valid_o(downstream_req_valid_o),
+        .oup_ready_i(downstream_req_ready_i)
+    );
+
+    assign downstream_req_addr_o = cache_addr_hashing(
+                                        down_req_payload.addr,
+                                        $clog2(DownstreamWidth/8),
+                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                        AddrHashLength
+                                    );
+    assign downstream_req_info_o = down_req_payload.info;
+    assign downstream_req_write_o = down_req_payload.write;
+    assign downstream_req_wdata_o = down_req_payload.wdata;
+    assign downstream_req_wmask_o = down_req_payload.wmask;
+
+    /*******************/
+    /*  Refill logics  */
+    /*******************/
+
+    assign core_refill_data = downstream_resp_data_i;
+    assign core_refill_info = downstream_resp_info_i;
+    assign core_refill_valid = downstream_resp_valid_i & ~downstream_resp_write_i;
+    assign downstream_resp_ready_o = downstream_resp_write_i? 1'b1: core_refill_ready;
+
+
+    /***********************/
+    /*  Flush Proc Arbiter */
+    /***********************/
+
+    assign flush_read_select_d         = ~proc_read_cache_valid;
+    assign bank_read_cache_valid       = flush_read_select_d? flush_read_cache_valid : proc_read_cache_valid;
+    assign proc_read_cache_ready       = bank_read_cache_ready;
+    assign flush_read_cache_ready      = flush_read_select_d? bank_read_cache_ready : '0;
+
+    assign bank_read_cache_addr        =  flush_read_select_d? flush_read_cache_addr: proc_read_cache_addr;
+
+    assign proc_read_cache_status      =  flush_read_select_q? '0: bank_read_cache_status;
+    assign proc_read_cache_dirty       =  flush_read_select_q? '0: bank_read_cache_dirty;
+    assign proc_read_cache_miss_meta   =  flush_read_select_q? '0: bank_read_cache_miss_meta;
+    assign proc_read_cache_mask        =  flush_read_select_q? '0: bank_read_cache_mask;
+    assign proc_read_cache_tag         =  flush_read_select_q? '0: bank_read_cache_tag;
+    assign proc_read_cache_data        =  flush_read_select_q? '0: bank_read_cache_data;
+    assign proc_read_cache_LRU         =  flush_read_select_q? '0: bank_read_cache_LRU;
+
+    assign flush_read_cache_status     =  ~flush_read_select_q? '0: bank_read_cache_status;
+    assign flush_read_cache_dirty      =  ~flush_read_select_q? '0: bank_read_cache_dirty;
+    assign flush_read_cache_miss_meta  =  ~flush_read_select_q? '0: bank_read_cache_miss_meta;
+    assign flush_read_cache_mask       =  ~flush_read_select_q? '0: bank_read_cache_mask;
+    assign flush_read_cache_tag        =  ~flush_read_select_q? '0: bank_read_cache_tag;
+    assign flush_read_cache_data       =  ~flush_read_select_q? '0: bank_read_cache_data;
+    assign flush_read_cache_LRU        =  ~flush_read_select_q? '0: bank_read_cache_LRU;
+
+    assign proc_write_select           = proc_write_cache_req | proc_write_LRU_req;
+    assign bank_write_cache_req        = proc_write_select? proc_write_cache_req : flush_write_cache_req_valid;
+    assign bank_write_LRU_req          = proc_write_select? proc_write_LRU_req : flush_write_cache_req_valid;
+    assign flush_write_cache_req_ready = ~proc_write_select;
+
+    assign bank_write_cache_addr       = proc_write_select? proc_write_cache_addr : flush_write_cache_addr;
+    assign bank_write_cache_status     = proc_write_select? proc_write_cache_status : flush_write_cache_status;
+    assign bank_write_cache_dirty      = proc_write_select? proc_write_cache_dirty : flush_write_cache_dirty;
+    assign bank_write_cache_miss_meta  = proc_write_select? proc_write_cache_miss_meta : flush_write_cache_miss_meta;
+    assign bank_write_cache_mask       = proc_write_select? proc_write_cache_mask : flush_write_cache_mask;
+    assign bank_write_cache_tag        = proc_write_select? proc_write_cache_tag : flush_write_cache_tag;
+    assign bank_write_cache_data       = proc_write_select? proc_write_cache_data : flush_write_cache_data;
+    assign bank_write_cache_LRU        = proc_write_select? proc_write_cache_LRU : flush_write_cache_LRU;
+
+
+    /*****************/
+    /*  Cache Banks  */
+    /*****************/
+
+    for (genvar i = 0; i < SetAssociativity; i++) begin: gen_cache_banks
+
+        logic __data_bank_read_ready;
+        logic __meta_bank_read_ready;
+
+        cache_meta_t [NumMetaBankPerWay-1:0] __tcdm_meta_rdata;
+        cache_meta_t [NumMetaBankPerWay-1:0] __tcdm_meta_wdata;
+
+        always_comb begin
+            {bank_read_cache_status[i],
+            bank_read_cache_dirty[i],
+            bank_read_cache_miss_meta[i],
+            bank_read_cache_mask[i],
+            bank_read_cache_tag[i],
+            bank_read_cache_LRU[i]} = cache_meta_read_data[i];
+
+            cache_meta_write_data[i] = {
+                bank_write_cache_status[i],
+                bank_write_cache_dirty[i],
+                bank_write_cache_miss_meta[i],
+                bank_write_cache_mask[i],
+                bank_write_cache_tag[i],
+                bank_write_cache_LRU[i]
+            };
+        end
+
+        cache_bank_depth_ptr_t  __gnt_data_bank_read_addr;
+        logic                   __gnt_data_bank_read_valid;
+        logic                   __gnt_data_bank_read_ready;
+        cache_data_t            __gnt_data_bank_read_data;
+
+        cache_bank_depth_ptr_t  __gnt_data_bank_write_addr;
+        logic                   __gnt_data_bank_write_req;
+        cache_data_t            __gnt_data_bank_write_data;
+
+        insitu_cache_bank_access_controller #(
+            .DEPTH              (CacheBankDepth),
+            .NumWordsPerLine    (CacheLineWidth/WordWidth),
+            .WordWidth          (WordWidth)
+        ) i_access_ctrl_for_data (
+            .clk_i,
+            .rst_ni,
+
+            .upstream_read_addr_i        (bank_read_cache_addr),
+            .upstream_read_valid_i       (bank_read_cache_valid),
+            .upstream_read_ready_o       (__data_bank_read_ready),
+            .upstream_read_data_o        (bank_read_cache_data[i]),
+
+            .upstream_write_addr_i       (bank_write_cache_addr),
+            .upstream_write_req_i        (bank_write_cache_req),
+            .upstream_write_data_i       (bank_write_cache_data[i]),
+
+            .downstream_read_addr_o      (__gnt_data_bank_read_addr),
+            .downstream_read_valid_o     (__gnt_data_bank_read_valid),
+            .downstream_read_ready_i     (__gnt_data_bank_read_ready),
+            .downstream_read_data_i      (__gnt_data_bank_read_data),
+
+            .downstream_write_addr_o     (__gnt_data_bank_write_addr),
+            .downstream_write_req_o      (__gnt_data_bank_write_req),
+            .downstream_write_data_o     (__gnt_data_bank_write_data),
+
+            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
+
+        );
+
+        pseudo_dual_port_tcdm_wrapper #(
+            .DEPTH              (CacheBankDepth),
+            .NumPseudoDualBanks (NumPseudoDualBanks),
+            .NumWordsPerLine    (CacheLineWidth/WordWidth),
+            .WordWidth          (WordWidth)
+        ) i_cache_data_bank (
+            .clk_i,
+            .rst_ni,
+
+            .read_addr_i        (__gnt_data_bank_read_addr),
+            .read_valid_i       (__gnt_data_bank_read_valid),
+            .read_ready_o       (__gnt_data_bank_read_ready),
+            .read_data_o        (__gnt_data_bank_read_data),
+
+            .write_addr_i       (__gnt_data_bank_write_addr),
+            .write_req_i        (__gnt_data_bank_write_req),
+            .write_data_i       (__gnt_data_bank_write_data),
+
+            .tcdm_bank_req_o    (tcdm_data_bank_req_o[i]),
+            .tcdm_bank_we_o     (tcdm_data_bank_we_o[i]),
+            .tcdm_bank_addr_o   (tcdm_data_bank_addr_o[i]),
+            .tcdm_bank_wdata_o  (tcdm_data_bank_wdata_o[i]),
+            .tcdm_bank_be_o     (tcdm_data_bank_be_o[i]),
+            .tcdm_bank_rdata_i  (tcdm_data_bank_rdata_i[i])
+        );
+
+        always_comb begin
+            for (int j = 0; j < NumMetaBankPerWay; j++) begin
+                tcdm_meta_bank_wdata_o[i][j] = '0;
+                tcdm_meta_bank_wdata_o[i][j] = __tcdm_meta_wdata[j];
+                __tcdm_meta_rdata[j] = tcdm_meta_bank_rdata_i[i][j];
+            end
+        end
+
+        cache_bank_depth_ptr_t  __gnt_meta_bank_read_addr;
+        logic                   __gnt_meta_bank_read_valid;
+        logic                   __gnt_meta_bank_read_ready;
+        cache_meta_t            __gnt_meta_bank_read_data;
+
+        cache_bank_depth_ptr_t  __gnt_meta_bank_write_addr;
+        logic                   __gnt_meta_bank_write_req;
+        cache_meta_t            __gnt_meta_bank_write_data;
+
+        insitu_cache_bank_access_controller #(
+            .DEPTH              (CacheBankDepth),
+            .NumWordsPerLine    (1),
+            .WordWidth          ($bits(cache_meta_t))
+        ) i_access_ctrl_for_meta (
+            .clk_i,
+            .rst_ni,
+
+            .upstream_read_addr_i        (bank_read_cache_addr),
+            .upstream_read_valid_i       (bank_read_cache_valid),
+            .upstream_read_ready_o       (__meta_bank_read_ready),
+            .upstream_read_data_o        (cache_meta_read_data[i]),
+
+            .upstream_write_addr_i       (bank_write_cache_addr),
+            .upstream_write_req_i        (bank_write_cache_req | bank_write_LRU_req),
+            .upstream_write_data_i       (cache_meta_write_data[i]),
+
+            .downstream_read_addr_o      (__gnt_meta_bank_read_addr),
+            .downstream_read_valid_o     (__gnt_meta_bank_read_valid),
+            .downstream_read_ready_i     (__gnt_meta_bank_read_ready),
+            .downstream_read_data_i      (__gnt_meta_bank_read_data),
+
+            .downstream_write_addr_o     (__gnt_meta_bank_write_addr),
+            .downstream_write_req_o      (__gnt_meta_bank_write_req),
+            .downstream_write_data_o     (__gnt_meta_bank_write_data),
+
+            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
+
+        );
+
+        pseudo_dual_port_tcdm_wrapper #(
+            .DEPTH              (CacheBankDepth),
+            .NumPseudoDualBanks (NumPseudoDualBanks),
+            .NumWordsPerLine    (1),
+            .WordWidth          ($bits(cache_meta_t))
+        ) i_cache_meta_bank (
+            .clk_i,
+            .rst_ni,
+
+            .read_addr_i        (__gnt_meta_bank_read_addr),
+            .read_valid_i       (__gnt_meta_bank_read_valid),
+            .read_ready_o       (__gnt_meta_bank_read_ready),
+            .read_data_o        (__gnt_meta_bank_read_data),
+
+            .write_addr_i       (__gnt_meta_bank_write_addr),
+            .write_req_i        (__gnt_meta_bank_write_req),
+            .write_data_i       (__gnt_meta_bank_write_data),
+
+            .tcdm_bank_req_o    (tcdm_meta_bank_req_o[i]),
+            .tcdm_bank_we_o     (tcdm_meta_bank_we_o[i]),
+            .tcdm_bank_addr_o   (tcdm_meta_bank_addr_o[i]),
+            .tcdm_bank_wdata_o  (__tcdm_meta_wdata),
+            .tcdm_bank_be_o     (tcdm_meta_bank_be_o[i]),
+            .tcdm_bank_rdata_i  (__tcdm_meta_rdata)
+        );
+
+        assign bank_read_cache_ready_per_way[i] = __data_bank_read_ready & __meta_bank_read_ready;
+    end
+
+    assign bank_read_cache_ready = &bank_read_cache_ready_per_way;
+
+endmodule
+
+
+
+
+
+module pseudo_dual_port_tcdm_wrapper #(
+    /// Address depth
+    parameter int unsigned  DEPTH                   = 512,
+    /// Number of banks
+    parameter int unsigned  NumPseudoDualBanks      = 2,
+    /// Number of words
+    parameter int unsigned  NumWordsPerLine         = 2,
+    /// Width of word
+    parameter int unsigned  WordWidth               = 32,
+    /// Dependent parameter, do not override. data type
+    localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
+    /// Dependent parameter, do not override. word type
+    localparam type         word_t                  = logic [WordWidth-1:0],
+    // Dependent parameter, do not override. Address type.
+    localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0],
+    // Dependent parameter, do not override. number of banks
+    localparam int unsigned NumBanks                = NumPseudoDualBanks * NumWordsPerLine,
+    // Dependent parameter, do not override. Address type.
+    localparam int unsigned SELECT_DEPTH            = (NumPseudoDualBanks > 1) ? $clog2(NumPseudoDualBanks) : 1,
+    // Dependent parameter, do not override. Select type.
+    localparam type         bank_select_t           = logic [SELECT_DEPTH-1:0],
+    // Dependent parameter, do not override. Address type.
+    localparam type         bank_addr_t             = logic [$clog2(DEPTH)-$clog2(NumPseudoDualBanks)-1:0]
+    )(
+    /// Clock, positive edge triggered.
+    input  logic                                    clk_i,
+    /// Reset, active low.
+    input  logic                                    rst_ni,
+
+    /// Read port
+    input  addr_t                                   read_addr_i,
+    input  logic                                    read_valid_i,
+    output logic                                    read_ready_o,
+    output data_t                                   read_data_o,
+
+    /// write port
+    input  addr_t                                   write_addr_i,
+    input  logic                                    write_req_i,
+    input  data_t                                   write_data_i,
+
+    /// bank ports
+    output logic         [NumBanks-1:0]             tcdm_bank_req_o,
+    output logic         [NumBanks-1:0]             tcdm_bank_we_o,
+    output bank_addr_t   [NumBanks-1:0]             tcdm_bank_addr_o,
+    output word_t        [NumBanks-1:0]             tcdm_bank_wdata_o,
+    output logic         [NumBanks-1:0]             tcdm_bank_be_o,
+    input  word_t        [NumBanks-1:0]             tcdm_bank_rdata_i
+    
+);
+    //////////////////////////////////////
+    //        Types Definition          //
+    //////////////////////////////////////
+
+    typedef enum logic [2:0] {
+        IDLE = '0,
+        W_ONLY,
+        R_ONLY,
+        WR_DIFF_BANK,
+        WR_SAME_ADDR,
+        WR_CONFLICT
+    } pseudo_dual_status_t;
+
+    //////////////////////////////////////
+    //        Signal Definition         //
+    //////////////////////////////////////
+
+    //status
+    pseudo_dual_status_t                            status;
+
+    //write line buffer
+    data_t write_line_buffer;
+    `FFARN (write_line_buffer, write_data_i, '0,    clk_i, rst_ni)
+
+    //bank signals
+    logic         [NumPseudoDualBanks-1:0]          bank_req;
+    logic         [NumPseudoDualBanks-1:0]          bank_we;
+    bank_addr_t   [NumPseudoDualBanks-1:0]          bank_addr;
+    data_t        [NumPseudoDualBanks-1:0]          bank_wdata;
+    data_t        [NumPseudoDualBanks-1:0]          bank_rdata;
+
+    //read & write port address info
+    bank_select_t                                   read_bank_select;
+    bank_addr_t                                     read_bank_addr;
+    bank_select_t                                   write_bank_select;
+    bank_addr_t                                     write_bank_addr;
+
+    //read data selection
+    logic                                           read_data_from_line_buffer_q, read_data_from_line_buffer_d;
+    bank_select_t                                   read_data_from_bank_select_q, read_data_from_bank_select_d;
+    `FFARN (read_data_from_line_buffer_q,
+            read_data_from_line_buffer_d,
+            '0, clk_i, rst_ni)
+    `FFARN (read_data_from_bank_select_q,
+            read_data_from_bank_select_d,
+            '0, clk_i, rst_ni)
+
+    //////////////////////////////////////
+    //        Instance Modules          //
+    //////////////////////////////////////
+
+    for (genvar i = 0; i < NumPseudoDualBanks; i++) begin
+        word_t [NumWordsPerLine-1:0] __wdata;
+        word_t [NumWordsPerLine-1:0] __rdata;
+        assign __wdata = bank_wdata[i];
+
+        for (genvar j = 0; j < NumWordsPerLine; j++) begin
+            assign tcdm_bank_req_o[i*NumWordsPerLine + j]    = bank_req[i];
+            assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = bank_we[i];
+            assign tcdm_bank_addr_o[i*NumWordsPerLine + j]   = bank_addr[i];
+            assign tcdm_bank_wdata_o[i*NumWordsPerLine + j]  = __wdata[j];
+            assign tcdm_bank_be_o[i*NumWordsPerLine + j]     = 1'b1;
+            assign __rdata[j]                                = tcdm_bank_rdata_i[i*NumWordsPerLine + j];
+        end
+
+        assign bank_rdata[i] = __rdata;
+    end
+
+    //////////////////////////////////////
+    //        Pseudo Dual Logics        //
+    //////////////////////////////////////
+
+    always_comb begin : proc_pseudo_dual
+        /*****************/
+        /* Defualt Value */
+        /*****************/
+        status = IDLE;
+
+        bank_req = '0;
+        bank_we = '0;
+        bank_addr = '0;
+        bank_wdata = '0;
+
+        if (NumPseudoDualBanks <= 1) begin
+            read_bank_select = '0;
+            write_bank_select = '0;
+            read_bank_addr = read_addr_i;
+            write_bank_addr = write_addr_i;
+        end else begin
+            {read_bank_addr,    read_bank_select}   = read_addr_i;
+            {write_bank_addr,   write_bank_select}  = write_addr_i;
+        end
+
+        read_ready_o = 1'b1;
+        read_data_from_line_buffer_d = '0;
+        read_data_from_bank_select_d = '0;
+
+        /*******************/
+        /* Determin Status */
+        /*******************/
+        if (read_valid_i & write_req_i) begin
+            if (read_bank_select != write_bank_select) begin
+                status = WR_DIFF_BANK;
+            end else
+            if (read_addr_i == write_addr_i) begin
+                status = WR_SAME_ADDR;
+            end else begin
+                status = WR_CONFLICT;
+            end
+        end else 
+        if (read_valid_i) begin
+            status = R_ONLY;
+        end else
+        if (write_req_i) begin
+            status = W_ONLY;
+        end
+
+        /************/
+        /* Main FSM */
+        /************/
+        case (status)
+            W_ONLY: begin
+                bank_req[write_bank_select]     = 1'b1;
+                bank_we[write_bank_select]      = 1'b1;
+                bank_addr[write_bank_select]    = write_bank_addr;
+                bank_wdata[write_bank_select]   = write_data_i;
+            end
+
+            R_ONLY: begin
+                bank_req[read_bank_select]      = 1'b1;
+                bank_we[read_bank_select]       = 1'b0;
+                bank_addr[read_bank_select]     = read_bank_addr;
+
+                read_data_from_line_buffer_d    = '0;
+                read_data_from_bank_select_d    = read_bank_select;
+            end
+
+            WR_DIFF_BANK: begin
+                bank_req[write_bank_select]     = 1'b1;
+                bank_we[write_bank_select]      = 1'b1;
+                bank_addr[write_bank_select]    = write_bank_addr;
+                bank_wdata[write_bank_select]   = write_data_i;
+
+                bank_req[read_bank_select]      = 1'b1;
+                bank_we[read_bank_select]       = 1'b0;
+                bank_addr[read_bank_select]     = read_bank_addr;
+
+                read_data_from_line_buffer_d    = '0;
+                read_data_from_bank_select_d    = read_bank_select;
+            end
+
+            WR_SAME_ADDR: begin
+                bank_req[write_bank_select]     = 1'b1;
+                bank_we[write_bank_select]      = 1'b1;
+                bank_addr[write_bank_select]    = write_bank_addr;
+                bank_wdata[write_bank_select]   = write_data_i;
+
+                read_data_from_line_buffer_d    = 1'b1;
+                read_data_from_bank_select_d    = '0;
+            end
+
+            WR_CONFLICT: begin
+                bank_req[write_bank_select]     = 1'b1;
+                bank_we[write_bank_select]      = 1'b1;
+                bank_addr[write_bank_select]    = write_bank_addr;
+                bank_wdata[write_bank_select]   = write_data_i;
+
+                read_data_from_line_buffer_d    = '0;
+                read_data_from_bank_select_d    = '0;
+            end
+        
+            default : /* default */;
+        endcase
+
+        /*********************/
+        /* Read Ready Logics */
+        /*********************/
+        if (write_req_i & (read_addr_i != write_addr_i) & (read_bank_select == write_bank_select)) begin
+            read_ready_o = 1'b0;
+        end
+    end
+
+    assign read_data_o = read_data_from_line_buffer_q? write_line_buffer: bank_rdata[read_data_from_bank_select_q];
+
+endmodule : pseudo_dual_port_tcdm_wrapper
+
+
+module insitu_cache_bank_access_controller #(
+    /// Address depth
+    parameter int unsigned  DEPTH                   = 512,
+    /// Number of words
+    parameter int unsigned  NumWordsPerLine         = 2,
+    /// Width of word
+    parameter int unsigned  WordWidth               = 32,
+    /// Dependent parameter, do not override. data type
+    localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
+    /// Dependent parameter, do not override. word type
+    localparam type         word_t                  = logic [WordWidth-1:0],
+    // Dependent parameter, do not override. Address type.
+    localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0]
+    )(
+    /// Clock, positive edge triggered.
+    input  logic                                    clk_i,
+    /// Reset, active low.
+    input  logic                                    rst_ni,
+
+    /// Upstream Read port
+    input  addr_t                                   upstream_read_addr_i,
+    input  logic                                    upstream_read_valid_i,
+    output logic                                    upstream_read_ready_o,
+    output data_t                                   upstream_read_data_o,
+
+    /// Upstream write port
+    input  addr_t                                   upstream_write_addr_i,
+    input  logic                                    upstream_write_req_i,
+    input  data_t                                   upstream_write_data_i,
+
+    /// Downstream Read port
+    output addr_t                                   downstream_read_addr_o,
+    output logic                                    downstream_read_valid_o,
+    input  logic                                    downstream_read_ready_i,
+    input  data_t                                   downstream_read_data_i,
+
+    /// Downstream write port
+    output addr_t                                   downstream_write_addr_o,
+    output logic                                    downstream_write_req_o,
+    output data_t                                   downstream_write_data_o,
+
+    // Bank Access Grant
+    input  logic                                    bank_gnt_i
+);
+    //////////////////////////////////////
+    //        Types Definition          //
+    //////////////////////////////////////
+
+    typedef enum logic {
+        ACCESS_THROUGH = '0,
+        ACCESS_STALL
+    } access_status_t;
+
+    //////////////////////////////////////
+    //        Signal Definition         //
+    //////////////////////////////////////
+
+    access_status_t access_status_q, access_status_d;
+    data_t          access_stall_data_q, access_stall_data_d;
+    addr_t          access_stall_addr_q, access_stall_addr_d;
+    `FFARN (access_status_q, access_status_d, ACCESS_THROUGH, clk_i, rst_ni)
+    `FFARN (access_stall_data_q, access_stall_data_d, '0, clk_i, rst_ni)
+    `FFARN (access_stall_addr_q, access_stall_addr_d, '0, clk_i, rst_ni)
+
+
+    //////////////////////////////////////
+    //        Access CTRL Logics        //
+    //////////////////////////////////////
+
+    always_comb begin
+        access_status_d         = access_status_q;
+        access_stall_data_d     = access_stall_data_q;
+        access_stall_addr_d     = access_stall_addr_q;
+
+        upstream_read_ready_o   = downstream_read_ready_i;
+        downstream_read_valid_o = upstream_read_valid_i;
+        downstream_write_req_o  = upstream_write_req_i;
+
+        upstream_read_data_o    = downstream_read_data_i;
+        downstream_read_addr_o  = upstream_read_addr_i;
+        downstream_write_addr_o = upstream_write_addr_i;
+        downstream_write_data_o = upstream_write_data_i;
+
+        /*FSM*/
+        case (access_status_q)
+            ACCESS_THROUGH: begin
+                if (bank_gnt_i == '0) begin
+                    upstream_read_ready_o = '0;
+                    downstream_read_valid_o = '0;
+                    downstream_write_req_o = '0;
+
+                    if (upstream_write_req_i == 1'b1) begin
+                        access_status_d = ACCESS_STALL;
+                        access_stall_data_d = upstream_write_data_i;
+                        access_stall_addr_d = upstream_write_addr_i;
+                    end
+                end
+            end
+
+            ACCESS_STALL: begin
+                upstream_read_ready_o = '0;
+                downstream_read_valid_o = '0;
+                downstream_write_req_o = '0;
+
+                downstream_write_addr_o = access_stall_addr_q;
+                downstream_write_data_o = access_stall_data_q;
+                if (bank_gnt_i) begin
+                    downstream_write_req_o = 1'b1;
+                    access_status_d = ACCESS_THROUGH;
+                end
+            end
+
+            default : access_status_d = ACCESS_THROUGH;
+        endcase
+    end
+
+
+endmodule : insitu_cache_bank_access_controller
