@@ -1,7 +1,7 @@
 # 🚀 Insitu-Cache
 
 **Insitu-Cache** is a **non-blocking, high-performance cache architecture** for modern heterogeneous SoCs.  
-Its key insight is simple yet powerful: **re-purpose otherwise idle cache-line space to absorb write traffic and hold miss status information**.  
+Its key insight is simple yet powerful: **Re-purpose wasted cache-line space for Write Buffer and MSHR fucntions**.
 This “do more with what you already have” approach shrinks area, slashes latency, and keeps bandwidth-hungry accelerators happy.
 
 <p align="center">
