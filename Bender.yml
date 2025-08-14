@@ -46,7 +46,6 @@ sources:
     - src/insitu_cache/insitu_cache_tcdm_wrapper.sv
     - src/insitu_cache/insitu_cache_tcdm_wrapper_partitionable_flushable.sv
     #level4
-    - src/flamingo/flamingo_spatz_cache_ctrl.sv
     - src/cachepool/cachepool_cache_ctrl.sv
   
   - target: insitu_test
