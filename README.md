@@ -15,10 +15,9 @@ This “do more with what you already have” approach shrinks area, slashes lat
 | 💡 | What makes Insitu-Cache special? |
 |---|----------------------------------|
 | 🏗️ | **In-situ write buffers & MSHRs** – no extra SRAM macros required. |
-| 🔄 | **True non-blocking** operation even under heavy multi-core pressure. |
-| ⏱️ | **Cycle-accurate SystemVerilog testbench** included. |
-| 📐 | **Modular RTL**: drop-in compatible with ARM AXI or OpenPULP TCDM fabrics. |
-| 📊 | **Area & energy breakdown scripts** (coming soon). |
+| 🔄 | **Efficient Non-blocking** handle more than 10K cache misses. |
+| 📐 | **Modular RTL**: drop-in compatible with ARM AXI or TCDM fabrics. |
+| 📊 | **Area & energy saving**. |
 
 ---
 
