@@ -1,4 +1,4 @@
-# Copyright 2023 ETH Zurich and University of Bologna.
+# Copyright 2025 ETH Zurich and University of Bologna.
 # Solderpad Hardware License, Version 0.51, see LICENSE for details.
 # SPDX-License-Identifier: SHL-0.51
 
@@ -41,7 +41,7 @@ sources:
     - src/coalesce_unit/seq_coalescer/seq_coalescer_req_merger.sv
     - src/coalesce_unit/seq_coalescer/seq_coalescer_multi_req_merger.sv
     - src/coalesce_unit/seq_coalescer/seq_coalescer_top.sv
-    - src/coalesce_unit/wirte_merger/write_through_merger.sv
+    - src/coalesce_unit/write_merger/write_through_merger.sv
     #level3
     - src/insitu_cache/insitu_cache_decoder.sv
     - src/insitu_cache/insitu_cache_encoder.sv

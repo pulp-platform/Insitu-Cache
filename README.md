@@ -1,6 +1,6 @@
 # 🚀 Insitu-Cache
 
-**Insitu-Cache** is a **non-blocking, high-performance cache architecture** for modern heterogeneous SoCs.  
+**Insitu-Cache** is a **non-blocking, high-performance cache architecture** for modern heterogeneous SoCs, developed at ETH Zurich & University of Bologna (as part of PULP platform).  
 Its key insight is simple yet powerful: **Re-purpose wasted cache-line space for Write Buffer and MSHR fucntions**.
 This “do more with what you already have” approach shrinks area, slashes latency, and keeps bandwidth-hungry accelerators happy.
 
@@ -83,11 +83,24 @@ Insitu-Cache/
 
 ---
 
-## 🏃‍♂️  Quick-Start: Simulate the Testbench
+## 🏃‍♂️  Quick-Start
 
+### 🔧 Prerequisites
+
+- This design leverages [`bender`](https://github.com/pulp-platform/bender) for dependency management and automatic generation of compilation scripts.
+  - `bender` version >= 0.27.2 is required
+- Note: We currently do not offer an open-source simulation setup. Instead, we have utilized `Questasim` for RTL simulation.
+- The testbech utilizes [DRAMSys5.0](https://github.com/tukl-msd/DRAMSys) developed by the [Microelectronic Systems Design Research Group](https://eit.rptu.de/en/fgs/ems/home/seite) at [RPTU Kaiserslautern-Landau](https://rptu.de/en/), by [Fraunhofer IESE](https://www.iese.fraunhofer.de/en.html) and by the [Computer Engineering Group](https://www.informatik.uni-wuerzburg.de/ce/) at [JMU Würzburg](https://www.uni-wuerzburg.de/en/home/) for DRAM Models. For building DRAMSys:
+  - `cmake` version >= 3.28.1 is required.
+  - `gcc` version >= 11.2.0 is required
+  - `g++` version >= 11.2.0 is required
+
+### 🚀 Run Simulation
 ```bash
 # Build Dramsys for insitu-cache testbench
-source sourceme.sh
+git submodule update --init --recursive
+make -C src/dep/dram_rtl_sim/ -j dramsys
+
 # Compile RTL, elaborate, and run in ModelSim/Questa
 make vsim
 ```
@@ -110,7 +123,7 @@ make vsim
 
 ## 📜  License
 
-All hardware sources and tool scripts are licensed under the Solderpad Hardware License 0.51 (see `LICENSE`).
+All hardware sources and tool scripts are licensed under the Solderpad Hardware License 0.51 (see `LICENSE`), while figures under the `doc` folder are licensed under the CC-BY-ND license.
 Feel free to use, modify, and star ⭐ the repo if you find Insitu-Cache helpful!
 
 
