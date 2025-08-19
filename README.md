@@ -90,7 +90,7 @@ Insitu-Cache/
 - This design leverages [`bender`](https://github.com/pulp-platform/bender) for dependency management and automatic generation of compilation scripts.
   - `bender` version >= 0.27.2 is required
 - Note: We currently do not offer an open-source simulation setup. Instead, we have utilized `Questasim` for RTL simulation.
-- The testbech utilizes [DRAMSys5.0](https://github.com/tukl-msd/DRAMSys) developed by the [Microelectronic Systems Design Research Group](https://eit.rptu.de/en/fgs/ems/home/seite) at [RPTU Kaiserslautern-Landau](https://rptu.de/en/), by [Fraunhofer IESE](https://www.iese.fraunhofer.de/en.html) and by the [Computer Engineering Group](https://www.informatik.uni-wuerzburg.de/ce/) at [JMU Würzburg](https://www.uni-wuerzburg.de/en/home/) for DRAM Models. For building DRAMSys:
+- The testbech utilizes [DRAMSys5.0](https://github.com/tukl-msd/DRAMSys) for DRAM Models. For building DRAMSys:
   - `cmake` version >= 3.28.1 is required.
   - `gcc` version >= 11.2.0 is required
   - `g++` version >= 11.2.0 is required
