@@ -4,11 +4,15 @@
 #
 # Chi Zhang <chizhang@iis.ee.ethz.ch>
 
-#Basic Settings
-BENDER                  ?= bender
-QUESTAVSIM              ?= questa-2022.3 vsim
+# Basic Settings
 LIBRARY                 ?= work
 TB_TOP                  ?= tb_insitu_cache
+
+# Bender
+BENDER                  ?= bender
+VLOG_ARGS               ?= -svinputport=compat -override_timescale 1ns/1ps -suppress 2583 -suppress 13314
+BENDER_TARGETS          ?= -t insitu_test -t rtl
+BENDER_VLOG_ARGS        ?= --vlog-arg="$(VLOG_ARGS)"
 
 # Path to DRAMsyslib
 DRAM_RTL_SIM_FOLDER     ?= $(abspath ./src/dep/dram_rtl_sim)
@@ -16,7 +20,7 @@ DRAMSYS_RESOUCES_PATH   ?= $(abspath ${DRAM_RTL_SIM_FOLDER}/dramsys_lib/DRAMSys/
 DRAMSYS_LIB_PATH        ?= $(abspath ${DRAM_RTL_SIM_FOLDER}/dramsys_lib/DRAMSys/build/lib)
 
 # QuestaSim
-VLOG_ARGS               ?= -svinputport=compat -override_timescale 1ns/1ps -suppress 2583 -suppress 13314
+QUESTAVSIM              ?= questa-2022.3 vsim
 QUESTA_ARGS             ?=
 QUESTA_ARGS             += +DRAMSYS_RES=$(DRAMSYS_RESOUCES_PATH)
 QUESTA_ARGS             += -sv_lib $(DRAMSYS_LIB_PATH)/libsystemc
@@ -24,7 +28,7 @@ QUESTA_ARGS             += -sv_lib $(DRAMSYS_LIB_PATH)/libDRAMSys_Simulator
 QUESTA_ARGS             += -suppress vsim-3999
 
 
-#Design parameters are defined here! testbench only
+# Design parameters are defined here! testbench only
 ## cache types setting ##
 USE_CONVENTIONAL_CACHE  ?= 0
 USE_BYPASS_CACHE        ?= 0
@@ -97,7 +101,7 @@ compile: vsim/compile.tcl
 	cd vsim && $(QUESTAVSIM) -c -do compile.tcl
 
 vsim/compile.tcl: Bender.yml Makefile $(shell find src -type f) $(shell find include -type f) 
-	$(BENDER) script vsim -t insitu_test -t rtl --vlog-arg="$(VLOG_ARGS)" $(BENDER_DEFS) > $@
+	$(BENDER) script vsim $(BENDER_TARGETS) $(BENDER_VLOG_ARGS) $(BENDER_DEFS) > $@
 
 clean:
 	cd vsim && rm -rf work/ vsim.wlf  transcript  modelsim.ini compile.tcl vsim* DRAMSys*
