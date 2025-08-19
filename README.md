@@ -123,7 +123,7 @@ make vsim
 
 ## 📜  License
 
-All hardware sources and tool scripts are licensed under the Solderpad Hardware License 0.51 (see `LICENSE`), while figures under the `doc` folder are licensed under the CC-BY-ND license.
+All hardware sources and tool scripts are licensed under the Solderpad Hardware License 0.51 (see `LICENSE`), while figures under the `doc/figures` folder are licensed under the CC-BY-ND license (see `doc/figures/LICENSE`).
 Feel free to use, modify, and star ⭐ the repo if you find Insitu-Cache helpful!
 
 
