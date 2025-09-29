@@ -127,3 +127,45 @@ All hardware sources and tool scripts are licensed under the Solderpad Hardware 
 Feel free to use, modify, and star ⭐ the repo if you find Insitu-Cache helpful!
 
 
+# Spatz Cache Wrapper
+
+## Overview
+
+This repository provides the Spatz Cache Wrapper, which is responsible for a specific subsystem in the larger Flamingo architecture. We currently provide the functionality encapsulated within the green block of the diagram below.
+
+![Flamingo L1 Subsystem Diagram](doc/figures/Flamingo_Spatz_Cache.png)
+
+## Initialization
+
+To initialize the environment, source the appropriate shell script:
+
+```bash
+source sourceme.sh
+```
+
+## Running the Testbench
+
+To run the testbench with the default simulation setup, use the following command:
+
+```bash
+make vsim
+```
+
+## To-Do List
+
+- [x] First RTL Wrapper of (Coalescer + Insitu-Cache) for Flamingo
+- [x] Wrapper TestBench and CI Setup
+- [x] Insitu-Cache Hyper-SPM Function
+- [x] Insitu-Cache Flush+Invalidation Function
+- [x] Add TestBench with Hyper-SPM & Flush+Invalidation Check
+- [x] Solve Problem When Configure All SPM
+- [x] Test pseudo_dual_port_fifo
+- [x] Solve All X in Simulation
+- [x] Sanity Check: Parameter Assertion
+- [x] Check All FlipFlop in The Design: They Should Be Async Reset
+- [x] Check All FSM Has Defualt Return to IDLE
+- [x] Connection test on spatz cluster
+- [x] Add Bank Access Grant Single and Controller to Delay Cache Bank Access When Conflict with Other Bank Access
+- [ ] Frontend Request Isolator for Cache (INIT/FLUSH/INVALID)
+- [ ] Optimize Perfromace: Coaleacer Organization & Cache Slices & Tag hashing
+- [ ] GF22 Area Estimation

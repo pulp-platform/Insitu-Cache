@@ -1,4 +1,4 @@
-// Copyright 2025 ETH Zurich and 
+// Copyright 2023 ETH Zurich and 
 // University of Bologna
 
 // Solderpad Hardware License
@@ -47,6 +47,8 @@ module insitu_cache_tcdm_wrapper
     parameter int unsigned NumPseudoDualBanks       = 1,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 32,
+    /// Tag Width
+    parameter int unsigned TagWidth                 = 64,
     /// Log Debug information for questa-sim.
     parameter int unsigned LogDebug                 = 1,
     /// Counter cache line life cycle information for questa-sim.
@@ -87,7 +89,7 @@ module insitu_cache_tcdm_wrapper
     /// Dependent parameter, do not override. word type
     localparam type word_t                          = logic [WordWidth-1:0],
     /// Dependent parameter, do not override. word type
-    localparam type tcdm_meta_data_t                = logic [63:0],
+    localparam type tcdm_meta_data_t                = logic [TagWidth-1:0],
     // Dependent parameter, do not override. set ptr type.
     localparam type way_ptr_t                       = logic [$clog2(SetAssociativity)-1:0],
     // Dependent parameter, do not override. Address type.

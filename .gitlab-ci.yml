@@ -1,0 +1,35 @@
+stages:
+  - build
+  - test
+
+build_job:
+  stage: build
+  script:
+    - echo "Building the project..."
+    - source sourceme.sh
+    - make vsim
+  timeout: 1h
+
+test_insitu_cache:
+  stage: test
+  script:
+    - echo "Running insitu-cache tests..."
+    - source sourceme.sh
+    - ./scripts/correctness_checking/insitu_cache_with_pseudo_dual_bank_check.sh
+  timeout: 2d
+
+test_flamingo_coalcache_wrapper:
+  stage: test
+  script:
+    - echo "Running flamingo_coalcache_wrapper tests..."
+    - source sourceme.sh
+    - ./scripts/correctness_checking/flamingo_coalcache_wrapper_check.sh
+  timeout: 2d
+
+test_flamingo_cache_SPM_hybird_and_flush_invalidation_function:
+  stage: test
+  script:
+    - echo "Running test_flamingo_cache_SPM_hybird_and_flush_invalidation_function tests..."
+    - source sourceme.sh
+    - ./scripts/correctness_checking/flamingo_insutu_cache_tcdm_wrapper_check.sh
+  timeout: 2d

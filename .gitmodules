@@ -1,0 +1,3 @@
+[submodule "src/dep/dram_rtl_sim"]
+	path = src/dep/dram_rtl_sim
+	url = https://github.com/pulp-platform/dram_rtl_sim.git

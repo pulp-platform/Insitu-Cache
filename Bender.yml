@@ -1,7 +1,3 @@
-# Copyright 2025 ETH Zurich and University of Bologna.
-# Solderpad Hardware License, Version 0.51, see LICENSE for details.
-# SPDX-License-Identifier: SHL-0.51
-
 package:
   name: insitu-cache
   authors:
@@ -41,7 +37,7 @@ sources:
     - src/coalesce_unit/seq_coalescer/seq_coalescer_req_merger.sv
     - src/coalesce_unit/seq_coalescer/seq_coalescer_multi_req_merger.sv
     - src/coalesce_unit/seq_coalescer/seq_coalescer_top.sv
-    - src/coalesce_unit/write_merger/write_through_merger.sv
+    - src/coalesce_unit/wirte_merger/write_through_merger.sv
     #level3
     - src/insitu_cache/insitu_cache_decoder.sv
     - src/insitu_cache/insitu_cache_encoder.sv
@@ -50,6 +46,7 @@ sources:
     - src/insitu_cache/insitu_cache_tcdm_wrapper.sv
     - src/insitu_cache/insitu_cache_tcdm_wrapper_partitionable_flushable.sv
     #level4
+    - src/flamingo/flamingo_spatz_cache_ctrl.sv
     - src/cachepool/cachepool_cache_ctrl.sv
   
   - target: insitu_test
@@ -60,4 +57,5 @@ sources:
       - src/dep/dram_rtl_sim/src/dram_sim_engine.sv
       #testbench
       - test/tb_insitu_cache.sv
-
+      - test/test_flamingo/tb_insitu_cache_tcdm_wrapper.sv
+      - test/test_flamingo/tb_flamingo_spatz_cache_ctrl.sv
