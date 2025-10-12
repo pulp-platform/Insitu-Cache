@@ -38,7 +38,7 @@ module par_coalescer_equal_window #(
     // Dependent parameter, do not override. byte offset type.
     localparam type offset_t                        = logic [$clog2(DownstreamDataWidth/UpstreamDataWidth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
-    localparam type downstream_info_t               = struct packed {down_id_t id; logic [NumPorts-1:0] hitmap; offset_t [NumPorts-1:0] ofsts; info_t [NumPorts-1:0] infos;}
+    localparam type downstream_info_t               = struct packed {down_id_t id; logic [NumPorts-1:0] hitmap; offset_t [NumPorts-1:0] ofsts; info_t [NumPorts-1:0] infos; logic bypass_coalescer;}
     )(
     /// Clock, positive edge triggered.
     input  logic                                    clk_i,
@@ -226,6 +226,7 @@ module par_coalescer_equal_window #(
         downstream_req_info_o.id = id_i;
         downstream_req_info_o.hitmap = coal_req_cut.hitmap;
         downstream_req_info_o.ofsts = coal_req_cut.ofsts;
+        downstream_req_info_o.bypass_coalescer = 1'b0;
 
         for (int i = 0; i < NumPorts; i++) begin
             downstream_req_info_o.infos[i] = coal_req_cut.hitmap[i]? buffer_req_info[i] : '0;

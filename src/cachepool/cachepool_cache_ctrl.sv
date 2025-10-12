@@ -152,9 +152,10 @@ module cachepool_cache_ctrl #(
 
   typedef struct packed {
     logic                                                                 id;
-    logic       [NumPorts * CoalExtFactor - 1:0]                          hitmap;
-    coal_ofst_t [NumPorts * CoalExtFactor - 1:0]                          ofsts;
-    core_meta_t [NumPorts * CoalExtFactor - 1:0]                          infos;
+    logic       [(NumPorts-1) * CoalExtFactor - 1:0]                      hitmap;
+    coal_ofst_t [(NumPorts-1) * CoalExtFactor - 1:0]                      ofsts;
+    core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
+    logic                                                                 bypass_coalescer;
   } coalescing_info_t;
 
   typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
@@ -192,6 +193,21 @@ module cachepool_cache_ctrl #(
   coalescing_info_t                                                       coalescing_resp_info;
   logic                                                                   coalescing_resp_write;
 
+  // Bypass xbar signals
+  logic                                                                   bypass_xbar_req_valid;
+  logic                                                                   bypass_xbar_req_ready;
+  addr_t                                                                  bypass_xbar_req_addr;
+  coalescing_info_t                                                       bypass_xbar_req_info;
+  logic                                                                   bypass_xbar_req_write;
+  coalescing_data_t                                                       bypass_xbar_req_wdata;
+  coalescing_mask_t                                                       bypass_xbar_req_wmask;
+
+  logic                                                                   bypass_xbar_resp_valid;
+  logic                                                                   bypass_xbar_resp_ready;
+  coalescing_data_t                                                       bypass_xbar_resp_data;
+  coalescing_info_t                                                       bypass_xbar_resp_info;
+  logic                                                                   bypass_xbar_resp_write;
+
   /// Cache request
   logic                                                                   cache_req_valid;
   logic                                                                   cache_req_ready;
@@ -226,10 +242,10 @@ module cachepool_cache_ctrl #(
   //        Instance Modules         //
   /////////////////////////////////////
 
-  //1.Coalescer
+  //0.Coalescer
   par_coalescer_top #(
     .ReqAddrWidth           (AddrWidth            ),
-    .NumPorts               (NumPorts             ),
+    .NumPorts               (NumPorts - 1         ), // Only spatz vlsu goes through coalescer
     .ExtFactor              (CoalExtFactor        ),
     .info_t                 (core_meta_t          ),
     .down_id_t              (logic                ),
@@ -240,18 +256,18 @@ module cachepool_cache_ctrl #(
     .rst_ni,
     .id_i                   ('0                   ),
 
-    .upstream_req_valid_i   (core_req_valid_i     ),
-    .upstream_req_ready_o   (core_req_ready_o     ),
-    .upstream_req_addr_i    (core_req_addr_i      ),
-    .upstream_req_info_i    (core_req_meta_i      ),
-    .upstream_req_write_i   (core_req_write_i     ),
-    .upstream_req_wdata_i   (core_req_wdata_i     ),
+    .upstream_req_valid_i   (core_req_valid_i [NumPorts-2:0]    ),
+    .upstream_req_ready_o   (core_req_ready_o [NumPorts-2:0]    ),
+    .upstream_req_addr_i    (core_req_addr_i  [NumPorts-2:0]    ),
+    .upstream_req_info_i    (core_req_meta_i  [NumPorts-2:0]    ),
+    .upstream_req_write_i   (core_req_write_i [NumPorts-2:0]    ),
+    .upstream_req_wdata_i   (core_req_wdata_i [NumPorts-2:0]    ),
 
-    .upstream_resp_valid_o  (core_resp_valid_o    ),
-    .upstream_resp_ready_i  (core_resp_ready_i    ),
-    .upstream_resp_write_o  (core_resp_write_o    ),
-    .upstream_resp_data_o   (core_resp_data_o     ),
-    .upstream_resp_info_o   (core_resp_meta_o     ),
+    .upstream_resp_valid_o  (core_resp_valid_o[NumPorts-2:0]    ),
+    .upstream_resp_ready_i  (core_resp_ready_i[NumPorts-2:0]    ),
+    .upstream_resp_write_o  (core_resp_write_o[NumPorts-2:0]    ),
+    .upstream_resp_data_o   (core_resp_data_o [NumPorts-2:0]    ),
+    .upstream_resp_info_o   (core_resp_meta_o [NumPorts-2:0]    ),
 
     .downstream_req_valid_o (coalescing_req_valid ),
     .downstream_req_ready_i (coalescing_req_ready ),
@@ -267,6 +283,122 @@ module cachepool_cache_ctrl #(
     .downstream_resp_info_i (coalescing_resp_info ),
     .downstream_resp_write_i(coalescing_resp_write)
   );
+
+  //1.mux/demux to divide snitch and spatz req/resp
+  typedef struct packed {
+    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-$clog2(CacheLineWidth/8)-1-1:0] padding;
+    core_meta_t                             core_meta;
+    logic [($clog2(CacheLineWidth/8)-1):0]  addr_offset;
+    logic                                   bypass_coalescer;
+  } bypass_info_t;
+
+  typedef union packed {
+    coalescing_info_t   coalescer;
+    bypass_info_t       bypass;
+  } coalescer_xbar_info_union_t;
+
+  // Ensure the packed union members overlay cleanly
+  initial begin
+    if ($bits(bypass_info_t) != $bits(coalescing_info_t)) begin
+      $error("Width mismatch: bypass_info_t=%0d, coalescing_info_t=%0d",
+            $bits(bypass_info_t), $bits(coalescing_info_t));
+    end
+  end
+
+  typedef struct packed {
+    addr_t              addr;
+    coalescer_xbar_info_union_t   info;
+    logic               write;
+    coalescing_data_t   wdata;
+    coalescing_mask_t   wmask;
+  } dreq_chan_t;
+
+  typedef struct packed {
+    coalescing_data_t           data;
+    coalescer_xbar_info_union_t meta;
+    logic                       write;
+  } drsp_chan_t;
+
+  dreq_chan_t coalescer_req, bypass_req, bypass_xbar_req;
+  drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
+
+  coalescing_data_t bypass_pad_data;
+  always_comb begin
+    bypass_pad_data = '0;
+    bypass_pad_data[ core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0] * 8  +: WordWidth] = core_req_wdata_i[NumPorts-1];
+  end
+  assign coalescer_req = '{
+    addr    : coalescing_req_addr,
+    info    : coalescer_xbar_info_union_t'(coalescing_req_info),
+    write   : coalescing_req_write,
+    wdata   : coalescing_req_wdata,
+    wmask   : coalescing_req_wmask
+  };
+
+  // bypass_info_t _binfo = '{
+  //   core_meta   : core_req_meta_i[NumPorts-1],
+  //   addr_offset : core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0]
+  // };
+
+  assign bypass_req = '{
+    addr    : core_req_addr_i [NumPorts-1] & ~(CacheLineWidth/8-1),
+    info    : coalescer_xbar_info_union_t'(
+      bypass_info_t'{
+        padding    : '0,
+        core_meta  : core_req_meta_i[NumPorts-1],
+        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0],
+        bypass_coalescer: 1'b1
+      }
+    ),
+    write   : core_req_write_i[NumPorts-1],
+    wdata   : bypass_pad_data,
+    wmask   : (1 << (core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):($clog2(WordWidth/8))]))
+  };
+
+  assign bypass_xbar_resp = '{
+    data    : bypass_xbar_resp_data,
+    write   : bypass_xbar_resp_write,
+    meta    : bypass_xbar_resp_info
+  };
+
+  reqrsp_xbar #(
+    .NumInp           (2                ),
+    .NumOut           (1                ),
+    .PipeReg          (1'b0             ),
+    .ExtReqPrio       (1'b0             ),
+    .ExtRspPrio       (1'b0             ),
+    .tcdm_req_chan_t  (dreq_chan_t      ),
+    .tcdm_rsp_chan_t  (drsp_chan_t      )
+  ) i_bypass_xbar (
+    .clk_i            (clk_i            ),
+    .rst_ni           (rst_ni           ),
+    .slv_req_i        ('{bypass_req                   , coalescer_req       } ),
+    .slv_req_valid_i  ('{core_req_valid_i[NumPorts-1] , coalescing_req_valid} ),
+    .slv_req_ready_o  ('{core_req_ready_o[NumPorts-1] , coalescing_req_ready} ),
+    .slv_rsp_o        ('{bypass_resp                  , coalescer_resp      } ),
+    .slv_rsp_valid_o  ('{core_resp_valid_o[NumPorts-1], coalescing_resp_valid} ),
+    .slv_rsp_ready_i  ('{core_resp_ready_i[NumPorts-1], coalescing_resp_ready} ),
+    .slv_sel_i        ('0               ),
+    .slv_rr_i         ('0               ),
+    .slv_selected_o   (                 ),
+    .mst_req_o        (bypass_xbar_req          ),
+    .mst_req_valid_o  (bypass_xbar_req_valid    ),
+    .mst_req_ready_i  (bypass_xbar_req_ready    ),
+    .mst_rsp_i        (bypass_xbar_resp         ),
+    .mst_rsp_valid_i  (bypass_xbar_resp_valid    ),
+    .mst_rsp_ready_o  (bypass_xbar_resp_ready    ),
+    .mst_sel_i        (bypass_xbar_resp_info.bypass_coalescer),
+    .mst_rr_i         ('0               )
+  );
+
+    // resp xbar to coalescer
+  assign coalescing_resp_data  = coalescer_resp.data;
+  assign coalescing_resp_info  = coalescer_resp.meta.coalescer;
+  assign coalescing_resp_write = coalescer_resp.write;
+    // resp xbar to snitch
+  assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
+  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[ bypass_resp.meta.bypass.addr_offset * 8  +: WordWidth];
+  assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
 
   //2.Insitu-Cache controller
   insitu_cache_tcdm_wrapper #(
@@ -291,19 +423,19 @@ module cachepool_cache_ctrl #(
     .cache_sync_insn_i      (cache_sync_insn_i      ),
     .cache_part_base_i      ('0                     ),
 
-    .upstream_req_valid_i   (coalescing_req_valid   ),
-    .upstream_req_ready_o   (coalescing_req_ready   ),
-    .upstream_req_addr_i    (coalescing_req_addr    ),
-    .upstream_req_info_i    (coalescing_req_info    ),
-    .upstream_req_write_i   (coalescing_req_write   ),
-    .upstream_req_wdata_i   (coalescing_req_wdata   ),
-    .upstream_req_wmask_i   (coalescing_req_wmask   ),
+    .upstream_req_valid_i   (bypass_xbar_req_valid  ),
+    .upstream_req_ready_o   (bypass_xbar_req_ready  ),
+    .upstream_req_addr_i    (bypass_xbar_req.addr   ),
+    .upstream_req_info_i    (bypass_xbar_req.info   ),
+    .upstream_req_write_i   (bypass_xbar_req.write  ),
+    .upstream_req_wdata_i   (bypass_xbar_req.wdata  ),
+    .upstream_req_wmask_i   (bypass_xbar_req.wmask  ),
 
-    .upstream_resp_valid_o  (coalescing_resp_valid  ),
-    .upstream_resp_ready_i  (coalescing_resp_ready  ),
-    .upstream_resp_write_o  (coalescing_resp_write  ),
-    .upstream_resp_data_o   (coalescing_resp_data   ),
-    .upstream_resp_info_o   (coalescing_resp_info   ),
+    .upstream_resp_valid_o  (bypass_xbar_resp_valid  ),
+    .upstream_resp_ready_i  (bypass_xbar_resp_ready  ),
+    .upstream_resp_write_o  (bypass_xbar_resp_write  ),
+    .upstream_resp_data_o   (bypass_xbar_resp_data   ),
+    .upstream_resp_info_o   (bypass_xbar_resp_info   ),
 
     .downstream_req_valid_o (cache_req_valid        ),
     .downstream_req_ready_i (cache_req_ready        ),

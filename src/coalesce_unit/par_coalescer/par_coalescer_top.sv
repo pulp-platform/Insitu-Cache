@@ -41,7 +41,7 @@ module par_coalescer_top #(
     // Dependent parameter, do not override. byte offset type.
     localparam type offset_t                        = logic [$clog2(DownstreamDataWidth/UpstreamDataWidth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
-    localparam type downstream_info_t               = struct packed {down_id_t id; logic [ExtPorts-1:0] hitmap; offset_t [ExtPorts-1:0] ofsts; info_t [ExtPorts-1:0] infos;}
+    localparam type downstream_info_t               = struct packed {down_id_t id; logic [ExtPorts-1:0] hitmap; offset_t [ExtPorts-1:0] ofsts; info_t [ExtPorts-1:0] infos; logic bypass_coalescer;}
     )(
     /// Clock, positive edge triggered.
     input  logic                                    clk_i,
