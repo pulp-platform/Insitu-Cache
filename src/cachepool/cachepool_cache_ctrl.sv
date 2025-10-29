@@ -286,9 +286,9 @@ module cachepool_cache_ctrl #(
 
   //1.mux/demux to divide snitch and spatz req/resp
   typedef struct packed {
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-$clog2(CacheLineWidth/8)-1-1:0] padding;
+    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-$clog2(CacheLineWidth/8)+2-1-1:0] padding;
     core_meta_t                             core_meta;
-    logic [($clog2(CacheLineWidth/8)-1):0]  addr_offset;
+    logic [($clog2(CacheLineWidth/8)-1)-2:0]  addr_offset;
     logic                                   bypass_coalescer;
   } bypass_info_t;
 
@@ -346,7 +346,7 @@ module cachepool_cache_ctrl #(
       bypass_info_t'{
         padding    : '0,
         core_meta  : core_req_meta_i[NumPorts-1],
-        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0],
+        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):2], // Snitch always accept word-width aligned response
         bypass_coalescer: 1'b1
       }
     ),
@@ -397,7 +397,7 @@ module cachepool_cache_ctrl #(
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
   assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
-  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[ bypass_resp.meta.bypass.addr_offset * 8  +: WordWidth];
+  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset[($clog2(CacheLineWidth/8)-1)-2:0] * 32 +: WordWidth];
   assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
 
   //2.Insitu-Cache controller
