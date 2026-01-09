@@ -27,6 +27,8 @@ module insitu_cache_encoder
     parameter int unsigned SetAssociativity                 = 16,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                        = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                        = 8,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheBankDepth                  = NumCacheEntry/SetAssociativity,
     // Dependent parameter, do not override. way ptr type.
@@ -36,7 +38,7 @@ module insitu_cache_encoder
     // Dependent parameter, do not override. Narrow word type.
     localparam type cache_data_t                            = logic [CacheLineWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                            = logic [CacheLineWidth/WordWidth-1:0],
+    localparam type cache_mask_t                            = logic [CacheLineWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. tag type.
     localparam type cache_tag_t                             = logic [ReqAddrWidth-$clog2(CacheLineWidth/8)-$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. bank depth ptr type.
@@ -88,12 +90,13 @@ module insitu_cache_encoder
     output cache_mask_t             [SetAssociativity-1:0]  bank_write_cache_mask_o,
     output cache_tag_t              [SetAssociativity-1:0]  bank_write_cache_tag_o,
     output cache_data_t             [SetAssociativity-1:0]  bank_write_cache_data_o,
+    output cache_mask_t             [SetAssociativity-1:0]  bank_write_data_mask_o,
     output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o
 );
 
     //Byte packed cache data
-    typedef logic [WordWidth-1:0]                           cache_word_t;
-    typedef cache_word_t [CacheLineWidth/WordWidth-1:0]     cache_data_in_words_t;
+    typedef logic [ByteWidth-1:0]                           cache_byte_t;
+    typedef logic [CacheLineWidth/ByteWidth-1:0][ByteWidth-1:0] cache_data_in_bytes_t;
 
     way_ptr_t                                               max_lru_credit;
 
@@ -173,6 +176,7 @@ module insitu_cache_encoder
         bank_write_cache_tag_o = bank_read_cache_tag_i;
         bank_write_cache_data_o = bank_read_cache_data_i;
         bank_write_cache_LRU_o = bank_read_cache_LRU_i;
+        bank_write_data_mask_o = '{default: '1};
 
         pendline_cnt_d = pendline_cnt_q;
         has_pend_line_o = (pendline_cnt_q != '0);
@@ -180,18 +184,19 @@ module insitu_cache_encoder
         //deal with masked modification
         write_data_final = enc_cache_data_i;
         if (enc_mod_data_with_mask_i) begin
-            automatic cache_data_in_words_t cache_data_in_words;
-            automatic cache_data_in_words_t write_data_in_words;
-            automatic cache_mask_t write_storb;
-            cache_data_in_words = enc_cache_data_i;
-            write_data_in_words = enc_mod_write_data_i;
-            write_storb = enc_mod_mask_i;
-            for (int bt = 0; bt < CacheLineWidth/WordWidth; bt++ ) begin
-                if (write_storb[bt]) begin
-                    cache_data_in_words[bt] = write_data_in_words[bt];
+            automatic cache_data_in_bytes_t cache_data_in_bytes;
+            automatic cache_data_in_bytes_t write_data_in_bytes;
+            automatic cache_mask_t write_strob;
+            cache_data_in_bytes = enc_cache_data_i;
+            write_data_in_bytes = enc_mod_write_data_i;
+            write_strob = enc_mod_mask_i;
+            for (int bt = 0; bt < CacheLineWidth/ByteWidth; bt++ ) begin
+                if (write_strob[bt]) begin
+                    cache_data_in_bytes[bt] = write_data_in_bytes[bt];
                 end
             end
-            write_data_final = cache_data_in_words;
+            write_data_final = cache_data_in_bytes;
+            bank_write_data_mask_o[enc_way_i] = enc_mod_mask_i;
         end
 
         //modify selescted way

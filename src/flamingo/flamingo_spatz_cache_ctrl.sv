@@ -25,6 +25,8 @@ module flamingo_spatz_cache_ctrl #(
     parameter int unsigned AddrWidth                                        = 32,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                                        = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                                        = 8,
     /// Width of Tag Bank data
     parameter int unsigned TagWidth                                         = 64,
 
@@ -68,7 +70,9 @@ module flamingo_spatz_cache_ctrl #(
     // Dependent parameter, do not override. TCDM Tag type.
     localparam type         tcdm_tag_data_t                                 = logic [TagWidth-1:0],
     // Dependent parameter, do not override. word type.
-    localparam type         word_data_t                                     = logic [WordWidth-1:0]
+    localparam type         word_data_t                                     = logic [WordWidth-1:0],
+    // Dependent parameter, do not override. byte strobe type.
+    localparam type         strb_t                                          = logic [WordWidth/ByteWidth-1:0]
     )(
     /// Clock, positive edge triggered.
     input  logic                                                            clk_i,
@@ -94,6 +98,7 @@ module flamingo_spatz_cache_ctrl #(
     input  core_meta_t      [NumPorts-1:0]                                  core_req_meta_i,
     input  logic            [NumPorts-1:0]                                  core_req_write_i,
     input  word_data_t      [NumPorts-1:0]                                  core_req_wdata_i,
+    input  strb_t           [NumPorts-1:0]                                  core_req_wstrb_i,
 
     /// spatz responses
     output logic            [NumPorts-1:0]                                  core_resp_valid_o,
@@ -123,7 +128,7 @@ module flamingo_spatz_cache_ctrl #(
     output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_we_o,
     output tcdm_bank_addr_t [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_addr_o,
     output word_data_t      [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_wdata_o,
-    output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_be_o,
+    output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0][WordWidth/ByteWidth-1:0] tcdm_data_bank_be_o,
     input  word_data_t      [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_rdata_i,
 
     /// Data Bank Request GNT for Cache
@@ -136,7 +141,7 @@ module flamingo_spatz_cache_ctrl #(
     //////////////////////////////////////
 
     typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
-    typedef logic [CacheLineWidth/WordWidth-1:0]                            coalescing_mask_t;
+    typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
     typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
 
     typedef struct packed {
@@ -147,7 +152,7 @@ module flamingo_spatz_cache_ctrl #(
     } coalescing_info_t;
 
     typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
-    typedef logic [CacheLineWidth/WordWidth-1:0]                            cache_mask_t;
+    typedef logic [CacheLineWidth/ByteWidth-1:0]                            cache_mask_t;
     typedef logic [CacheLineWidth/8-1:0]                                    cache_strb_t;
     typedef logic [$clog2(SetAssociativity)-1:0]                            way_ptr_t;
     typedef logic [$clog2(CacheWaysEntry)-1:0]                              cache_ways_entry_ptr_t;
@@ -231,7 +236,7 @@ module flamingo_spatz_cache_ctrl #(
     function automatic cache_strb_t mask_to_strb(input cache_mask_t mask);
         automatic cache_strb_t strb;
         for (int i = 0; i < CacheLineWidth/8 ; i++) begin
-            strb[i] = mask[i/(WordWidth/8)];
+            strb[i] = mask[i/(ByteWidth/8)];
         end
         return strb;
     endfunction
@@ -249,7 +254,8 @@ module flamingo_spatz_cache_ctrl #(
         .info_t             (core_meta_t),
         .down_id_t          (logic),
         .UpstreamDataWidth  (WordWidth),
-        .DownstreamDataWidth(CacheLineWidth)
+        .DownstreamDataWidth(CacheLineWidth),
+        .ByteWidth          (ByteWidth)
     ) i_par_coalescer_for_spatz (
         .clk_i,
         .rst_ni,
@@ -261,6 +267,7 @@ module flamingo_spatz_cache_ctrl #(
         .upstream_req_info_i    (core_req_meta_i      ),
         .upstream_req_write_i   (core_req_write_i     ),
         .upstream_req_wdata_i   (core_req_wdata_i     ),
+        .upstream_req_wstrb_i   (core_req_wstrb_i     ),
 
         .upstream_resp_valid_o  (core_resp_valid_o    ),
         .upstream_resp_ready_i  (core_resp_ready_i    ),
@@ -292,7 +299,8 @@ module flamingo_spatz_cache_ctrl #(
         .SetAssociativity       (SetAssociativity),
         .NumPseudoDualBanks     (BankFactor),
         .WriteThroughMode       (0),
-        .WordWidth              (WordWidth)
+        .WordWidth              (WordWidth),
+        .ByteWidth              (ByteWidth)
     ) i_insitu_cache_tcdm_wrapper (
         .clk_i,
         .rst_ni,

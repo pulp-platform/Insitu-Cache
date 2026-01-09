@@ -24,8 +24,10 @@ module cachepool_cache_ctrl #(
   parameter type         core_meta_t                                      = logic[7:0],
   /// Address width of both narrow request from spatz
   parameter int unsigned AddrWidth                                        = 32,
-  /// Width of word (granularity of non-blocking write)
+  /// Width of word
   parameter int unsigned WordWidth                                        = 64,
+  /// Width of strb (byte enable) for each word
+  parameter int unsigned ByteWidth                                        = 8,
   /// Width of Tag Bank data
   parameter int unsigned TagWidth                                         = 64,
 
@@ -73,7 +75,9 @@ module cachepool_cache_ctrl #(
   // Dependent parameter, do not override. TCDM Tag type.
   localparam type         tcdm_tag_data_t                                 = logic [TagWidth-1:0],
   // Dependent parameter, do not override. word type.
-  localparam type         word_data_t                                     = logic [WordWidth-1:0]
+  localparam type         word_data_t                                     = logic [WordWidth-1:0],
+  // Dependent parameter, do not override. byte strobe type.
+  localparam type         strb_t                                          = logic [WordWidth/ByteWidth-1:0]
   )(
   /// Clock, positive edge triggered.
   input  logic                                                            clk_i,
@@ -99,6 +103,7 @@ module cachepool_cache_ctrl #(
   input  core_meta_t      [NumPorts-1:0]                                  core_req_meta_i,
   input  logic            [NumPorts-1:0]                                  core_req_write_i,
   input  word_data_t      [NumPorts-1:0]                                  core_req_wdata_i,
+  input  strb_t           [NumPorts-1:0]                                  core_req_wstrb_i,
 
   /// spatz responses
   output logic            [NumPorts-1:0]                                  core_resp_valid_o,
@@ -134,7 +139,7 @@ module cachepool_cache_ctrl #(
   output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_we_o,
   output tcdm_bank_addr_t [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_addr_o,
   output word_data_t      [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_wdata_o,
-  output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_be_o,
+  output logic            [SetAssociativity-1:0][NumDataBankPerWay-1:0][WordWidth/ByteWidth-1:0] tcdm_data_bank_be_o,
   input  word_data_t      [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_rdata_i,
 
   /// Data Bank Request GNT for Cache
@@ -147,7 +152,7 @@ module cachepool_cache_ctrl #(
   //////////////////////////////////////
 
   typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
-  typedef logic [CacheLineWidth/WordWidth-1:0]                            coalescing_mask_t;
+  typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
   typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
 
   typedef struct packed {
@@ -159,7 +164,7 @@ module cachepool_cache_ctrl #(
   } coalescing_info_t;
 
   typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
-  typedef logic [CacheLineWidth/WordWidth-1:0]                            cache_mask_t;
+  typedef logic [CacheLineWidth/ByteWidth-1:0]                            cache_mask_t;
   typedef logic [CacheLineWidth/8-1:0]                                    cache_strb_t;
   typedef logic [$clog2(SetAssociativity)-1:0]                            way_ptr_t;
   typedef logic [$clog2(CacheWaysEntry)-1:0]                              cache_ways_entry_ptr_t;
@@ -232,7 +237,7 @@ module cachepool_cache_ctrl #(
   function automatic cache_strb_t mask_to_strb(input cache_mask_t mask);
     automatic cache_strb_t strb;
     for (int i = 0; i < CacheLineWidth/8 ; i++) begin
-        strb[i] = mask[i/(WordWidth/8)];
+        strb[i] = mask[i/(ByteWidth/8)];
     end
     return strb;
   endfunction
@@ -250,7 +255,8 @@ module cachepool_cache_ctrl #(
     .info_t                 (core_meta_t          ),
     .down_id_t              (logic                ),
     .UpstreamDataWidth      (WordWidth            ),
-    .DownstreamDataWidth    (CacheLineWidth       )
+    .DownstreamDataWidth    (CacheLineWidth       ),
+    .ByteWidth              (ByteWidth            )
   ) i_par_coalescer_for_spatz (
     .clk_i,
     .rst_ni,
@@ -262,6 +268,7 @@ module cachepool_cache_ctrl #(
     .upstream_req_info_i    (core_req_meta_i  [NumPorts-2:0]    ),
     .upstream_req_write_i   (core_req_write_i [NumPorts-2:0]    ),
     .upstream_req_wdata_i   (core_req_wdata_i [NumPorts-2:0]    ),
+    .upstream_req_wstrb_i   (core_req_wstrb_i [NumPorts-2:0]    ),
 
     .upstream_resp_valid_o  (core_resp_valid_o[NumPorts-2:0]    ),
     .upstream_resp_ready_i  (core_resp_ready_i[NumPorts-2:0]    ),
@@ -285,11 +292,13 @@ module cachepool_cache_ctrl #(
   );
 
   //1.mux/demux to divide snitch and spatz req/resp
+  localparam int unsigned BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
+  typedef logic [BypassAddrOfstWidth-1:0]    bypass_addr_ofst_t;
   typedef struct packed {
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-$clog2(CacheLineWidth/8)+2-1-1:0] padding;
-    core_meta_t                             core_meta;
-    logic [($clog2(CacheLineWidth/8)-1)-2:0]  addr_offset;
-    logic                                   bypass_coalescer;
+    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
+    core_meta_t                       core_meta;
+    bypass_addr_ofst_t                addr_offset;
+    logic                             bypass_coalescer;
   } bypass_info_t;
 
   typedef union packed {
@@ -310,7 +319,7 @@ module cachepool_cache_ctrl #(
     coalescer_xbar_info_union_t   info;
     logic               write;
     coalescing_data_t   wdata;
-    coalescing_mask_t   wmask;
+    cache_mask_t        wmask;
   } dreq_chan_t;
 
   typedef struct packed {
@@ -346,13 +355,16 @@ module cachepool_cache_ctrl #(
       bypass_info_t'{
         padding    : '0,
         core_meta  : core_req_meta_i[NumPorts-1],
-        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):2], // Snitch always accept word-width aligned response
+        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)], // Snitch always accept word-width aligned response
         bypass_coalescer: 1'b1
       }
     ),
     write   : core_req_write_i[NumPorts-1],
     wdata   : bypass_pad_data,
-    wmask   : (1 << (core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):($clog2(WordWidth/8))]))
+    wmask   :
+      core_req_wstrb_i[NumPorts-1][WordWidth/ByteWidth-1:0] <<
+        (WordWidth/ByteWidth *
+         core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):($clog2(WordWidth/8))])
   };
 
   assign bypass_xbar_resp = '{
@@ -397,7 +409,7 @@ module cachepool_cache_ctrl #(
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
   assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
-  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset[($clog2(CacheLineWidth/8)-1)-2:0] * 32 +: WordWidth];
+  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset * WordWidth +: WordWidth];
   assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
 
   //2.Insitu-Cache controller
@@ -411,6 +423,7 @@ module cachepool_cache_ctrl #(
     .NumPseudoDualBanks     (BankFactor             ),
     .WriteThroughMode       (0                      ),
     .WordWidth              (WordWidth              ),
+    .ByteWidth              (ByteWidth              ),
     .LogDebug               (1                      ),
     .LogLifeCycle           (0                      ),
     .AddrHashLength         (0                      )

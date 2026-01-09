@@ -67,8 +67,8 @@ module tb_insitu_cache_tcdm_wrapper#(
     localparam type addr_t                                                      = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type data_t                                                      = logic [CacheLineWidth-1:0],
-    // Dependent parameter, do not override. Word mask type.
-    localparam type mask_t                                                      = logic [CacheLineWidth/WordWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type mask_t                                                      = logic [CacheLineWidth/8-1:0],
     // Dependent parameter, do not override. Byte strb type.
     localparam type strb_t                                                      = logic [CacheLineWidth/8-1:0],
     // Dependent parameter, do not override. set ptr type.
@@ -137,9 +137,7 @@ module tb_insitu_cache_tcdm_wrapper#(
     /////////////////////////////////////
 
     function automatic void mask_to_strb(input mask_t mask, output strb_t strb);
-        for (int i = 0; i < CacheLineWidth/8 ; i++) begin
-            strb[i] = mask[i/(WordWidth/8)];
-        end
+        strb = mask;
     endfunction
 
     function automatic void simplify_data(input data_t data_in, output data_t data_out);
@@ -219,7 +217,7 @@ module tb_insitu_cache_tcdm_wrapper#(
     logic             [NumDataBank-1:0]                     tcdm_data_bank_we;
     tcdm_bank_addr_t  [NumDataBank-1:0]                     tcdm_data_bank_addr;
     cache_word_t      [NumDataBank-1:0]                     tcdm_data_bank_wdata;
-    logic             [NumDataBank-1:0]                     tcdm_data_bank_be;
+    logic             [NumDataBank-1:0][WordWidth/8-1:0]     tcdm_data_bank_be;
     cache_word_t      [NumDataBank-1:0]                     tcdm_data_bank_rdata;
 
     /// Bank Grant for Cache
@@ -345,7 +343,7 @@ module tb_insitu_cache_tcdm_wrapper#(
         tc_sram #(
             .NumWords(CacheBankDepth/NumPseudoDualBanks),
             .DataWidth(WordWidth),
-            .ByteWidth(WordWidth),
+            .ByteWidth(8),
             .NumPorts(1),
             .Latency(1),
             .SimInit("zeros")
@@ -707,7 +705,7 @@ end
             req_wrapper.randomize();
             req = req_wrapper.req;
             req.addr  = (i << $clog2(CacheLineWidth/8));
-            req.wmask = {(CacheLineWidth/WordWidth){1'b1}};
+            req.wmask = '1;
             mask_to_strb(req.wmask, req.wstrb);
             if (test_type == TEST_ALL_READS) begin
                 req.write = '0;
@@ -790,7 +788,7 @@ end
             /**********************************
             * generate sparse access requests *
             **********************************/
-            automatic logic [$clog2(CacheLineWidth/WordWidth)-1:0] offset;
+            automatic int unsigned offset;
             automatic upstream_req_t req;
             offset = number;
             req_wrapper.randomize();
@@ -798,7 +796,9 @@ end
 
             req.addr  = (number << $clog2(WordWidth/8));
             req.wmask = '0;
-            req.wmask[offset] = 1'b1;
+            for (int b = 0; b < WordWidth/8; b++) begin
+                req.wmask[(offset * (WordWidth/8)) + b] = 1'b1;
+            end
             mask_to_strb(req.wmask, req.wstrb);
             if (test_type == TEST_ALL_READS) begin
                 req.write = '0;
@@ -926,9 +926,18 @@ end
             begin
                 automatic upstream_req_wrapper req_wrapper = new;
                 automatic upstream_req_t req;
+                automatic logic [CacheLineWidth/WordWidth-1:0] word_mask;
                 req.addr = '0;
                 req.wstrb = '0;
-                req.wmask = 'b11101011;
+                word_mask = 'b11101011;
+                req.wmask = '0;
+                for (int w = 0; w < CacheLineWidth/WordWidth; w++) begin
+                    if (word_mask[w]) begin
+                        for (int b = 0; b < WordWidth/8; b++) begin
+                            req.wmask[(w * (WordWidth/8)) + b] = 1'b1;
+                        end
+                    end
+                end
 
                 req_wrapper.randomize();
                 req.wdata = req_wrapper.req.wdata;

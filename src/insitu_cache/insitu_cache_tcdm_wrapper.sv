@@ -47,6 +47,8 @@ module insitu_cache_tcdm_wrapper
     parameter int unsigned NumPseudoDualBanks       = 1,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 32,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                = 8,
     /// Tag Width
     parameter int unsigned TagWidth                 = 64,
     /// Log Debug information for questa-sim.
@@ -101,7 +103,7 @@ module insitu_cache_tcdm_wrapper
     // Dependent parameter, do not override. Wide word type.
     localparam type cache_data_t                    = logic [DownstreamWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                    = logic [DownstreamWidth/WordWidth-1:0],
+    localparam type cache_mask_t                    = logic [DownstreamWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. tag type.
     localparam type cache_tag_t                     = logic [ReqAddrWidth-$clog2(DownstreamWidth/8)-$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. bank depth ptr type.
@@ -174,7 +176,7 @@ module insitu_cache_tcdm_wrapper
     output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_we_o,
     output tcdm_bank_addr_t  [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_addr_o,
     output word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_wdata_o,
-    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_be_o,
+    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0][WordWidth/ByteWidth-1:0] tcdm_data_bank_be_o,
     input  word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_rdata_i,
 
     /// Data Bank Request GNT for Cache
@@ -209,6 +211,14 @@ module insitu_cache_tcdm_wrapper
         downstream_data_t                                   wdata;
         cache_mask_t                                        wmask;
     } down_req_t;
+
+    // Guard against truncating cache metadata in tag/meta banks.
+    initial begin
+        if (TagWidth < $bits(cache_meta_t)) begin
+            $error("TagWidth (%0d) is smaller than cache_meta_t (%0d); update L1D_TAG_DATA_WIDTH for byte masks.",
+                   TagWidth, $bits(cache_meta_t));
+        end
+    end
 
     typedef enum logic[2:0] {
         SYNC_CTRL_IDLE = '0,
@@ -324,6 +334,8 @@ module insitu_cache_tcdm_wrapper
     cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_cache_mask;
     cache_tag_t             [SetAssociativity - 1 : 0]      bank_write_cache_tag;
     cache_data_t            [SetAssociativity - 1 : 0]      bank_write_cache_data;
+    cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask;
+    cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask_sel;
     logic                                                   bank_write_LRU_req;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_write_cache_LRU;
 
@@ -443,7 +455,8 @@ module insitu_cache_tcdm_wrapper
             .info_t                             (info_t),
             .downstream_info_t                  (downstream_info_t),
             .CacheLineWidth                     (CacheLineWidth),
-            .WordWidth                          (WordWidth)
+            .WordWidth                          (WordWidth),
+            .ByteWidth                          (ByteWidth)
         ) i_write_through_merger (
             .clk_i,
             .rst_ni,
@@ -700,6 +713,7 @@ module insitu_cache_tcdm_wrapper
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
         .WordWidth       (WordWidth),
+        .ByteWidth       (ByteWidth),
         .LogDebug        (LogDebug),
         .LogLifeCycle    (LogLifeCycle),
         .RespFifoDepth   (RespFifoDepth),
@@ -767,6 +781,7 @@ module insitu_cache_tcdm_wrapper
         .bank_write_cache_mask_o        (proc_write_cache_mask),
         .bank_write_cache_tag_o         (proc_write_cache_tag),
         .bank_write_cache_data_o        (proc_write_cache_data),
+        .bank_write_data_mask_o         (bank_write_data_mask),
         .bank_write_LRU_req_o           (proc_write_LRU_req),
         .bank_write_cache_LRU_o         (proc_write_cache_LRU)
     );
@@ -914,6 +929,7 @@ module insitu_cache_tcdm_wrapper
     assign bank_write_cache_tag        = proc_write_select? proc_write_cache_tag : flush_write_cache_tag;
     assign bank_write_cache_data       = proc_write_select? proc_write_cache_data : flush_write_cache_data;
     assign bank_write_cache_LRU        = proc_write_select? proc_write_cache_LRU : flush_write_cache_LRU;
+    assign bank_write_data_mask_sel    = proc_write_select? bank_write_data_mask : '{default: '1};
 
 
     /*****************/
@@ -954,11 +970,13 @@ module insitu_cache_tcdm_wrapper
         cache_bank_depth_ptr_t  __gnt_data_bank_write_addr;
         logic                   __gnt_data_bank_write_req;
         cache_data_t            __gnt_data_bank_write_data;
+        cache_mask_t            __gnt_data_bank_write_mask;
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
-            .WordWidth          (WordWidth)
+            .WordWidth          (WordWidth),
+            .ByteWidth          (ByteWidth)
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
@@ -971,6 +989,7 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_addr_i       (bank_write_cache_addr),
             .upstream_write_req_i        (bank_write_cache_req),
             .upstream_write_data_i       (bank_write_cache_data[i]),
+            .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
 
             .downstream_read_addr_o      (__gnt_data_bank_read_addr),
             .downstream_read_valid_o     (__gnt_data_bank_read_valid),
@@ -980,6 +999,7 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_addr_o     (__gnt_data_bank_write_addr),
             .downstream_write_req_o      (__gnt_data_bank_write_req),
             .downstream_write_data_o     (__gnt_data_bank_write_data),
+            .downstream_write_mask_o     (__gnt_data_bank_write_mask),
 
             .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
 
@@ -989,7 +1009,8 @@ module insitu_cache_tcdm_wrapper
             .DEPTH              (CacheBankDepth),
             .NumPseudoDualBanks (NumPseudoDualBanks),
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
-            .WordWidth          (WordWidth)
+            .WordWidth          (WordWidth),
+            .ByteWidth          (ByteWidth)
         ) i_cache_data_bank (
             .clk_i,
             .rst_ni,
@@ -1002,6 +1023,7 @@ module insitu_cache_tcdm_wrapper
             .write_addr_i       (__gnt_data_bank_write_addr),
             .write_req_i        (__gnt_data_bank_write_req),
             .write_data_i       (__gnt_data_bank_write_data),
+            .write_mask_i       (__gnt_data_bank_write_mask),
 
             .tcdm_bank_req_o    (tcdm_data_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_data_bank_we_o[i]),
@@ -1027,11 +1049,13 @@ module insitu_cache_tcdm_wrapper
         cache_bank_depth_ptr_t  __gnt_meta_bank_write_addr;
         logic                   __gnt_meta_bank_write_req;
         cache_meta_t            __gnt_meta_bank_write_data;
+        logic                   __gnt_meta_bank_write_mask;
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (1),
-            .WordWidth          ($bits(cache_meta_t))
+            .WordWidth          ($bits(cache_meta_t)),
+            .ByteWidth          ($bits(cache_meta_t))
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1044,6 +1068,7 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_addr_i       (bank_write_cache_addr),
             .upstream_write_req_i        (bank_write_cache_req | bank_write_LRU_req),
             .upstream_write_data_i       (cache_meta_write_data[i]),
+            .upstream_write_mask_i       ('1    ),
 
             .downstream_read_addr_o      (__gnt_meta_bank_read_addr),
             .downstream_read_valid_o     (__gnt_meta_bank_read_valid),
@@ -1053,6 +1078,7 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_addr_o     (__gnt_meta_bank_write_addr),
             .downstream_write_req_o      (__gnt_meta_bank_write_req),
             .downstream_write_data_o     (__gnt_meta_bank_write_data),
+            .downstream_write_mask_o     (__gnt_meta_bank_write_mask),
 
             .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
 
@@ -1062,7 +1088,8 @@ module insitu_cache_tcdm_wrapper
             .DEPTH              (CacheBankDepth),
             .NumPseudoDualBanks (NumPseudoDualBanks),
             .NumWordsPerLine    (1),
-            .WordWidth          ($bits(cache_meta_t))
+            .WordWidth          ($bits(cache_meta_t)),
+            .ByteWidth          ($bits(cache_meta_t))
         ) i_cache_meta_bank (
             .clk_i,
             .rst_ni,
@@ -1075,6 +1102,7 @@ module insitu_cache_tcdm_wrapper
             .write_addr_i       (__gnt_meta_bank_write_addr),
             .write_req_i        (__gnt_meta_bank_write_req),
             .write_data_i       (__gnt_meta_bank_write_data),
+            .write_mask_i       (__gnt_meta_bank_write_mask),
 
             .tcdm_bank_req_o    (tcdm_meta_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_meta_bank_we_o[i]),
@@ -1104,10 +1132,14 @@ module pseudo_dual_port_tcdm_wrapper #(
     parameter int unsigned  NumWordsPerLine         = 2,
     /// Width of word
     parameter int unsigned  WordWidth               = 32,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned  ByteWidth               = 8,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. word type
     localparam type         word_t                  = logic [WordWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type         mask_t                  = logic [NumWordsPerLine*WordWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. Address type.
     localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0],
     // Dependent parameter, do not override. number of banks
@@ -1134,15 +1166,16 @@ module pseudo_dual_port_tcdm_wrapper #(
     input  addr_t                                   write_addr_i,
     input  logic                                    write_req_i,
     input  data_t                                   write_data_i,
+    input  mask_t                                   write_mask_i,
 
     /// bank ports
     output logic         [NumBanks-1:0]             tcdm_bank_req_o,
     output logic         [NumBanks-1:0]             tcdm_bank_we_o,
     output bank_addr_t   [NumBanks-1:0]             tcdm_bank_addr_o,
     output word_t        [NumBanks-1:0]             tcdm_bank_wdata_o,
-    output logic         [NumBanks-1:0]             tcdm_bank_be_o,
+    output logic         [NumBanks-1:0][WordWidth/ByteWidth-1:0] tcdm_bank_be_o,
     input  word_t        [NumBanks-1:0]             tcdm_bank_rdata_i
-    
+
 );
     //////////////////////////////////////
     //        Types Definition          //
@@ -1161,6 +1194,8 @@ module pseudo_dual_port_tcdm_wrapper #(
     //        Signal Definition         //
     //////////////////////////////////////
 
+    localparam int unsigned                       WordBytes = WordWidth/ByteWidth;
+
     //status
     pseudo_dual_status_t                            status;
 
@@ -1173,6 +1208,7 @@ module pseudo_dual_port_tcdm_wrapper #(
     logic         [NumPseudoDualBanks-1:0]          bank_we;
     bank_addr_t   [NumPseudoDualBanks-1:0]          bank_addr;
     data_t        [NumPseudoDualBanks-1:0]          bank_wdata;
+    mask_t        [NumPseudoDualBanks-1:0]          bank_wmask;
     data_t        [NumPseudoDualBanks-1:0]          bank_rdata;
 
     //read & write port address info
@@ -1205,7 +1241,7 @@ module pseudo_dual_port_tcdm_wrapper #(
             assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = bank_we[i];
             assign tcdm_bank_addr_o[i*NumWordsPerLine + j]   = bank_addr[i];
             assign tcdm_bank_wdata_o[i*NumWordsPerLine + j]  = __wdata[j];
-            assign tcdm_bank_be_o[i*NumWordsPerLine + j]     = 1'b1;
+            assign tcdm_bank_be_o[i*NumWordsPerLine + j]     = bank_wmask[i][j*WordBytes +: WordBytes];
             assign __rdata[j]                                = tcdm_bank_rdata_i[i*NumWordsPerLine + j];
         end
 
@@ -1226,6 +1262,7 @@ module pseudo_dual_port_tcdm_wrapper #(
         bank_we = '0;
         bank_addr = '0;
         bank_wdata = '0;
+        bank_wmask = '0;
 
         if (NumPseudoDualBanks <= 1) begin
             read_bank_select = '0;
@@ -1270,6 +1307,7 @@ module pseudo_dual_port_tcdm_wrapper #(
                 bank_we[write_bank_select]      = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
+                bank_wmask[write_bank_select]   = write_mask_i;
             end
 
             R_ONLY: begin
@@ -1286,6 +1324,7 @@ module pseudo_dual_port_tcdm_wrapper #(
                 bank_we[write_bank_select]      = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
+                bank_wmask[write_bank_select]   = write_mask_i;
 
                 bank_req[read_bank_select]      = 1'b1;
                 bank_we[read_bank_select]       = 1'b0;
@@ -1300,6 +1339,7 @@ module pseudo_dual_port_tcdm_wrapper #(
                 bank_we[write_bank_select]      = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
+                bank_wmask[write_bank_select]   = write_mask_i;
 
                 read_data_from_line_buffer_d    = 1'b1;
                 read_data_from_bank_select_d    = '0;
@@ -1310,11 +1350,12 @@ module pseudo_dual_port_tcdm_wrapper #(
                 bank_we[write_bank_select]      = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
+                bank_wmask[write_bank_select]   = write_mask_i;
 
                 read_data_from_line_buffer_d    = '0;
                 read_data_from_bank_select_d    = '0;
             end
-        
+
             default : /* default */;
         endcase
 
@@ -1338,8 +1379,12 @@ module insitu_cache_bank_access_controller #(
     parameter int unsigned  NumWordsPerLine         = 2,
     /// Width of word
     parameter int unsigned  WordWidth               = 32,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned  ByteWidth               = 8,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
+    /// Dependent parameter, do not override. Byte mask type.
+    localparam type         mask_t                  = logic [NumWordsPerLine*WordWidth/ByteWidth-1:0],
     /// Dependent parameter, do not override. word type
     localparam type         word_t                  = logic [WordWidth-1:0],
     // Dependent parameter, do not override. Address type.
@@ -1360,6 +1405,7 @@ module insitu_cache_bank_access_controller #(
     input  addr_t                                   upstream_write_addr_i,
     input  logic                                    upstream_write_req_i,
     input  data_t                                   upstream_write_data_i,
+    input  mask_t                                   upstream_write_mask_i,
 
     /// Downstream Read port
     output addr_t                                   downstream_read_addr_o,
@@ -1371,6 +1417,7 @@ module insitu_cache_bank_access_controller #(
     output addr_t                                   downstream_write_addr_o,
     output logic                                    downstream_write_req_o,
     output data_t                                   downstream_write_data_o,
+    output mask_t                                   downstream_write_mask_o,
 
     // Bank Access Grant
     input  logic                                    bank_gnt_i
@@ -1391,9 +1438,11 @@ module insitu_cache_bank_access_controller #(
     access_status_t access_status_q, access_status_d;
     data_t          access_stall_data_q, access_stall_data_d;
     addr_t          access_stall_addr_q, access_stall_addr_d;
+    mask_t          access_stall_mask_q, access_stall_mask_d;
     `FFARN (access_status_q, access_status_d, ACCESS_THROUGH, clk_i, rst_ni)
     `FFARN (access_stall_data_q, access_stall_data_d, '0, clk_i, rst_ni)
     `FFARN (access_stall_addr_q, access_stall_addr_d, '0, clk_i, rst_ni)
+    `FFARN (access_stall_mask_q, access_stall_mask_d, '0, clk_i, rst_ni)
 
 
     //////////////////////////////////////
@@ -1404,6 +1453,7 @@ module insitu_cache_bank_access_controller #(
         access_status_d         = access_status_q;
         access_stall_data_d     = access_stall_data_q;
         access_stall_addr_d     = access_stall_addr_q;
+        access_stall_mask_d     = access_stall_mask_q;
 
         upstream_read_ready_o   = downstream_read_ready_i;
         downstream_read_valid_o = upstream_read_valid_i;
@@ -1413,6 +1463,7 @@ module insitu_cache_bank_access_controller #(
         downstream_read_addr_o  = upstream_read_addr_i;
         downstream_write_addr_o = upstream_write_addr_i;
         downstream_write_data_o = upstream_write_data_i;
+        downstream_write_mask_o = upstream_write_mask_i;
 
         /*FSM*/
         case (access_status_q)
@@ -1426,6 +1477,7 @@ module insitu_cache_bank_access_controller #(
                         access_status_d = ACCESS_STALL;
                         access_stall_data_d = upstream_write_data_i;
                         access_stall_addr_d = upstream_write_addr_i;
+                        access_stall_mask_d = upstream_write_mask_i;
                     end
                 end
             end
@@ -1437,6 +1489,7 @@ module insitu_cache_bank_access_controller #(
 
                 downstream_write_addr_o = access_stall_addr_q;
                 downstream_write_data_o = access_stall_data_q;
+                downstream_write_mask_o = access_stall_mask_q;
                 if (bank_gnt_i) begin
                     downstream_write_req_o = 1'b1;
                     access_status_d = ACCESS_THROUGH;

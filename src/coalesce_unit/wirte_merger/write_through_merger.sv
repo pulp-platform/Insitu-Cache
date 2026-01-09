@@ -21,6 +21,8 @@ module write_through_merger #(
     parameter int unsigned CacheLineWidth           = 512,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                = 8,
     /// Watchdog Counter
     parameter int unsigned WatchDogMax              = 4,
     /// Word width of narrow data to upstream
@@ -29,6 +31,8 @@ module write_through_merger #(
     parameter int unsigned DownstreamWidth          = CacheLineWidth,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned NumWord                 = CacheLineWidth/WordWidth,
+    // Dependent parameter, do not override. Number of bytes per line.
+    localparam int unsigned NumBytes                = CacheLineWidth/ByteWidth,
     // Dependent parameter, do not override. Address type.
     localparam type addr_t                          = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
@@ -36,7 +40,7 @@ module write_through_merger #(
     // Dependent parameter, do not override. Wide word type.
     localparam type downstream_data_t               = logic [DownstreamWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type mask_t                          = logic [DownstreamWidth/WordWidth-1:0],
+    localparam type mask_t                          = logic [DownstreamWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. byte offset type.
     localparam type byte_of_t                       = logic [$clog2(DownstreamWidth/8)-1:0],
     // Dependent parameter, do not override. tag type.
@@ -75,8 +79,8 @@ module write_through_merger #(
 
     typedef logic [$clog2(WatchDogMax):0]           watch_dog_cnt_t;
 
-    typedef logic [WordWidth-1:0]                   cache_word_t;
-    typedef cache_word_t [NumWord-1:0]              cache_data_in_words_t;
+    typedef logic [ByteWidth-1:0]                   cache_byte_t;
+    typedef logic [NumBytes-1:0][ByteWidth-1:0]     cache_data_in_bytes_t;
 
     typedef struct packed {
         tag_t                                       tag;
@@ -210,19 +214,19 @@ module write_through_merger #(
                         upstream_req_ready_o = 1'b1;
 
                     end else if (coal_hit) begin
-                        automatic cache_data_in_words_t write_data_in_words = upstream_req_wdata_i;
-                        automatic cache_data_in_words_t cache_data_in_words = coal_meta_q.wdata;
+                        automatic cache_data_in_bytes_t write_data_in_bytes = upstream_req_wdata_i;
+                        automatic cache_data_in_bytes_t cache_data_in_bytes = coal_meta_q.wdata;
 
                         /* merge a hit */
                         dog_cnt_d = WatchDogMax;
 
-                        for (int wd = 0; wd < CacheLineWidth/WordWidth; wd++ ) begin
-                            if (upstream_req_wmask_i[wd]) begin
-                                cache_data_in_words[wd] = write_data_in_words[wd];
+                        for (int bt = 0; bt < NumBytes; bt++ ) begin
+                            if (upstream_req_wmask_i[bt]) begin
+                                cache_data_in_bytes[bt] = write_data_in_bytes[bt];
                             end
                         end
 
-                        coal_meta_d.wdata = cache_data_in_words;
+                        coal_meta_d.wdata = cache_data_in_bytes;
                         coal_meta_d.wmask = coal_meta_q.wmask | upstream_req_wmask_i;
 
                         //accept req

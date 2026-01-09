@@ -26,6 +26,8 @@ module par_coalescer_top #(
     parameter int unsigned UpstreamDataWidth        = 32,
     /// Data width of downstream channel
     parameter int unsigned DownstreamDataWidth      = 512,
+    /// Width of strb (byte enable) for each word
+    parameter int unsigned ByteWidth                = 8,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned NumWord                 = DownstreamDataWidth/UpstreamDataWidth,
     // Dependent parameter, do not override. Depth of cache bank.
@@ -34,10 +36,12 @@ module par_coalescer_top #(
     localparam type addr_t                          = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type upstream_data_t                 = logic [UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. byte strobe type.
+    localparam type upstream_strb_t                 = logic [UpstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. Wide word type.
     localparam type downstream_data_t               = logic [DownstreamDataWidth-1:0],
-    // Dependent parameter, do not override. Word mask type.
-    localparam type mask_t                          = logic [DownstreamDataWidth/UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type mask_t                          = logic [DownstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. byte offset type.
     localparam type offset_t                        = logic [$clog2(DownstreamDataWidth/UpstreamDataWidth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
@@ -58,6 +62,7 @@ module par_coalescer_top #(
     input  info_t           [NumPorts-1:0]          upstream_req_info_i,
     input  logic            [NumPorts-1:0]          upstream_req_write_i,
     input  upstream_data_t  [NumPorts-1:0]          upstream_req_wdata_i,
+    input  upstream_strb_t  [NumPorts-1:0]          upstream_req_wstrb_i,
 
     /// Upstream response
     output logic            [NumPorts-1:0]          upstream_resp_valid_o,
@@ -81,7 +86,6 @@ module par_coalescer_top #(
     input  downstream_data_t                        downstream_resp_data_i,
     input  downstream_info_t                        downstream_resp_info_i,
     input  logic                                    downstream_resp_write_i
- 
 );
 
 if (ExtFactor > 1) begin : gen_extend_window
@@ -92,7 +96,8 @@ if (ExtFactor > 1) begin : gen_extend_window
         .info_t             (info_t),
         .down_id_t          (down_id_t),
         .UpstreamDataWidth  (UpstreamDataWidth),
-        .DownstreamDataWidth(DownstreamDataWidth)
+        .DownstreamDataWidth(DownstreamDataWidth),
+        .ByteWidth          (ByteWidth)
     ) i_par_coalescer_extend_window (
         .clk_i,
         .rst_ni,
@@ -103,6 +108,7 @@ if (ExtFactor > 1) begin : gen_extend_window
         .upstream_req_info_i,
         .upstream_req_write_i,
         .upstream_req_wdata_i,
+        .upstream_req_wstrb_i,
         .upstream_resp_valid_o,
         .upstream_resp_ready_i,
         .upstream_resp_write_o,
@@ -128,7 +134,8 @@ end else begin : gen_equal_window
         .info_t             (info_t),
         .down_id_t          (down_id_t),
         .UpstreamDataWidth  (UpstreamDataWidth),
-        .DownstreamDataWidth(DownstreamDataWidth)
+        .DownstreamDataWidth(DownstreamDataWidth),
+        .ByteWidth          (ByteWidth)
     ) i_par_coalescer_equal_window (
         .clk_i,
         .rst_ni,
@@ -139,6 +146,7 @@ end else begin : gen_equal_window
         .upstream_req_info_i,
         .upstream_req_write_i,
         .upstream_req_wdata_i,
+        .upstream_req_wstrb_i,
         .upstream_resp_valid_o,
         .upstream_resp_ready_i,
         .upstream_resp_write_o,

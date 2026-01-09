@@ -26,6 +26,8 @@ module par_coalescer_extend_window #(
     parameter int unsigned UpstreamDataWidth        = 32,
     /// Data width of downstream channel
     parameter int unsigned DownstreamDataWidth      = 512,
+    /// Width of strb (byte enable) for each word
+    parameter int unsigned ByteWidth                = 8,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned NumWord                 = DownstreamDataWidth/UpstreamDataWidth,
     // Dependent parameter, do not override. Depth of cache bank.
@@ -34,10 +36,12 @@ module par_coalescer_extend_window #(
     localparam type addr_t                          = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type upstream_data_t                 = logic [UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. byte strobe type.
+    localparam type upstream_strb_t                 = logic [UpstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. Wide word type.
     localparam type downstream_data_t               = logic [DownstreamDataWidth-1:0],
-    // Dependent parameter, do not override. Word mask type.
-    localparam type mask_t                          = logic [DownstreamDataWidth/UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type mask_t                          = logic [DownstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. byte offset type.
     localparam type offset_t                        = logic [$clog2(DownstreamDataWidth/UpstreamDataWidth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
@@ -58,6 +62,7 @@ module par_coalescer_extend_window #(
     input  info_t           [NumPorts-1:0]          upstream_req_info_i,
     input  logic            [NumPorts-1:0]          upstream_req_write_i,
     input  upstream_data_t  [NumPorts-1:0]          upstream_req_wdata_i,
+    input  upstream_strb_t  [NumPorts-1:0]          upstream_req_wstrb_i,
 
     /// Upstream response
     output logic            [NumPorts-1:0]          upstream_resp_valid_o,
@@ -81,7 +86,6 @@ module par_coalescer_extend_window #(
     input  downstream_data_t                        downstream_resp_data_i,
     input  downstream_info_t                        downstream_resp_info_i,
     input  logic                                    downstream_resp_write_i
- 
 );
 
      //////////////////////////////////////
@@ -89,7 +93,6 @@ module par_coalescer_extend_window #(
     //////////////////////////////////////
 
     typedef logic [$clog2(ExtFactor)-1:0]           port_select_t;
-    
 
     //////////////////////////////////////
     //        Signal Definition         //
@@ -101,6 +104,7 @@ module par_coalescer_extend_window #(
     info_t           [NumPorts-1:0][ExtFactor-1:0]  extend_req_info;
     logic            [NumPorts-1:0][ExtFactor-1:0]  extend_req_write;
     upstream_data_t  [NumPorts-1:0][ExtFactor-1:0]  extend_req_wdata;
+    upstream_strb_t  [NumPorts-1:0][ExtFactor-1:0]  extend_req_wstrb;
 
     /// Upstream response
     logic            [NumPorts-1:0][ExtFactor-1:0]  extend_resp_valid;
@@ -142,6 +146,7 @@ module par_coalescer_extend_window #(
             extend_req_info[i][req_port_select_q[i]]  = upstream_req_info_i[i];
             extend_req_write[i][req_port_select_q[i]] = upstream_req_write_i[i];
             extend_req_wdata[i][req_port_select_q[i]] = upstream_req_wdata_i[i];
+            extend_req_wstrb[i][req_port_select_q[i]] = upstream_req_wstrb_i[i];
         end
     end
 
@@ -175,7 +180,6 @@ module par_coalescer_extend_window #(
         end
     end
 
-    
 
     //////////////////////////////////
     //        Instance Modules      //
@@ -188,6 +192,7 @@ module par_coalescer_extend_window #(
         .down_id_t          (down_id_t),
         .UpstreamDataWidth  (UpstreamDataWidth),
         .DownstreamDataWidth(DownstreamDataWidth),
+        .ByteWidth          (ByteWidth),
         .SpliterSpillReg    (0)
     ) i_par_coalescer (
         .clk_i,
@@ -200,6 +205,7 @@ module par_coalescer_extend_window #(
         .upstream_req_info_i    (extend_req_info      ),
         .upstream_req_write_i   (extend_req_write     ),
         .upstream_req_wdata_i   (extend_req_wdata     ),
+        .upstream_req_wstrb_i   (extend_req_wstrb     ),
 
         .upstream_resp_valid_o  (extend_resp_valid    ),
         .upstream_resp_ready_i  (extend_resp_ready    ),

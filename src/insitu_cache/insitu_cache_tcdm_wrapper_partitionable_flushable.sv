@@ -47,6 +47,8 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
     parameter int unsigned NumPseudoDualBanks       = 1,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 32,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                = 8,
     /// Log Debug information for questa-sim.
     parameter int unsigned LogDebug                 = 1,
     /// Counter cache line life cycle information for questa-sim.
@@ -97,7 +99,7 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
     // Dependent parameter, do not override. Wide word type.
     localparam type cache_data_t                    = logic [DownstreamWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                    = logic [DownstreamWidth/WordWidth-1:0],
+    localparam type cache_mask_t                    = logic [DownstreamWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. bank depth ptr type.
     localparam type cache_bank_depth_ptr_t          = logic [$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
@@ -163,7 +165,7 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
     output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_we_o,
     output tcdm_bank_addr_t  [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_addr_o,
     output word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_wdata_o,
-    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_be_o,
+    output logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0][WordWidth/ByteWidth-1:0] tcdm_data_bank_be_o,
     input  word_t            [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_rdata_i,
 
     /// Data Bank Request GNT for Cache
@@ -227,6 +229,7 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
         .SetAssociativity     (SetAssociativity),
         .NumPseudoDualBanks   (NumPseudoDualBanks),
         .WordWidth            (WordWidth),
+        .ByteWidth            (ByteWidth),
         .LogDebug             (LogDebug),
         .LogLifeCycle         (LogLifeCycle),
         .WriteThroughFifoDepth(WriteThroughFifoDepth),

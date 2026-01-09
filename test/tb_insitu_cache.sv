@@ -46,8 +46,8 @@ module tb_insitu_cache#(
     localparam type addr_t                                                      = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type data_t                                                      = logic [CacheLineWidth-1:0],
-    // Dependent parameter, do not override. Word mask type.
-    localparam type mask_t                                                      = logic [CacheLineWidth/WordWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type mask_t                                                      = logic [CacheLineWidth/8-1:0],
     // Dependent parameter, do not override. Byte strb type.
     localparam type strb_t                                                      = logic [CacheLineWidth/8-1:0],
     // Dependent parameter, do not override. set ptr type.
@@ -112,9 +112,7 @@ module tb_insitu_cache#(
     /////////////////////////////////////
 
     function automatic void mask_to_strb(input mask_t mask, output strb_t strb);
-        for (int i = 0; i < CacheLineWidth/8 ; i++) begin
-            strb[i] = mask[i/(WordWidth/8)];
-        end
+        strb = mask;
     endfunction
 
     function automatic void simplify_data(input data_t data_in, output data_t data_out);
@@ -549,9 +547,18 @@ end
             begin
                 automatic upstream_req_wrapper req_wrapper = new;
                 automatic upstream_req_t req;
+                automatic logic [CacheLineWidth/WordWidth-1:0] word_mask;
                 req.addr = '0;
                 req.wstrb = '0;
-                req.wmask = 'b11101011;
+                word_mask = 'b11101011;
+                req.wmask = '0;
+                for (int w = 0; w < CacheLineWidth/WordWidth; w++) begin
+                    if (word_mask[w]) begin
+                        for (int b = 0; b < WordWidth/8; b++) begin
+                            req.wmask[(w * (WordWidth/8)) + b] = 1'b1;
+                        end
+                    end
+                end
 
                 req_wrapper.randomize();
                 req.wdata = req_wrapper.req.wdata;

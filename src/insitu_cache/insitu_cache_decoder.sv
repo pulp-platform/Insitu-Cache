@@ -27,6 +27,8 @@ module insitu_cache_decoder
     parameter int unsigned SetAssociativity                 = 16,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                        = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                        = 8,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheBankDepth                  = NumCacheEntry/SetAssociativity,
     // Dependent parameter, do not override. way ptr type.
@@ -36,7 +38,7 @@ module insitu_cache_decoder
     // Dependent parameter, do not override. Narrow word type.
     localparam type cache_data_t                            = logic [CacheLineWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                            = logic [CacheLineWidth/WordWidth-1:0],
+    localparam type cache_mask_t                            = logic [CacheLineWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. tag type.
     localparam type cache_tag_t                             = logic [ReqAddrWidth-$clog2(CacheLineWidth/8)-$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. bank depth ptr type.

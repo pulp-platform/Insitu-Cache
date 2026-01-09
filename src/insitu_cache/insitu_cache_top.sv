@@ -33,6 +33,8 @@ module insitu_cache_top #(
     parameter int unsigned NumPseudoDualBanks       = 8,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                = 8,
     /// Log Debug information for questa-sim.
     parameter int unsigned LogDebug                 = 1,
     /// Counter cache line life cycle information for questa-sim.
@@ -77,7 +79,7 @@ module insitu_cache_top #(
     // Dependent parameter, do not override. Wide word type.
     localparam type cache_data_t                    = logic [DownstreamWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                    = logic [DownstreamWidth/WordWidth-1:0],
+    localparam type cache_mask_t                    = logic [DownstreamWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. tag type.
     localparam type cache_tag_t                     = logic [ReqAddrWidth-$clog2(DownstreamWidth/8)-$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. bank depth ptr type.
@@ -262,6 +264,7 @@ module insitu_cache_top #(
     cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_cache_mask;
     cache_tag_t             [SetAssociativity - 1 : 0]      bank_write_cache_tag;
     cache_data_t            [SetAssociativity - 1 : 0]      bank_write_cache_data;
+    cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask;
     logic                                                   bank_write_LRU_req;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_write_cache_LRU;
 
@@ -312,7 +315,8 @@ module insitu_cache_top #(
             .info_t                             (info_t),
             .downstream_info_t                  (downstream_info_t),
             .CacheLineWidth                     (CacheLineWidth),
-            .WordWidth                          (WordWidth)
+            .WordWidth                          (WordWidth),
+            .ByteWidth                          (ByteWidth)
         ) i_write_through_merger (
             .clk_i,
             .rst_ni,
@@ -424,6 +428,7 @@ module insitu_cache_top #(
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
         .WordWidth       (WordWidth),
+        .ByteWidth       (ByteWidth),
         .LogDebug        (LogDebug),
         .LogLifeCycle    (LogLifeCycle),
         .RespFifoDepth   (RespFifoDepth),
@@ -491,6 +496,7 @@ module insitu_cache_top #(
         .bank_write_cache_mask_o        (bank_write_cache_mask),
         .bank_write_cache_tag_o         (bank_write_cache_tag),
         .bank_write_cache_data_o        (bank_write_cache_data),
+        .bank_write_data_mask_o         (bank_write_data_mask),
         .bank_write_LRU_req_o           (bank_write_LRU_req),
         .bank_write_cache_LRU_o         (bank_write_cache_LRU)
     );

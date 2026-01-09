@@ -59,6 +59,8 @@ module tb_flamingo_spatz_cache_ctrl#(
     localparam type data_t                                                      = logic [CacheLineWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type word_t                                                      = logic [WordWidth-1:0],
+    // Dependent parameter, do not override. Byte strobe type for a word.
+    localparam type word_strb_t                                                 = logic [WordWidth/8-1:0],
     // Dependent parameter, do not override. Word mask type.
     localparam type mask_t                                                      = logic [CacheLineWidth/WordWidth-1:0],
     // Dependent parameter, do not override. Byte strb type.
@@ -93,6 +95,7 @@ module tb_flamingo_spatz_cache_ctrl#(
         core_meta_t                                         meta;
         logic                                               write;
         word_t                                              wdata;
+        word_strb_t                                         strb;
     } core_req_t;
 
     typedef struct packed {
@@ -116,6 +119,7 @@ module tb_flamingo_spatz_cache_ctrl#(
     core_meta_t       [NumPorts-1:0]                        core_req_meta;
     logic             [NumPorts-1:0]                        core_req_write;
     word_t            [NumPorts-1:0]                        core_req_wdata;
+    word_strb_t       [NumPorts-1:0]                        core_req_wstrb;
 
     logic             [NumPorts-1:0]                        core_resp_valid;
     logic             [NumPorts-1:0]                        core_resp_ready;
@@ -142,7 +146,7 @@ module tb_flamingo_spatz_cache_ctrl#(
     logic             [NumDataBank-1:0]                     tcdm_data_bank_we;
     tcdm_bank_addr_t  [NumDataBank-1:0]                     tcdm_data_bank_addr;
     word_t            [NumDataBank-1:0]                     tcdm_data_bank_wdata;
-    logic             [NumDataBank-1:0]                     tcdm_data_bank_be;
+    logic             [NumDataBank-1:0][WordWidth/8-1:0]     tcdm_data_bank_be;
     word_t            [NumDataBank-1:0]                     tcdm_data_bank_rdata;
 
     /// Bank Grant for Cache
@@ -207,6 +211,7 @@ module tb_flamingo_spatz_cache_ctrl#(
         .core_req_meta_i        (core_req_meta),
         .core_req_write_i       (core_req_write),
         .core_req_wdata_i       (core_req_wdata),
+        .core_req_wstrb_i       (core_req_wstrb),
         .core_resp_valid_o      (core_resp_valid),
         .core_resp_ready_i      (core_resp_ready),
         .core_resp_write_o      (core_resp_write),
@@ -261,7 +266,7 @@ module tb_flamingo_spatz_cache_ctrl#(
         tc_sram #(
             .NumWords(CacheWaysEntry/BankFactor),
             .DataWidth(WordWidth),
-            .ByteWidth(WordWidth),
+            .ByteWidth(8),
             .NumPorts(1),
             .Latency(1),
             .SimInit("zeros")
@@ -339,6 +344,7 @@ module tb_flamingo_spatz_cache_ctrl#(
                 req.meta  = core_req_meta[i];
                 req.write = core_req_write[i];
                 req.wdata = core_req_wdata[i];
+                req.strb  = core_req_wstrb[i];
                 monitor_core_request_queue[i].push_back(req);  // Push write signal into queue
             end
         end
@@ -437,6 +443,7 @@ module tb_flamingo_spatz_cache_ctrl#(
             core_req_meta[id]   = '0;
             core_req_write[id]  = '0;
             core_req_wdata[id]  = '0;
+            core_req_wstrb[id]  = '0;
             core_req_valid[id]  = '0;
             core_resp_ready[id] = 1'b1;
         end
@@ -450,6 +457,7 @@ module tb_flamingo_spatz_cache_ctrl#(
         core_req_meta[id] = req.meta;
         core_req_write[id] = req.write;
         core_req_wdata[id] = req.wdata;
+        core_req_wstrb[id] = req.strb;
         core_req_valid[id] = 1'b1;
         cycle_start();
         while (core_req_ready[id] != 1'b1) begin cycle_end(); cycle_start(); end
@@ -458,6 +466,7 @@ module tb_flamingo_spatz_cache_ctrl#(
         core_req_meta[id] = '0;
         core_req_write[id] = '0;
         core_req_wdata[id] = '0;
+        core_req_wstrb[id] = '0;
         core_req_valid[id] = '0;
     endtask
 
@@ -486,6 +495,7 @@ module tb_flamingo_spatz_cache_ctrl#(
             req_wrapper.req.addr = req_wrapper.req.addr << $clog2(WordWidth/8);
             req_wrapper.req.meta.core_id = id;
             req_wrapper.req.meta.access_id = i;
+            req_wrapper.req.strb = req_wrapper.req.write ? {WordWidth/8{1'b1}} : '0;
             send_req_to_cache(req_wrapper.req, id);
             $display("%s[Core %0d]    Send #%0d ",test_type_str,id,i);
         end
@@ -506,6 +516,7 @@ module tb_flamingo_spatz_cache_ctrl#(
             req_wrapper.req.meta.core_id = id;
             req_wrapper.req.meta.access_id = i;
             req_wrapper.req.write = '0;
+            req_wrapper.req.strb = '0;
             send_req_to_cache(req_wrapper.req, id);
             $display("%s[Core %0d]    Send #%0d ",test_type_str,id,i);
         end

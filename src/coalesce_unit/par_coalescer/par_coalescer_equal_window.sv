@@ -23,18 +23,24 @@ module par_coalescer_equal_window #(
     parameter int unsigned UpstreamDataWidth        = 32,
     /// Data width of downstream channel
     parameter int unsigned DownstreamDataWidth      = 512,
+    /// Width of strb (byte enable) for each word
+    parameter int unsigned ByteWidth                = 8,
     /// Number of narrow request ports.
     parameter bit          SpliterSpillReg          = 0,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned NumWord                 = DownstreamDataWidth/UpstreamDataWidth,
+    // Dependent parameter, do not override. Number of bytes per upstream word.
+    localparam int unsigned WordBytes               = UpstreamDataWidth/ByteWidth,
     // Dependent parameter, do not override. Address type.
     localparam type addr_t                          = logic [ReqAddrWidth-1:0],
     // Dependent parameter, do not override. Narrow word type.
     localparam type upstream_data_t                 = logic [UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. byte strobe type.
+    localparam type upstream_strb_t                 = logic [UpstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. Wide word type.
     localparam type downstream_data_t               = logic [DownstreamDataWidth-1:0],
-    // Dependent parameter, do not override. Word mask type.
-    localparam type mask_t                          = logic [DownstreamDataWidth/UpstreamDataWidth-1:0],
+    // Dependent parameter, do not override. Byte mask type.
+    localparam type mask_t                          = logic [DownstreamDataWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. byte offset type.
     localparam type offset_t                        = logic [$clog2(DownstreamDataWidth/UpstreamDataWidth)-1:0],
     // Dependent parameter, do not override. Downstream request payload.
@@ -55,6 +61,7 @@ module par_coalescer_equal_window #(
     input  info_t           [NumPorts-1:0]          upstream_req_info_i,
     input  logic            [NumPorts-1:0]          upstream_req_write_i,
     input  upstream_data_t  [NumPorts-1:0]          upstream_req_wdata_i,
+    input  upstream_strb_t  [NumPorts-1:0]          upstream_req_wstrb_i,
 
     /// Upstream response
     output logic            [NumPorts-1:0]          upstream_resp_valid_o,
@@ -113,6 +120,7 @@ module par_coalescer_equal_window #(
 
     info_t             [NumPorts-1:0]               buffer_req_info;
     upstream_data_t    [NumPorts-1:0]               buffer_req_wdata;
+    upstream_strb_t    [NumPorts-1:0]               buffer_req_wstrb;
 
 
     logic              [NumPorts-1:0]               upstream_resp_valid;
@@ -146,8 +154,8 @@ module par_coalescer_equal_window #(
         .clk_i,
         .rst_ni,
 
-        .upstream_addr_i           (write_mixed_addr           ), 
-        .upstream_valid_i          (upstream_req_valid_i       ), 
+        .upstream_addr_i           (write_mixed_addr           ),
+        .upstream_valid_i          (upstream_req_valid_i       ),
         .upstream_ready_o          (upstream_req_ready_o       ),
 
         .coal_valid_o              (coal_req_valid             ),
@@ -216,6 +224,24 @@ module par_coalescer_equal_window #(
             .pop_i                 (downstream_req_valid_o & downstream_req_ready_i & downstream_req_info_o.hitmap[i] )
         );
 
+        fifo_v3 #(
+            .FALL_THROUGH          (1'b0                       ),
+            .DEPTH                 (4                          ),
+            .dtype                 (upstream_strb_t            )
+        ) i_req_wstrb_fifo (
+            .clk_i,
+            .rst_ni,
+            .flush_i               (1'b0                       ),
+            .testmode_i            (1'b0                       ),
+            .full_o                (/*open*/),
+            .empty_o               (/*open*/),
+            .usage_o               (/*open*/                   ),
+            .data_i                (upstream_req_wstrb_i[i]    ),
+            .push_i                (upstream_req_valid_i[i] & upstream_req_ready_o[i]),
+            .data_o                (buffer_req_wstrb[i]        ),
+            .pop_i                 (downstream_req_valid_o & downstream_req_ready_i & downstream_req_info_o.hitmap[i] )
+        );
+
     end
 
     always_comb begin : gen_down_req_data
@@ -228,11 +254,27 @@ module par_coalescer_equal_window #(
         downstream_req_info_o.ofsts = coal_req_cut.ofsts;
         downstream_req_info_o.bypass_coalescer = 1'b0;
 
+        // Higher index ports override earlier bytes on overlap.
         for (int i = 0; i < NumPorts; i++) begin
             downstream_req_info_o.infos[i] = coal_req_cut.hitmap[i]? buffer_req_info[i] : '0;
             if (coal_req_cut.hitmap[i]) begin
-                wdata[coal_req_cut.ofsts[i]] = buffer_req_wdata[i];
-                downstream_req_wmask_o[coal_req_cut.ofsts[i]] = 1'b1;
+                automatic int unsigned word_index;
+                automatic upstream_data_t wdata_word;
+                automatic upstream_data_t req_word;
+                word_index = coal_req_cut.ofsts[i];
+                if (downstream_req_write_o) begin
+                    wdata_word = wdata[word_index];
+                    req_word = buffer_req_wdata[i];
+                    for (int b = 0; b < WordBytes; b++) begin
+                        if (buffer_req_wstrb[i][b]) begin
+                            wdata_word[b * ByteWidth +: ByteWidth] = req_word[b * ByteWidth +: ByteWidth];
+                            downstream_req_wmask_o[word_index * WordBytes + b] = 1'b1;
+                        end
+                    end
+                    wdata[word_index] = wdata_word;
+                end else begin
+                    wdata[word_index] = buffer_req_wdata[i];
+                end
             end
         end
 

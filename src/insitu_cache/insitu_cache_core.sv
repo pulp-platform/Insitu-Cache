@@ -38,6 +38,8 @@ module insitu_cache_core
     parameter int unsigned SetAssociativity                 = 16,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                        = 64,
+    /// Width of byte (granularity of byte mask)
+    parameter int unsigned ByteWidth                        = 8,
     /// Show Debug information on screen.
     parameter int unsigned ShowDebug                        = 0,
     /// Log Debug information for questa-sim.
@@ -70,7 +72,7 @@ module insitu_cache_core
     // Dependent parameter, do not override. Narrow word type.
     localparam type cache_data_t                            = logic [CacheLineWidth-1:0],
     // Dependent parameter, do not override. Byte mask type.
-    localparam type cache_mask_t                            = logic [CacheLineWidth/WordWidth-1:0],
+    localparam type cache_mask_t                            = logic [CacheLineWidth/ByteWidth-1:0],
     // Dependent parameter, do not override. tag type.
     localparam type cache_tag_t                             = logic [ReqAddrWidth-$clog2(CacheLineWidth/8)-$clog2(CacheBankDepth)-1:0],
     // Dependent parameter, do not override. bank depth ptr type.
@@ -147,6 +149,7 @@ module insitu_cache_core
     output cache_mask_t             [SetAssociativity-1:0]  bank_write_cache_mask_o,
     output cache_tag_t              [SetAssociativity-1:0]  bank_write_cache_tag_o,
     output cache_data_t             [SetAssociativity-1:0]  bank_write_cache_data_o,
+    output cache_mask_t             [SetAssociativity-1:0]  bank_write_data_mask_o,
     output logic                                            bank_write_LRU_req_o,
     output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o
     
@@ -161,7 +164,7 @@ module insitu_cache_core
     localparam int unsigned MaxNumSubarray                  = CacheLineWidth/InfoWidth;
     localparam int unsigned NumSubarray                     = MaxNumSubarray > (2**SubarrayCounterWidth)-2? (2**SubarrayCounterWidth)-2 : MaxNumSubarray;
     localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoWidth;
-    localparam int unsigned TaskPayloadPad                  = ReqAddrWidth + CacheLineWidth/WordWidth + InfoWidth - $bits(downstream_info_t);
+    localparam int unsigned TaskPayloadPad                  = ReqAddrWidth + CacheLineWidth/ByteWidth + InfoWidth - $bits(downstream_info_t);
 
 
 
@@ -792,7 +795,8 @@ module insitu_cache_core
         .task_payload_t  (task_payload_t),
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
-        .WordWidth       (WordWidth)
+        .WordWidth       (WordWidth),
+        .ByteWidth       (ByteWidth)
     ) i_insitu_cache_decoder (
         .bank_read_cache_status_i,
         .bank_read_cache_dirty_i,
@@ -834,7 +838,8 @@ module insitu_cache_core
         .task_payload_t  (task_payload_t),
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
-        .WordWidth       (WordWidth)
+        .WordWidth       (WordWidth),
+        .ByteWidth       (ByteWidth)
     ) i_insitu_cache_encoder (
         .clk_i,
         .rst_ni,
@@ -870,6 +875,7 @@ module insitu_cache_core
         .bank_write_cache_mask_o,
         .bank_write_cache_tag_o,
         .bank_write_cache_data_o,
+        .bank_write_data_mask_o,
         .bank_write_cache_LRU_o
     );
 
