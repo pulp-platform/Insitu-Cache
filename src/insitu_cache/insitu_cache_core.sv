@@ -201,6 +201,8 @@ module insitu_cache_core
     //Byte packed cache data
     typedef logic [WordWidth-1:0]                           cache_word_t;
     typedef cache_word_t [CacheLineWidth/WordWidth-1:0]     cache_data_in_words_t;
+    typedef logic [ByteWidth-1:0]                           cache_byte_t;
+    typedef cache_byte_t [CacheLineWidth/ByteWidth-1:0]     cache_data_in_bytes_t;
 
     //Cache payload
     typedef union packed {
@@ -1623,6 +1625,8 @@ module insitu_cache_core
             automatic cache_data_in_words_t cache_data_in_words;
             automatic cache_data_in_words_t evic_data_in_words;
             automatic cache_data_in_words_t write_data_in_words;
+            automatic cache_data_in_bytes_t cache_data_in_bytes;
+            automatic cache_data_in_bytes_t write_data_in_bytes;
             automatic cache_mask_t write_storb;
             automatic way_ptr_t refill_way = dec_way;
             automatic logic is_stalled_req_write;
@@ -1671,12 +1675,15 @@ module insitu_cache_core
             //2.3 Update accroding to dirty bits
             if (dec_cache_dirty) begin
                 write_data_in_words = dec_cache_data;
+                cache_data_in_bytes = cache_data_in_words;
+                write_data_in_bytes = write_data_in_words;
                 write_storb = dec_cache_mask;
-                for (int bt = 0; bt < CacheLineWidth/WordWidth; bt++ ) begin
+                for (int bt = 0; bt < CacheLineWidth/ByteWidth; bt++ ) begin
                     if (write_storb[bt]) begin
-                        cache_data_in_words[bt] = write_data_in_words[bt];
+                        cache_data_in_bytes[bt] = write_data_in_bytes[bt];
                     end
                 end
+                cache_data_in_words = cache_data_in_bytes;
             end
 
             //2.4 Update cache line data

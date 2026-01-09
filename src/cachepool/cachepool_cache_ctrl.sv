@@ -242,6 +242,19 @@ module cachepool_cache_ctrl #(
     return strb;
   endfunction
 
+  coalescing_data_t bypass_pad_data;
+  logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
+
+  assign bypass_word_index =
+    core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)];
+
+  always_comb begin
+    bypass_pad_data = '0;
+    // Data from the core is already aligned to the byte lane indicated by strb.
+    bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
+      core_req_wdata_i[NumPorts-1];
+  end
+
 
   /////////////////////////////////////
   //        Instance Modules         //
@@ -331,11 +344,6 @@ module cachepool_cache_ctrl #(
   dreq_chan_t coalescer_req, bypass_req, bypass_xbar_req;
   drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
 
-  coalescing_data_t bypass_pad_data;
-  always_comb begin
-    bypass_pad_data = '0;
-    bypass_pad_data[ core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0] * 8  +: WordWidth] = core_req_wdata_i[NumPorts-1];
-  end
   assign coalescer_req = '{
     addr    : coalescing_req_addr,
     info    : coalescer_xbar_info_union_t'(coalescing_req_info),
@@ -363,8 +371,7 @@ module cachepool_cache_ctrl #(
     wdata   : bypass_pad_data,
     wmask   :
       core_req_wstrb_i[NumPorts-1][WordWidth/ByteWidth-1:0] <<
-        (WordWidth/ByteWidth *
-         core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):($clog2(WordWidth/8))])
+        (WordWidth/ByteWidth * bypass_word_index)
   };
 
   assign bypass_xbar_resp = '{
