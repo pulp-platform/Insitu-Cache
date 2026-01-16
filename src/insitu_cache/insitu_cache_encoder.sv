@@ -176,7 +176,7 @@ module insitu_cache_encoder
         bank_write_cache_tag_o = bank_read_cache_tag_i;
         bank_write_cache_data_o = bank_read_cache_data_i;
         bank_write_cache_LRU_o = bank_read_cache_LRU_i;
-        bank_write_data_mask_o = '{default: '1};
+        bank_write_data_mask_o = '{default: '0};
 
         pendline_cnt_d = pendline_cnt_q;
         has_pend_line_o = (pendline_cnt_q != '0);
@@ -197,6 +197,8 @@ module insitu_cache_encoder
             end
             write_data_final = cache_data_in_bytes;
             bank_write_data_mask_o[enc_way_i] = enc_mod_mask_i;
+        end else begin
+            bank_write_data_mask_o[enc_way_i] = '1;
         end
 
         //modify selescted way

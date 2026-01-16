@@ -27,6 +27,10 @@ module tb_flamingo_spatz_cache_ctrl#(
     parameter int unsigned SetAssociativity                                     = `NUM_CACHE_ASSO,
     /// Number of Pseudo-Dual Banks
     parameter int unsigned BankFactor                                           = `NUM_CACHE_BANK_FACTOR,
+    /// Enable folded data banks for cache data RAM.
+    parameter bit          UseFoldedDataBanks                                   = 1'b1,
+    /// Ways per folded data bank (0 = auto: min(4, SetAssociativity)).
+    parameter int unsigned FoldWayGroup                                         = 0,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                                            = `CACHE_WORD_WIDTH,
     /// Number of Latency of Offchip Link
@@ -47,10 +51,19 @@ module tb_flamingo_spatz_cache_ctrl#(
 
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheWaysEntry                                      = NumCacheEntry/SetAssociativity,
+    localparam int unsigned NumDataBankPerWay                                   = BankFactor*(CacheLineWidth/WordWidth),
     // Dependent parameter, do not override. Number of data tcdm banks.
     localparam int unsigned NumDataBank                                         = SetAssociativity*BankFactor*(CacheLineWidth/WordWidth),
     // Dependent parameter, do not override. Number of meta tcdm banks.
     localparam int unsigned NumTagBank                                          = SetAssociativity*BankFactor,
+    localparam int unsigned NumWays                                             = SetAssociativity,
+    localparam int unsigned EffectiveFoldWayGroup                               = UseFoldedDataBanks ?
+        ((FoldWayGroup == 0) ? ((SetAssociativity < 4) ? SetAssociativity : 4) : FoldWayGroup) :
+        SetAssociativity,
+    localparam int unsigned NumWayGroups                                        = SetAssociativity / EffectiveFoldWayGroup,
+    localparam int unsigned DataBankLineSplit                                   = UseFoldedDataBanks ? EffectiveFoldWayGroup : 1,
+    localparam int unsigned DataBankWordGroup                                   = (CacheLineWidth / DataBankLineSplit) / WordWidth,
+    localparam int unsigned NumDataBankPerWayGrouped                            = NumDataBankPerWay / DataBankWordGroup,
     // Dependent parameter, do not override. Address type.
     localparam type tcdm_bank_addr_t                                            = logic [$clog2(CacheWaysEntry)-$clog2(BankFactor)-1:0],
     // Dependent parameter, do not override. Address type.
@@ -262,26 +275,95 @@ module tb_flamingo_spatz_cache_ctrl#(
         );
     end
 
-    for (genvar i = 0; i < NumDataBank; i++) begin : gen_data_banks
-        tc_sram #(
-            .NumWords(CacheWaysEntry/BankFactor),
-            .DataWidth(WordWidth),
-            .ByteWidth(8),
-            .NumPorts(1),
-            .Latency(1),
-            .SimInit("zeros")
-        ) i_data_bank (
-            .clk_i  (clk                    ),
-            .rst_ni (rst_n                  ),
-            .req_i  (tcdm_data_bank_req[i]  ),
-            .we_i   (tcdm_data_bank_we[i]   ),
-            .addr_i (tcdm_data_bank_addr[i] ),
-            .wdata_i(tcdm_data_bank_wdata[i]),
-            .be_i   (tcdm_data_bank_be[i]   ),
-            .rdata_o(tcdm_data_bank_rdata[i])
-        );
+    if (UseFoldedDataBanks) begin : gen_folded_data_banks
+        localparam int unsigned BankDataWidth = WordWidth * DataBankWordGroup;
+        localparam int unsigned BankByteCount = BankDataWidth / 8;
+        for (genvar bank = 0; bank < NumDataBankPerWayGrouped; bank++) begin : gen_data_banks
+            for (genvar group = 0; group < NumWayGroups; group++) begin : gen_way_groups
+                logic [EffectiveFoldWayGroup-1:0] bank_req;
+                logic [EffectiveFoldWayGroup-1:0] bank_we;
+                tcdm_bank_addr_t                  bank_addr  [EffectiveFoldWayGroup];
+                logic [BankDataWidth-1:0]         bank_wdata [EffectiveFoldWayGroup];
+                logic [BankByteCount-1:0]         bank_be    [EffectiveFoldWayGroup];
+                logic [BankDataWidth-1:0]         bank_rdata [EffectiveFoldWayGroup];
 
-        assign tcdm_data_bank_gnt[i] = 1'b1;
+                for (genvar way = 0; way < EffectiveFoldWayGroup; way++) begin : gen_folded_ports
+                    localparam int unsigned WayIdx = group * EffectiveFoldWayGroup + way;
+                    assign bank_req[way] = |tcdm_data_bank_req[WayIdx*NumDataBankPerWay + bank*DataBankWordGroup +: DataBankWordGroup];
+                    assign bank_we[way] = |tcdm_data_bank_we[WayIdx*NumDataBankPerWay + bank*DataBankWordGroup +: DataBankWordGroup];
+                    assign bank_addr[way] = tcdm_data_bank_addr[WayIdx*NumDataBankPerWay + bank*DataBankWordGroup];
+
+                    for (genvar g = 0; g < DataBankWordGroup; g++) begin : gen_group_words
+                        localparam int unsigned FlatIdx = WayIdx * NumDataBankPerWay + bank * DataBankWordGroup + g;
+                        assign bank_wdata[way][g*WordWidth +: WordWidth] = tcdm_data_bank_wdata[FlatIdx];
+                        assign bank_be[way][g*(WordWidth/8) +: (WordWidth/8)] = tcdm_data_bank_be[FlatIdx];
+                        assign tcdm_data_bank_rdata[FlatIdx] = bank_rdata[way][g*WordWidth +: WordWidth];
+                        assign tcdm_data_bank_gnt[FlatIdx] = 1'b1;
+                    end
+                end
+
+                folded_data_bank #(
+                    .NumWays     (EffectiveFoldWayGroup),
+                    .DepthPerWay (CacheWaysEntry/BankFactor),
+                    .DataWidth   (BankDataWidth),
+                    .ByteWidth   (8),
+                    .Latency     (1),
+                    .SimInit     ("zeros")
+                ) i_data_bank (
+                    .clk_i   (clk),
+                    .rst_ni  (rst_n),
+                    .req_i   (bank_req),
+                    .we_i    (bank_we),
+                    .addr_i  (bank_addr),
+                    .wdata_i (bank_wdata),
+                    .be_i    (bank_be),
+                    .rdata_o (bank_rdata)
+                );
+            end
+        end
+    end else begin : gen_unfolded_data_banks
+        localparam int unsigned BankDataWidth = WordWidth * DataBankWordGroup;
+        localparam int unsigned BankByteCount = BankDataWidth / 8;
+        for (genvar bank = 0; bank < NumDataBankPerWayGrouped; bank++) begin : gen_data_banks
+            for (genvar way = 0; way < NumWays; way++) begin : gen_way_banks
+                logic                     bank_req;
+                logic                     bank_we;
+                tcdm_bank_addr_t          bank_addr;
+                logic [BankDataWidth-1:0] bank_wdata;
+                logic [BankByteCount-1:0] bank_be;
+                logic [BankDataWidth-1:0] bank_rdata;
+
+                assign bank_req = |tcdm_data_bank_req[way*NumDataBankPerWay + bank*DataBankWordGroup +: DataBankWordGroup];
+                assign bank_we  = |tcdm_data_bank_we [way*NumDataBankPerWay + bank*DataBankWordGroup +: DataBankWordGroup];
+                assign bank_addr = tcdm_data_bank_addr[way*NumDataBankPerWay + bank*DataBankWordGroup];
+
+                for (genvar g = 0; g < DataBankWordGroup; g++) begin : gen_group_words
+                    localparam int unsigned FlatIdx = way * NumDataBankPerWay + bank * DataBankWordGroup + g;
+                    assign bank_wdata[g*WordWidth +: WordWidth] = tcdm_data_bank_wdata[FlatIdx];
+                    assign bank_be[g*(WordWidth/8) +: (WordWidth/8)] = tcdm_data_bank_be[FlatIdx];
+                    assign tcdm_data_bank_rdata[FlatIdx] = bank_rdata[g*WordWidth +: WordWidth];
+                    assign tcdm_data_bank_gnt[FlatIdx] = 1'b1;
+                end
+
+                tc_sram #(
+                    .NumWords(CacheWaysEntry/BankFactor),
+                    .DataWidth(BankDataWidth),
+                    .ByteWidth(8),
+                    .NumPorts(1),
+                    .Latency(1),
+                    .SimInit("zeros")
+                ) i_data_bank (
+                    .clk_i  (clk      ),
+                    .rst_ni (rst_n    ),
+                    .req_i  (bank_req ),
+                    .we_i   (bank_we  ),
+                    .addr_i (bank_addr),
+                    .wdata_i(bank_wdata),
+                    .be_i   (bank_be  ),
+                    .rdata_o(bank_rdata)
+                );
+            end
+        end
     end
 
     ////////////////////////

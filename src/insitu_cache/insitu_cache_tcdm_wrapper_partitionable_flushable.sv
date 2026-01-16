@@ -29,7 +29,6 @@
 
 
 `include "common_cells/registers.svh"
-`include "insitu_cache/hash.svh"
 module insitu_cache_tcdm_wrapper_partitionable_flushable
   import insitu_cache_pkg::*;
   #(
@@ -43,6 +42,8 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
     parameter int unsigned NumCacheEntry            = 512,
     /// Number of Associatity
     parameter int unsigned SetAssociativity         = 2,
+    /// Number of parts per cache line for data banks (1 = unfolded).
+    parameter int unsigned DataPartSplit            = 1,
     /// Number of Pseudo-Dual Banks
     parameter int unsigned NumPseudoDualBanks       = 1,
     /// Width of word (granularity of non-blocking write)
@@ -227,6 +228,7 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
         .CacheLineWidth       (CacheLineWidth),
         .NumCacheEntry        (NumCacheEntry),
         .SetAssociativity     (SetAssociativity),
+        .DataPartSplit        (DataPartSplit),
         .NumPseudoDualBanks   (NumPseudoDualBanks),
         .WordWidth            (WordWidth),
         .ByteWidth            (ByteWidth),

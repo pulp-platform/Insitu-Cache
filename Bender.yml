@@ -23,6 +23,7 @@ sources:
     - src/utilities/pseudo_dual_port_bank.sv
     - src/utilities/pseudo_dual_port_way.sv
     - src/utilities/pseudo_dual_port_fifo.sv
+    - src/utilities/folded_data_bank.sv
     - src/utilities/cache_to_axi.sv
     - src/utilities/decouple_channels_adapter.sv
     - src/utilities/decouple_queue_sync.sv

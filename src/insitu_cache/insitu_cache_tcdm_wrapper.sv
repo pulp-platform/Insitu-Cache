@@ -29,7 +29,6 @@
 
 
 `include "common_cells/registers.svh"
-`include "insitu_cache/hash.svh"
 module insitu_cache_tcdm_wrapper
   import insitu_cache_pkg::*;
   #(
@@ -45,6 +44,8 @@ module insitu_cache_tcdm_wrapper
     parameter int unsigned SetAssociativity         = 2,
     /// Number of Pseudo-Dual Banks
     parameter int unsigned NumPseudoDualBanks       = 1,
+    /// Number of parts per cache line for data banks (1 = unfolded).
+    parameter int unsigned DataPartSplit            = 1,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 32,
     /// Width of byte (granularity of byte mask)
@@ -84,6 +85,12 @@ module insitu_cache_tcdm_wrapper
     localparam int unsigned CacheBankDepth          = NumCacheEntry/SetAssociativity,
     // Dependent parameter, do not override. Number of data bank per way.
     localparam int unsigned NumDataBankPerWay       = NumPseudoDualBanks * (CacheLineWidth/WordWidth),
+    // Dependent parameter, do not override. Number of parts in a cache line.
+    localparam int unsigned PartSplit               = (DataPartSplit == 0) ? 1 : DataPartSplit,
+    // Dependent parameter, do not override. Number of words per part.
+    localparam int unsigned PartWords               = (CacheLineWidth/WordWidth) / PartSplit,
+    // Dependent parameter, do not override. Part index width.
+    localparam int unsigned PartIdxWidth            = (PartSplit > 1) ? $clog2(PartSplit) : 1,
     // Dependent parameter, do not override. Number of meta bank per way.
     localparam int unsigned NumMetaBankPerWay       = NumPseudoDualBanks,
     // Dependent parameter, do not override. Address type.
@@ -219,6 +226,12 @@ module insitu_cache_tcdm_wrapper
                    TagWidth, $bits(cache_meta_t));
         end
     end
+    initial begin
+        if (((CacheLineWidth/WordWidth) % PartSplit) != 0) begin
+            $fatal(1, "PartSplit (%0d) must divide NumWordsPerLine (%0d).",
+                   PartSplit, (CacheLineWidth/WordWidth));
+        end
+    end
 
     typedef enum logic[2:0] {
         SYNC_CTRL_IDLE = '0,
@@ -241,6 +254,20 @@ module insitu_cache_tcdm_wrapper
     logic                                                   upstream_req_to_cache_valid;
     logic                                                   upstream_req_to_cache_ready;
     up_req_t                                                upstream_req_to_cache_payload;
+
+    up_req_t                                                req_fifo_wt_in;
+    logic                                                   req_fifo_wt_full;
+    logic                                                   req_fifo_wt_push;
+    up_req_t                                                req_fifo_wt_out;
+    logic                                                   req_fifo_wt_empty;
+    logic                                                   req_fifo_wt_pop;
+
+    logic                                                   write_through_merger_valid;
+    logic                                                   write_through_merger_ready;
+
+    logic                                                   write_through_valid_cut0;
+    logic                                                   write_through_ready_cut0;
+    down_req_t                                              write_through_req_payload_cut0;
 
     logic                                                   write_through_valid;
     logic                                                   write_through_ready;
@@ -314,8 +341,14 @@ module insitu_cache_tcdm_wrapper
 
 
     cache_bank_depth_ptr_t                                  bank_read_cache_addr;
+    logic          [PartIdxWidth-1:0]                       bank_read_part_idx;
+    logic                                                   bank_read_all_parts;
     logic                                                   bank_read_cache_valid;
     logic                                                   bank_read_cache_ready;
+    logic                   [SetAssociativity - 1 : 0]     bank_read_way_mask;
+    logic                   [SetAssociativity - 1 : 0]     bank_read_way_mask_sel;
+    logic          [PartIdxWidth-1:0]                       bank_read_part_idx_sel;
+    logic                                                   bank_read_all_parts_sel;
     logic                   [SetAssociativity - 1 : 0]      bank_read_cache_ready_per_way;
     cache_status_t          [SetAssociativity - 1 : 0]      bank_read_cache_status;
     logic                   [SetAssociativity - 1 : 0]      bank_read_cache_dirty;
@@ -325,6 +358,32 @@ module insitu_cache_tcdm_wrapper
     cache_data_t            [SetAssociativity - 1 : 0]      bank_read_cache_data;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_read_cache_LRU;
     
+    logic                   [SetAssociativity - 1 : 0]      data_bank_read_ready;
+    logic                   [SetAssociativity - 1 : 0]      meta_bank_read_ready;
+
+    cache_meta_t            [SetAssociativity - 1 : 0][NumMetaBankPerWay-1:0] tcdm_meta_rdata_int;
+    cache_meta_t            [SetAssociativity - 1 : 0][NumMetaBankPerWay-1:0] tcdm_meta_wdata_int;
+
+    cache_bank_depth_ptr_t  [SetAssociativity - 1 : 0]      gnt_data_bank_read_addr;
+    logic                   [SetAssociativity - 1 : 0]      gnt_data_bank_read_valid;
+    logic                   [SetAssociativity - 1 : 0]      gnt_data_bank_read_ready;
+    cache_data_t            [SetAssociativity - 1 : 0]      gnt_data_bank_read_data;
+
+    cache_bank_depth_ptr_t  [SetAssociativity - 1 : 0]      gnt_data_bank_write_addr;
+    logic                   [SetAssociativity - 1 : 0]      gnt_data_bank_write_req;
+    cache_data_t            [SetAssociativity - 1 : 0]      gnt_data_bank_write_data;
+    cache_mask_t            [SetAssociativity - 1 : 0]      gnt_data_bank_write_mask;
+
+    cache_bank_depth_ptr_t  [SetAssociativity - 1 : 0]      gnt_meta_bank_read_addr;
+    logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_read_valid;
+    logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_read_ready;
+    cache_meta_t            [SetAssociativity - 1 : 0]      gnt_meta_bank_read_data;
+
+    cache_bank_depth_ptr_t  [SetAssociativity - 1 : 0]      gnt_meta_bank_write_addr;
+    logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_write_req;
+    cache_meta_t            [SetAssociativity - 1 : 0]      gnt_meta_bank_write_data;
+    logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_write_mask;
+
 
     cache_bank_depth_ptr_t                                  bank_write_cache_addr;
     logic                                                   bank_write_cache_req;
@@ -395,6 +454,9 @@ module insitu_cache_tcdm_wrapper
 
     logic                                                   flush_read_select_q, flush_read_select_d;
     `FFARN (flush_read_select_q, flush_read_select_d,       '0, clk_i, rst_ni)
+    logic          [PartIdxWidth-1:0]                       flush_read_part_idx;
+    logic                                                   flush_read_all_parts;
+    logic                   [SetAssociativity - 1 : 0]      flush_read_way_mask;
 
     logic                                                   sync_ctrl_still_pending;
     logic                                                   sync_ctrl_has_dirty_line;
@@ -407,6 +469,22 @@ module insitu_cache_tcdm_wrapper
     `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_payload_q,sync_ctrl_payload_d,        '0, clk_i, rst_ni)
+    cache_data_t                                            flush_full_data_q, flush_full_data_d;
+    cache_mask_t                                            flush_full_mask_q, flush_full_mask_d;
+    cache_tag_t                                             flush_full_tag_q, flush_full_tag_d;
+    cache_bank_depth_ptr_t                                  flush_full_addr_q, flush_full_addr_d;
+    way_ptr_t                                               flush_full_way_q, flush_full_way_d;
+    logic                                                   flush_full_data_valid_q, flush_full_data_valid_d;
+    logic                                                   flush_full_wait_q, flush_full_wait_d;
+    `FFARN (flush_full_data_q, flush_full_data_d,            '0, clk_i, rst_ni)
+    `FFARN (flush_full_mask_q, flush_full_mask_d,            '0, clk_i, rst_ni)
+    `FFARN (flush_full_tag_q, flush_full_tag_d,              '0, clk_i, rst_ni)
+    `FFARN (flush_full_addr_q, flush_full_addr_d,            '0, clk_i, rst_ni)
+    `FFARN (flush_full_way_q, flush_full_way_d,              '0, clk_i, rst_ni)
+    `FFARN (flush_full_data_valid_q, flush_full_data_valid_d,'0, clk_i, rst_ni)
+    `FFARN (flush_full_wait_q, flush_full_wait_d,            '0, clk_i, rst_ni)
+    logic                                                   flush_full_read_active;
+    byte_offset_t                                           sync_ctrl_ofst;
 
     /////////////////////////////////////
     //        Instance Modules         //
@@ -417,20 +495,6 @@ module insitu_cache_tcdm_wrapper
     /***************************************/
 
     if (WriteThroughMode) begin
-
-        up_req_t                                req_fifo_wt_in;
-        logic                                   req_fifo_wt_full;
-        logic                                   req_fifo_wt_push;
-        up_req_t                                req_fifo_wt_out;
-        logic                                   req_fifo_wt_empty;
-        logic                                   req_fifo_wt_pop;
-
-        logic                                   write_through_merger_valid;
-        logic                                   write_through_merger_ready;
-
-        logic                                   write_through_valid_cut0;
-        logic                                   write_through_ready_cut0;
-        down_req_t                              write_through_req_payload_cut0;
 
         fifo_v3 #(
             .FALL_THROUGH                       (1'b0                       ),
@@ -566,11 +630,23 @@ module insitu_cache_tcdm_wrapper
             sync_ctrl_insn_d            = sync_ctrl_insn_q;
             sync_ctrl_ptr_d             = sync_ctrl_ptr_q;
             sync_ctrl_payload_d         = sync_ctrl_payload_q;
+            flush_full_data_d           = flush_full_data_q;
+            flush_full_mask_d           = flush_full_mask_q;
+            flush_full_tag_d            = flush_full_tag_q;
+            flush_full_addr_d           = flush_full_addr_q;
+            flush_full_way_d            = flush_full_way_q;
+            flush_full_data_valid_d     = flush_full_data_valid_q;
+            flush_full_wait_d           = flush_full_wait_q;
+            flush_full_read_active      = 1'b0;
+            sync_ctrl_ofst              = '0;
 
             flush_read_cache_valid      = '0;
             flush_read_cache_addr       = '0;
             flush_write_cache_req_valid = '0;
             flush_write_cache_addr      = '0;
+            flush_read_part_idx         = '0;
+            flush_read_all_parts        = 1'b0;
+            flush_read_way_mask         = {SetAssociativity{1'b1}};
 
             flush_write_cache_status    = flush_read_cache_status;
             flush_write_cache_dirty     = flush_read_cache_dirty;
@@ -639,7 +715,6 @@ module insitu_cache_tcdm_wrapper
                 end
 
                 SYNC_CTRL_FLUSH : begin
-                    automatic byte_offset_t _ofst = '0;
                     //Check Dirty Line
                     for (int i = 0; i < SetAssociativity; i++) begin
                         if ((flush_read_cache_status[i] == VALID) && (flush_read_cache_dirty[i] == 1'b1)) begin
@@ -650,19 +725,60 @@ module insitu_cache_tcdm_wrapper
                     end
 
                     if (sync_ctrl_has_dirty_line) begin
-                        //Try to evict dirty line
-                        write_through_req_payload.addr  = {flush_read_cache_tag[sync_ctrl_dirty_line], sync_ctrl_ptr_q, _ofst};
-                        write_through_req_payload.info  = '0;
-                        write_through_req_payload.write = 1'b1;
-                        write_through_req_payload.wdata = flush_read_cache_data[sync_ctrl_dirty_line];
-                        write_through_req_payload.wmask = flush_read_cache_mask[sync_ctrl_dirty_line];
-                        write_through_valid = 1'b1;
-                        if (write_through_ready) begin
-                            //clean up the dirty line
-                            flush_write_cache_addr                          = sync_ctrl_ptr_q;
-                            flush_write_cache_status[sync_ctrl_dirty_line]  = INVALID;
-                            flush_write_cache_dirty[sync_ctrl_dirty_line]   = 1'b0;
-                            flush_write_cache_req_valid                     = 1'b1;
+                        if (PartSplit > 1) begin
+                            flush_full_read_active = 1'b1;
+                            if (~flush_full_wait_q && ~flush_full_data_valid_q) begin
+                                flush_full_way_d = sync_ctrl_dirty_line;
+                                flush_full_tag_d = flush_read_cache_tag[sync_ctrl_dirty_line];
+                                flush_full_mask_d = flush_read_cache_mask[sync_ctrl_dirty_line];
+                                flush_full_addr_d = sync_ctrl_ptr_q;
+                                flush_read_cache_addr = sync_ctrl_ptr_q;
+                                flush_read_cache_valid = 1'b1;
+                                flush_read_all_parts = 1'b1;
+                                flush_read_way_mask = '0;
+                                flush_read_way_mask[sync_ctrl_dirty_line] = 1'b1;
+                                if (flush_read_cache_ready) begin
+                                    flush_full_wait_d = 1'b1;
+                                end
+                            end else if (flush_full_wait_q) begin
+                                flush_full_data_d = bank_read_cache_data[flush_full_way_q];
+                                flush_full_data_valid_d = 1'b1;
+                                flush_full_wait_d = 1'b0;
+                            end
+
+                            if (flush_full_data_valid_q) begin
+                                //Try to evict dirty line
+                                write_through_req_payload.addr  = {flush_full_tag_q, flush_full_addr_q, sync_ctrl_ofst};
+                                write_through_req_payload.info  = '0;
+                                write_through_req_payload.write = 1'b1;
+                                write_through_req_payload.wdata = flush_full_data_q;
+                                write_through_req_payload.wmask = flush_full_mask_q;
+                                write_through_valid = 1'b1;
+                                if (write_through_ready) begin
+                                    //clean up the dirty line
+                                    flush_write_cache_addr                          = flush_full_addr_q;
+                                    flush_write_cache_status[flush_full_way_q]      = INVALID;
+                                    flush_write_cache_dirty[flush_full_way_q]       = 1'b0;
+                                    flush_write_cache_req_valid                     = 1'b1;
+                                    flush_full_data_valid_d                         = 1'b0;
+                                    flush_full_wait_d                               = 1'b0;
+                                end
+                            end
+                        end else begin
+                            //Try to evict dirty line
+                            write_through_req_payload.addr  = {flush_read_cache_tag[sync_ctrl_dirty_line], sync_ctrl_ptr_q, sync_ctrl_ofst};
+                            write_through_req_payload.info  = '0;
+                            write_through_req_payload.write = 1'b1;
+                            write_through_req_payload.wdata = flush_read_cache_data[sync_ctrl_dirty_line];
+                            write_through_req_payload.wmask = flush_read_cache_mask[sync_ctrl_dirty_line];
+                            write_through_valid = 1'b1;
+                            if (write_through_ready) begin
+                                //clean up the dirty line
+                                flush_write_cache_addr                          = sync_ctrl_ptr_q;
+                                flush_write_cache_status[sync_ctrl_dirty_line]  = INVALID;
+                                flush_write_cache_dirty[sync_ctrl_dirty_line]   = 1'b0;
+                                flush_write_cache_req_valid                     = 1'b1;
+                            end
                         end
                     end else begin
                         //clean up whole way
@@ -676,14 +792,18 @@ module insitu_cache_tcdm_wrapper
 
                         flush_write_cache_req_valid = 1'b1;
                         sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
+                        flush_full_data_valid_d = 1'b0;
+                        flush_full_wait_d = 1'b0;
                         if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
                             sync_ctrl_status_d = SYNC_CTRL_FINISH;
                         end
                     end
 
                     //Read Bank at Background
-                    flush_read_cache_addr = sync_ctrl_ptr_d;
-                    flush_read_cache_valid = 1'b1;
+                    if (~flush_full_read_active) begin
+                        flush_read_cache_addr = sync_ctrl_ptr_d;
+                        flush_read_cache_valid = 1'b1;
+                    end
 
                 end
 
@@ -712,6 +832,7 @@ module insitu_cache_tcdm_wrapper
         .info_t          (info_t),
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
+        .DataPartSplit   (PartSplit),
         .WordWidth       (WordWidth),
         .ByteWidth       (ByteWidth),
         .LogDebug        (LogDebug),
@@ -762,8 +883,11 @@ module insitu_cache_tcdm_wrapper
 
         //Bank
         .bank_read_addr_o               (proc_read_cache_addr),
+        .bank_read_part_idx_o           (bank_read_part_idx),
+        .bank_read_all_parts_o          (bank_read_all_parts),
         .bank_read_valid_o              (proc_read_cache_valid),
         .bank_read_ready_i              (proc_read_cache_ready),
+        .bank_read_way_mask_o           (bank_read_way_mask),
         .bank_read_cache_status_i       (proc_read_cache_status),
         .bank_read_cache_dirty_i        (proc_read_cache_dirty),
         .bank_read_cache_miss_meta_i    (proc_read_cache_miss_meta),
@@ -897,6 +1021,9 @@ module insitu_cache_tcdm_wrapper
     assign bank_read_cache_valid       = flush_read_select_d? flush_read_cache_valid : proc_read_cache_valid;
     assign proc_read_cache_ready       = bank_read_cache_ready;
     assign flush_read_cache_ready      = flush_read_select_d? bank_read_cache_ready : '0;
+    assign bank_read_way_mask_sel      = flush_read_select_d? flush_read_way_mask : bank_read_way_mask;
+    assign bank_read_part_idx_sel      = flush_read_select_d? flush_read_part_idx : bank_read_part_idx;
+    assign bank_read_all_parts_sel     = flush_read_select_d? flush_read_all_parts : bank_read_all_parts;
 
     assign bank_read_cache_addr        =  flush_read_select_d? flush_read_cache_addr: proc_read_cache_addr;
 
@@ -937,13 +1064,6 @@ module insitu_cache_tcdm_wrapper
     /*****************/
 
     for (genvar i = 0; i < SetAssociativity; i++) begin: gen_cache_banks
-
-        logic __data_bank_read_ready;
-        logic __meta_bank_read_ready;
-
-        cache_meta_t [NumMetaBankPerWay-1:0] __tcdm_meta_rdata;
-        cache_meta_t [NumMetaBankPerWay-1:0] __tcdm_meta_wdata;
-
         always_comb begin
             {bank_read_cache_status[i],
             bank_read_cache_dirty[i],
@@ -962,16 +1082,6 @@ module insitu_cache_tcdm_wrapper
             };
         end
 
-        cache_bank_depth_ptr_t  __gnt_data_bank_read_addr;
-        logic                   __gnt_data_bank_read_valid;
-        logic                   __gnt_data_bank_read_ready;
-        cache_data_t            __gnt_data_bank_read_data;
-
-        cache_bank_depth_ptr_t  __gnt_data_bank_write_addr;
-        logic                   __gnt_data_bank_write_req;
-        cache_data_t            __gnt_data_bank_write_data;
-        cache_mask_t            __gnt_data_bank_write_mask;
-
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
@@ -982,8 +1092,8 @@ module insitu_cache_tcdm_wrapper
             .rst_ni,
 
             .upstream_read_addr_i        (bank_read_cache_addr),
-            .upstream_read_valid_i       (bank_read_cache_valid),
-            .upstream_read_ready_o       (__data_bank_read_ready),
+            .upstream_read_valid_i       (bank_read_cache_valid & bank_read_way_mask_sel[i]),
+            .upstream_read_ready_o       (data_bank_read_ready[i]),
             .upstream_read_data_o        (bank_read_cache_data[i]),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
@@ -991,15 +1101,15 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
 
-            .downstream_read_addr_o      (__gnt_data_bank_read_addr),
-            .downstream_read_valid_o     (__gnt_data_bank_read_valid),
-            .downstream_read_ready_i     (__gnt_data_bank_read_ready),
-            .downstream_read_data_i      (__gnt_data_bank_read_data),
+            .downstream_read_addr_o      (gnt_data_bank_read_addr[i]),
+            .downstream_read_valid_o     (gnt_data_bank_read_valid[i]),
+            .downstream_read_ready_i     (gnt_data_bank_read_ready[i]),
+            .downstream_read_data_i      (gnt_data_bank_read_data[i]),
 
-            .downstream_write_addr_o     (__gnt_data_bank_write_addr),
-            .downstream_write_req_o      (__gnt_data_bank_write_req),
-            .downstream_write_data_o     (__gnt_data_bank_write_data),
-            .downstream_write_mask_o     (__gnt_data_bank_write_mask),
+            .downstream_write_addr_o     (gnt_data_bank_write_addr[i]),
+            .downstream_write_req_o      (gnt_data_bank_write_req[i]),
+            .downstream_write_data_o     (gnt_data_bank_write_data[i]),
+            .downstream_write_mask_o     (gnt_data_bank_write_mask[i]),
 
             .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
 
@@ -1010,20 +1120,23 @@ module insitu_cache_tcdm_wrapper
             .NumPseudoDualBanks (NumPseudoDualBanks),
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
             .WordWidth          (WordWidth),
-            .ByteWidth          (ByteWidth)
+            .ByteWidth          (ByteWidth),
+            .PartSplit          (PartSplit)
         ) i_cache_data_bank (
             .clk_i,
             .rst_ni,
 
-            .read_addr_i        (__gnt_data_bank_read_addr),
-            .read_valid_i       (__gnt_data_bank_read_valid),
-            .read_ready_o       (__gnt_data_bank_read_ready),
-            .read_data_o        (__gnt_data_bank_read_data),
+            .read_addr_i        (gnt_data_bank_read_addr[i]),
+            .read_valid_i       (gnt_data_bank_read_valid[i]),
+            .read_part_idx_i    (bank_read_part_idx_sel),
+            .read_all_parts_i   (bank_read_all_parts_sel),
+            .read_ready_o       (gnt_data_bank_read_ready[i]),
+            .read_data_o        (gnt_data_bank_read_data[i]),
 
-            .write_addr_i       (__gnt_data_bank_write_addr),
-            .write_req_i        (__gnt_data_bank_write_req),
-            .write_data_i       (__gnt_data_bank_write_data),
-            .write_mask_i       (__gnt_data_bank_write_mask),
+            .write_addr_i       (gnt_data_bank_write_addr[i]),
+            .write_req_i        (gnt_data_bank_write_req[i]),
+            .write_data_i       (gnt_data_bank_write_data[i]),
+            .write_mask_i       (gnt_data_bank_write_mask[i]),
 
             .tcdm_bank_req_o    (tcdm_data_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_data_bank_we_o[i]),
@@ -1035,21 +1148,10 @@ module insitu_cache_tcdm_wrapper
 
         always_comb begin
             for (int j = 0; j < NumMetaBankPerWay; j++) begin
-                tcdm_meta_bank_wdata_o[i][j] = '0;
-                tcdm_meta_bank_wdata_o[i][j] = __tcdm_meta_wdata[j];
-                __tcdm_meta_rdata[j] = tcdm_meta_bank_rdata_i[i][j];
+                tcdm_meta_bank_wdata_o[i][j] = tcdm_meta_wdata_int[i][j];
+                tcdm_meta_rdata_int[i][j] = tcdm_meta_bank_rdata_i[i][j];
             end
         end
-
-        cache_bank_depth_ptr_t  __gnt_meta_bank_read_addr;
-        logic                   __gnt_meta_bank_read_valid;
-        logic                   __gnt_meta_bank_read_ready;
-        cache_meta_t            __gnt_meta_bank_read_data;
-
-        cache_bank_depth_ptr_t  __gnt_meta_bank_write_addr;
-        logic                   __gnt_meta_bank_write_req;
-        cache_meta_t            __gnt_meta_bank_write_data;
-        logic                   __gnt_meta_bank_write_mask;
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
@@ -1061,8 +1163,8 @@ module insitu_cache_tcdm_wrapper
             .rst_ni,
 
             .upstream_read_addr_i        (bank_read_cache_addr),
-            .upstream_read_valid_i       (bank_read_cache_valid),
-            .upstream_read_ready_o       (__meta_bank_read_ready),
+            .upstream_read_valid_i       (bank_read_cache_valid & bank_read_way_mask_sel[i]),
+            .upstream_read_ready_o       (meta_bank_read_ready[i]),
             .upstream_read_data_o        (cache_meta_read_data[i]),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
@@ -1070,15 +1172,15 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
 
-            .downstream_read_addr_o      (__gnt_meta_bank_read_addr),
-            .downstream_read_valid_o     (__gnt_meta_bank_read_valid),
-            .downstream_read_ready_i     (__gnt_meta_bank_read_ready),
-            .downstream_read_data_i      (__gnt_meta_bank_read_data),
+            .downstream_read_addr_o      (gnt_meta_bank_read_addr[i]),
+            .downstream_read_valid_o     (gnt_meta_bank_read_valid[i]),
+            .downstream_read_ready_i     (gnt_meta_bank_read_ready[i]),
+            .downstream_read_data_i      (gnt_meta_bank_read_data[i]),
 
-            .downstream_write_addr_o     (__gnt_meta_bank_write_addr),
-            .downstream_write_req_o      (__gnt_meta_bank_write_req),
-            .downstream_write_data_o     (__gnt_meta_bank_write_data),
-            .downstream_write_mask_o     (__gnt_meta_bank_write_mask),
+            .downstream_write_addr_o     (gnt_meta_bank_write_addr[i]),
+            .downstream_write_req_o      (gnt_meta_bank_write_req[i]),
+            .downstream_write_data_o     (gnt_meta_bank_write_data[i]),
+            .downstream_write_mask_o     (gnt_meta_bank_write_mask[i]),
 
             .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
 
@@ -1089,30 +1191,35 @@ module insitu_cache_tcdm_wrapper
             .NumPseudoDualBanks (NumPseudoDualBanks),
             .NumWordsPerLine    (1),
             .WordWidth          ($bits(cache_meta_t)),
-            .ByteWidth          ($bits(cache_meta_t))
+            .ByteWidth          ($bits(cache_meta_t)),
+            .PartSplit          (1)
         ) i_cache_meta_bank (
             .clk_i,
             .rst_ni,
 
-            .read_addr_i        (__gnt_meta_bank_read_addr),
-            .read_valid_i       (__gnt_meta_bank_read_valid),
-            .read_ready_o       (__gnt_meta_bank_read_ready),
-            .read_data_o        (__gnt_meta_bank_read_data),
+            .read_addr_i        (gnt_meta_bank_read_addr[i]),
+            .read_valid_i       (gnt_meta_bank_read_valid[i]),
+            .read_part_idx_i    ('0),
+            .read_all_parts_i   (1'b1),
+            .read_ready_o       (gnt_meta_bank_read_ready[i]),
+            .read_data_o        (gnt_meta_bank_read_data[i]),
 
-            .write_addr_i       (__gnt_meta_bank_write_addr),
-            .write_req_i        (__gnt_meta_bank_write_req),
-            .write_data_i       (__gnt_meta_bank_write_data),
-            .write_mask_i       (__gnt_meta_bank_write_mask),
+            .write_addr_i       (gnt_meta_bank_write_addr[i]),
+            .write_req_i        (gnt_meta_bank_write_req[i]),
+            .write_data_i       (gnt_meta_bank_write_data[i]),
+            .write_mask_i       (gnt_meta_bank_write_mask[i]),
 
             .tcdm_bank_req_o    (tcdm_meta_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_meta_bank_we_o[i]),
             .tcdm_bank_addr_o   (tcdm_meta_bank_addr_o[i]),
-            .tcdm_bank_wdata_o  (__tcdm_meta_wdata),
+            .tcdm_bank_wdata_o  (tcdm_meta_wdata_int[i]),
             .tcdm_bank_be_o     (tcdm_meta_bank_be_o[i]),
-            .tcdm_bank_rdata_i  (__tcdm_meta_rdata)
+            .tcdm_bank_rdata_i  (tcdm_meta_rdata_int[i])
         );
 
-        assign bank_read_cache_ready_per_way[i] = __data_bank_read_ready & __meta_bank_read_ready;
+        assign bank_read_cache_ready_per_way[i] = bank_read_way_mask_sel[i] ?
+                                                   (data_bank_read_ready[i] & meta_bank_read_ready[i]) :
+                                                   1'b1;
     end
 
     assign bank_read_cache_ready = &bank_read_cache_ready_per_way;
@@ -1130,6 +1237,8 @@ module pseudo_dual_port_tcdm_wrapper #(
     parameter int unsigned  NumPseudoDualBanks      = 2,
     /// Number of words
     parameter int unsigned  NumWordsPerLine         = 2,
+    /// Number of parts per line (1 = no part gating).
+    parameter int unsigned  PartSplit               = 1,
     /// Width of word
     parameter int unsigned  WordWidth               = 32,
     /// Width of byte (granularity of byte mask)
@@ -1144,6 +1253,10 @@ module pseudo_dual_port_tcdm_wrapper #(
     localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0],
     // Dependent parameter, do not override. number of banks
     localparam int unsigned NumBanks                = NumPseudoDualBanks * NumWordsPerLine,
+    // Dependent parameter, do not override. words per part.
+    localparam int unsigned PartWords               = (PartSplit == 0) ? NumWordsPerLine : (NumWordsPerLine / PartSplit),
+    // Dependent parameter, do not override. part index width.
+    localparam int unsigned PartIdxWidth            = (PartSplit > 1) ? $clog2(PartSplit) : 1,
     // Dependent parameter, do not override. Address type.
     localparam int unsigned SELECT_DEPTH            = (NumPseudoDualBanks > 1) ? $clog2(NumPseudoDualBanks) : 1,
     // Dependent parameter, do not override. Select type.
@@ -1159,6 +1272,8 @@ module pseudo_dual_port_tcdm_wrapper #(
     /// Read port
     input  addr_t                                   read_addr_i,
     input  logic                                    read_valid_i,
+    input  logic        [PartIdxWidth-1:0]          read_part_idx_i,
+    input  logic                                    read_all_parts_i,
     output logic                                    read_ready_o,
     output data_t                                   read_data_o,
 
@@ -1204,12 +1319,19 @@ module pseudo_dual_port_tcdm_wrapper #(
     `FFARN (write_line_buffer, write_data_i, '0,    clk_i, rst_ni)
 
     //bank signals
-    logic         [NumPseudoDualBanks-1:0]          bank_req;
-    logic         [NumPseudoDualBanks-1:0]          bank_we;
+    logic         [NumPseudoDualBanks-1:0]          bank_req_read;
+    logic         [NumPseudoDualBanks-1:0]          bank_req_write;
     bank_addr_t   [NumPseudoDualBanks-1:0]          bank_addr;
     data_t        [NumPseudoDualBanks-1:0]          bank_wdata;
     mask_t        [NumPseudoDualBanks-1:0]          bank_wmask;
     data_t        [NumPseudoDualBanks-1:0]          bank_rdata;
+    logic                                           write_has_data;
+    word_t        [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] bank_wdata_words;
+    word_t        [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] bank_rdata_words;
+    logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_in_part;
+    logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_read_en;
+    logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_read_en_q;
+    logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_write_en;
 
     //read & write port address info
     bank_select_t                                   read_bank_select;
@@ -1226,26 +1348,40 @@ module pseudo_dual_port_tcdm_wrapper #(
     `FFARN (read_data_from_bank_select_q,
             read_data_from_bank_select_d,
             '0, clk_i, rst_ni)
+    `FFARN (word_read_en_q,
+            word_read_en,
+            '0, clk_i, rst_ni)
+
+    initial begin
+        if ((PartSplit > 1) && ((NumWordsPerLine % PartSplit) != 0)) begin
+            $fatal(1, "PartSplit (%0d) must divide NumWordsPerLine (%0d).",
+                   PartSplit, NumWordsPerLine);
+        end
+    end
 
     //////////////////////////////////////
     //        Instance Modules          //
     //////////////////////////////////////
 
     for (genvar i = 0; i < NumPseudoDualBanks; i++) begin
-        word_t [NumWordsPerLine-1:0] __wdata;
-        word_t [NumWordsPerLine-1:0] __rdata;
-        assign __wdata = bank_wdata[i];
-
+        assign bank_wdata_words[i] = bank_wdata[i];
         for (genvar j = 0; j < NumWordsPerLine; j++) begin
-            assign tcdm_bank_req_o[i*NumWordsPerLine + j]    = bank_req[i];
-            assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = bank_we[i];
+            localparam int unsigned WordPart = (PartSplit > 1) ? (j / PartWords) : 0;
+            assign word_in_part[i][j] = read_all_parts_i ? 1'b1 :
+              ((PartSplit > 1) ? (read_part_idx_i == WordPart[PartIdxWidth-1:0]) : 1'b1);
+            assign word_read_en[i][j] = bank_req_read[i] & read_valid_i & word_in_part[i][j];
+            assign word_write_en[i][j] = bank_req_write[i] & write_has_data &
+              (|bank_wmask[i][j*WordBytes +: WordBytes]);
+            assign tcdm_bank_req_o[i*NumWordsPerLine + j]    = word_read_en[i][j] | word_write_en[i][j];
+            assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = word_write_en[i][j];
             assign tcdm_bank_addr_o[i*NumWordsPerLine + j]   = bank_addr[i];
-            assign tcdm_bank_wdata_o[i*NumWordsPerLine + j]  = __wdata[j];
+            assign tcdm_bank_wdata_o[i*NumWordsPerLine + j]  = bank_wdata_words[i][j];
             assign tcdm_bank_be_o[i*NumWordsPerLine + j]     = bank_wmask[i][j*WordBytes +: WordBytes];
-            assign __rdata[j]                                = tcdm_bank_rdata_i[i*NumWordsPerLine + j];
+            assign bank_rdata_words[i][j]                    = word_read_en_q[i][j] ?
+                                                              tcdm_bank_rdata_i[i*NumWordsPerLine + j] : '0;
         end
 
-        assign bank_rdata[i] = __rdata;
+        assign bank_rdata[i] = bank_rdata_words[i];
     end
 
     //////////////////////////////////////
@@ -1258,8 +1394,8 @@ module pseudo_dual_port_tcdm_wrapper #(
         /*****************/
         status = IDLE;
 
-        bank_req = '0;
-        bank_we = '0;
+        bank_req_read = '0;
+        bank_req_write = '0;
         bank_addr = '0;
         bank_wdata = '0;
         bank_wmask = '0;
@@ -1278,10 +1414,12 @@ module pseudo_dual_port_tcdm_wrapper #(
         read_data_from_line_buffer_d = '0;
         read_data_from_bank_select_d = '0;
 
+        write_has_data = write_req_i & (|write_mask_i);
+
         /*******************/
         /* Determin Status */
         /*******************/
-        if (read_valid_i & write_req_i) begin
+        if (read_valid_i & write_has_data) begin
             if (read_bank_select != write_bank_select) begin
                 status = WR_DIFF_BANK;
             end else
@@ -1294,7 +1432,7 @@ module pseudo_dual_port_tcdm_wrapper #(
         if (read_valid_i) begin
             status = R_ONLY;
         end else
-        if (write_req_i) begin
+        if (write_has_data) begin
             status = W_ONLY;
         end
 
@@ -1303,16 +1441,14 @@ module pseudo_dual_port_tcdm_wrapper #(
         /************/
         case (status)
             W_ONLY: begin
-                bank_req[write_bank_select]     = 1'b1;
-                bank_we[write_bank_select]      = 1'b1;
+                bank_req_write[write_bank_select] = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
                 bank_wmask[write_bank_select]   = write_mask_i;
             end
 
             R_ONLY: begin
-                bank_req[read_bank_select]      = 1'b1;
-                bank_we[read_bank_select]       = 1'b0;
+                bank_req_read[read_bank_select] = 1'b1;
                 bank_addr[read_bank_select]     = read_bank_addr;
 
                 read_data_from_line_buffer_d    = '0;
@@ -1320,14 +1456,12 @@ module pseudo_dual_port_tcdm_wrapper #(
             end
 
             WR_DIFF_BANK: begin
-                bank_req[write_bank_select]     = 1'b1;
-                bank_we[write_bank_select]      = 1'b1;
+                bank_req_write[write_bank_select] = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
                 bank_wmask[write_bank_select]   = write_mask_i;
 
-                bank_req[read_bank_select]      = 1'b1;
-                bank_we[read_bank_select]       = 1'b0;
+                bank_req_read[read_bank_select] = 1'b1;
                 bank_addr[read_bank_select]     = read_bank_addr;
 
                 read_data_from_line_buffer_d    = '0;
@@ -1335,8 +1469,7 @@ module pseudo_dual_port_tcdm_wrapper #(
             end
 
             WR_SAME_ADDR: begin
-                bank_req[write_bank_select]     = 1'b1;
-                bank_we[write_bank_select]      = 1'b1;
+                bank_req_write[write_bank_select] = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
                 bank_wmask[write_bank_select]   = write_mask_i;
@@ -1346,8 +1479,7 @@ module pseudo_dual_port_tcdm_wrapper #(
             end
 
             WR_CONFLICT: begin
-                bank_req[write_bank_select]     = 1'b1;
-                bank_we[write_bank_select]      = 1'b1;
+                bank_req_write[write_bank_select] = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
                 bank_wmask[write_bank_select]   = write_mask_i;
@@ -1362,7 +1494,7 @@ module pseudo_dual_port_tcdm_wrapper #(
         /*********************/
         /* Read Ready Logics */
         /*********************/
-        if (write_req_i & (read_addr_i != write_addr_i) & (read_bank_select == write_bank_select)) begin
+        if (write_has_data & (read_addr_i != write_addr_i) & (read_bank_select == write_bank_select)) begin
             read_ready_o = 1'b0;
         end
     end

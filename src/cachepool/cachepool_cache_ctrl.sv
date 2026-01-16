@@ -40,6 +40,8 @@ module cachepool_cache_ctrl #(
   parameter int unsigned CacheLineWidth                                   = 512,
   /// Number of Associatity
   parameter int unsigned SetAssociativity                                 = 4,
+  /// Number of parts per cache line for data banks (1 = unfolded).
+  parameter int unsigned DataPartSplit                                    = 1,
   /// Number of Pseudo-Dual Banks
   parameter int unsigned BankFactor                                       = 2,
 
@@ -154,6 +156,9 @@ module cachepool_cache_ctrl #(
   typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
   typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
+  localparam int unsigned                                                 LineOfstBits = $clog2(CacheLineWidth/8);
+  localparam int unsigned                                                 WordOfstBits = $clog2(WordWidth/8);
+  localparam int unsigned                                                 CoalPorts = (NumPorts - 1) * CoalExtFactor;
 
   typedef struct packed {
     logic                                                                 id;
@@ -201,11 +206,6 @@ module cachepool_cache_ctrl #(
   // Bypass xbar signals
   logic                                                                   bypass_xbar_req_valid;
   logic                                                                   bypass_xbar_req_ready;
-  addr_t                                                                  bypass_xbar_req_addr;
-  coalescing_info_t                                                       bypass_xbar_req_info;
-  logic                                                                   bypass_xbar_req_write;
-  coalescing_data_t                                                       bypass_xbar_req_wdata;
-  coalescing_mask_t                                                       bypass_xbar_req_wmask;
 
   logic                                                                   bypass_xbar_resp_valid;
   logic                                                                   bypass_xbar_resp_ready;
@@ -244,6 +244,9 @@ module cachepool_cache_ctrl #(
 
   coalescing_data_t bypass_pad_data;
   logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
+  coal_ofst_t coalescing_first_ofst;
+  logic [LineOfstBits-1:0] coalescing_line_ofst;
+  addr_t coalescing_req_addr_with_ofst;
 
   assign bypass_word_index =
     core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)];
@@ -254,6 +257,20 @@ module cachepool_cache_ctrl #(
     bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
       core_req_wdata_i[NumPorts-1];
   end
+  always_comb begin
+    logic found;
+    coalescing_first_ofst = '0;
+    found = 1'b0;
+    for (int i = 0; i < CoalPorts; i++) begin
+      if (coalescing_req_info.hitmap[i] && !found) begin
+        coalescing_first_ofst = coalescing_req_info.ofsts[i];
+        found = 1'b1;
+      end
+    end
+  end
+  assign coalescing_line_ofst = coalescing_first_ofst << WordOfstBits;
+  assign coalescing_req_addr_with_ofst =
+    (coalescing_req_addr & ~(CacheLineWidth/8-1)) | coalescing_line_ofst;
 
 
   /////////////////////////////////////
@@ -345,7 +362,7 @@ module cachepool_cache_ctrl #(
   drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
 
   assign coalescer_req = '{
-    addr    : coalescing_req_addr,
+    addr    : coalescing_req_addr_with_ofst,
     info    : coalescer_xbar_info_union_t'(coalescing_req_info),
     write   : coalescing_req_write,
     wdata   : coalescing_req_wdata,
@@ -358,7 +375,7 @@ module cachepool_cache_ctrl #(
   // };
 
   assign bypass_req = '{
-    addr    : core_req_addr_i [NumPorts-1] & ~(CacheLineWidth/8-1),
+    addr    : core_req_addr_i [NumPorts-1],
     info    : coalescer_xbar_info_union_t'(
       bypass_info_t'{
         padding    : '0,
@@ -379,6 +396,13 @@ module cachepool_cache_ctrl #(
     write   : bypass_xbar_resp_write,
     meta    : bypass_xbar_resp_info
   };
+  logic bypass_xbar_resp_sel;
+  always_comb begin
+    bypass_xbar_resp_sel = 1'b0;
+    if (bypass_xbar_resp_info.bypass_coalescer === 1'b1) begin
+      bypass_xbar_resp_sel = 1'b1;
+    end
+  end
 
   reqrsp_xbar #(
     .NumInp           (2                ),
@@ -406,7 +430,7 @@ module cachepool_cache_ctrl #(
     .mst_rsp_i        (bypass_xbar_resp         ),
     .mst_rsp_valid_i  (bypass_xbar_resp_valid    ),
     .mst_rsp_ready_o  (bypass_xbar_resp_ready    ),
-    .mst_sel_i        (bypass_xbar_resp_info.bypass_coalescer),
+    .mst_sel_i        (bypass_xbar_resp_sel),
     .mst_rr_i         ('0               )
   );
 
@@ -427,6 +451,7 @@ module cachepool_cache_ctrl #(
     .CacheLineWidth         (CacheLineWidth         ),
     .NumCacheEntry          (NumCacheEntry          ),
     .SetAssociativity       (SetAssociativity       ),
+    .DataPartSplit          (DataPartSplit          ),
     .NumPseudoDualBanks     (BankFactor             ),
     .WriteThroughMode       (0                      ),
     .WordWidth              (WordWidth              ),

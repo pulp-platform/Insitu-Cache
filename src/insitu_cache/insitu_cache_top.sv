@@ -13,7 +13,6 @@
 // Limitation: 1. Upstream Datawidth = Downstream Datawidth = Cache line data width
 
 `include "common_cells/registers.svh"
-`include "insitu_cache/hash.svh"
 module insitu_cache_top #(
     /// Address width of both upstream narrow request and downstream wide request
     parameter int unsigned ReqAddrWidth             = 32,
@@ -25,6 +24,8 @@ module insitu_cache_top #(
     parameter int unsigned NumCacheEntry            = 512,
     /// Number of Associatity
     parameter int unsigned SetAssociativity         = 16,
+    /// Number of parts per cache line for data banks (1 = unfolded).
+    parameter int unsigned DataPartSplit            = 1,
     /// If Use Dual-Port RF, Default No!
     parameter bit          UseDualPortRF            = 0,
     /// If Use Pseudo-Dual Banks, Default yes!
@@ -66,6 +67,8 @@ module insitu_cache_top #(
     parameter int unsigned DownstreamWidth          = CacheLineWidth,
     /// SRAM Configuration
     parameter type impl_in_t                        = logic,
+    // Dependent parameter, do not override. Part index width.
+    localparam int unsigned PartIdxWidth            = (DataPartSplit > 1) ? $clog2(DataPartSplit) : 1,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheBankDepth          = NumCacheEntry/SetAssociativity,
     // Dependent parameter, do not override. set ptr type.
@@ -244,8 +247,11 @@ module insitu_cache_top #(
 
 
     cache_bank_depth_ptr_t                                  bank_read_cache_addr;
+    logic [PartIdxWidth-1:0]                                bank_read_part_idx;
+    logic                                                   bank_read_all_parts;
     logic                                                   bank_read_cache_valid;
     logic                                                   bank_read_cache_ready;
+    logic                   [SetAssociativity - 1 : 0]     bank_read_way_mask;
     logic                   [SetAssociativity - 1 : 0]      bank_read_cache_ready_per_way;
     cache_status_t          [SetAssociativity - 1 : 0]      bank_read_cache_status;
     logic                   [SetAssociativity - 1 : 0]      bank_read_cache_dirty;
@@ -427,6 +433,7 @@ module insitu_cache_top #(
         .info_t          (info_t),
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
+        .DataPartSplit   (DataPartSplit),
         .WordWidth       (WordWidth),
         .ByteWidth       (ByteWidth),
         .LogDebug        (LogDebug),
@@ -477,8 +484,11 @@ module insitu_cache_top #(
 
         //Bank
         .bank_read_addr_o               (bank_read_cache_addr),
+        .bank_read_part_idx_o           (bank_read_part_idx),
+        .bank_read_all_parts_o          (bank_read_all_parts),
         .bank_read_valid_o              (bank_read_cache_valid),
         .bank_read_ready_i              (bank_read_cache_ready),
+        .bank_read_way_mask_o           (bank_read_way_mask),
         .bank_read_cache_status_i       (bank_read_cache_status),
         .bank_read_cache_dirty_i        (bank_read_cache_dirty),
         .bank_read_cache_miss_meta_i    (bank_read_cache_miss_meta),
@@ -640,7 +650,7 @@ module insitu_cache_top #(
             .impl_i           (impl_i),
 
             .read_addr_i(bank_read_cache_addr),
-            .read_valid_i(bank_read_cache_valid),
+            .read_valid_i(bank_read_cache_valid & bank_read_way_mask[i]),
             .write_addr_i(bank_write_cache_addr),
 
             .meta_read_ready_o(__meta_bank_read_ready),
@@ -655,7 +665,9 @@ module insitu_cache_top #(
         );
 
 
-        assign bank_read_cache_ready_per_way[i] = __data_bank_read_ready & __meta_bank_read_ready;
+        assign bank_read_cache_ready_per_way[i] = bank_read_way_mask[i] ?
+                                                   (__data_bank_read_ready & __meta_bank_read_ready) :
+                                                   1'b1;
     end
 
     assign bank_read_cache_ready = &bank_read_cache_ready_per_way;
