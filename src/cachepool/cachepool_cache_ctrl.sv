@@ -70,6 +70,13 @@ module cachepool_cache_ctrl #(
   localparam int unsigned NumDataBankPerWay                               = BankFactor * (CacheLineWidth/WordWidth),
   // Dependent parameter, do not override. Number of meta bank per way.
   localparam int unsigned NumTagBankPerWay                                = BankFactor,
+  // Dependent parameter, do not override. Part split (min 1).
+  localparam int unsigned PartSplit                                       = (DataPartSplit == 0) ? 1 : DataPartSplit,
+  // Dependent parameter, do not override. Coalescer data width (part width when folded).
+  localparam int unsigned CoalescerDataWidth                              =
+    (PartSplit > 1) ? (CacheLineWidth/PartSplit) : CacheLineWidth,
+  // Dependent parameter, do not override. Part index width (min 1).
+  localparam int unsigned PartIdxWidth                                    = (PartSplit > 1) ? $clog2(PartSplit) : 1,
   // Dependent parameter, do not override. Address type.
   localparam type         addr_t                                          = logic [AddrWidth-1:0],
   // Dependent parameter, do not override. Address type.
@@ -155,8 +162,12 @@ module cachepool_cache_ctrl #(
 
   typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
-  typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
+  typedef logic [CoalescerDataWidth-1:0]                                  coal_data_t;
+  typedef logic [CoalescerDataWidth/ByteWidth-1:0]                        coal_mask_t;
+  typedef logic [$clog2(CoalescerDataWidth/WordWidth)-1:0]                coal_ofst_t;
+  typedef logic [PartIdxWidth-1:0]                                        part_idx_t;
   localparam int unsigned                                                 LineOfstBits = $clog2(CacheLineWidth/8);
+  localparam int unsigned                                                 CoalescerLineOfstBits = $clog2(CoalescerDataWidth/8);
   localparam int unsigned                                                 WordOfstBits = $clog2(WordWidth/8);
   localparam int unsigned                                                 CoalPorts = (NumPorts - 1) * CoalExtFactor;
 
@@ -167,6 +178,11 @@ module cachepool_cache_ctrl #(
     core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
     logic                                                                 bypass_coalescer;
   } coalescing_info_t;
+
+  typedef struct packed {
+    part_idx_t                                                            part_idx;
+    coalescing_info_t                                                     coal;
+  } coal_cache_info_t;
 
   typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            cache_mask_t;
@@ -182,6 +198,28 @@ module cachepool_cache_ctrl #(
     way_ptr_t                                                             way;
   } cache_info_t;
 
+  localparam int unsigned                                                 BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
+  typedef logic [BypassAddrOfstWidth-1:0]                                 bypass_addr_ofst_t;
+  typedef struct packed {
+    logic [$bits(coal_cache_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
+    core_meta_t                                                           core_meta;
+    bypass_addr_ofst_t                                                    addr_offset;
+    logic                                                                 bypass_coalescer;
+  } bypass_info_t;
+
+  typedef union packed {
+    coal_cache_info_t                                                     coal;
+    bypass_info_t                                                         bypass;
+  } coalescer_xbar_info_union_t;
+
+  // Ensure the packed union members overlay cleanly
+  initial begin
+    if ($bits(bypass_info_t) != $bits(coal_cache_info_t)) begin
+      $error("Width mismatch: bypass_info_t=%0d, coal_cache_info_t=%0d",
+            $bits(bypass_info_t), $bits(coal_cache_info_t));
+    end
+  end
+
 
   //////////////////////////////////////
   //        Signal Definition         //
@@ -193,15 +231,19 @@ module cachepool_cache_ctrl #(
   addr_t                                                                  coalescing_req_addr;
   coalescing_info_t                                                       coalescing_req_info;
   logic                                                                   coalescing_req_write;
+  coal_data_t                                                             coal_req_wdata;
+  coal_mask_t                                                             coal_req_wmask;
   coalescing_data_t                                                       coalescing_req_wdata;
   coalescing_mask_t                                                       coalescing_req_wmask;
+  part_idx_t                                                              coalescing_req_part_idx;
 
   /// Coalesced response
   logic                                                                   coalescing_resp_valid;
   logic                                                                   coalescing_resp_ready;
-  coalescing_data_t                                                       coalescing_resp_data;
+  coal_data_t                                                             coalescing_resp_data;
   coalescing_info_t                                                       coalescing_resp_info;
   logic                                                                   coalescing_resp_write;
+  part_idx_t                                                              coalescing_resp_part_idx;
 
   // Bypass xbar signals
   logic                                                                   bypass_xbar_req_valid;
@@ -210,7 +252,7 @@ module cachepool_cache_ctrl #(
   logic                                                                   bypass_xbar_resp_valid;
   logic                                                                   bypass_xbar_resp_ready;
   coalescing_data_t                                                       bypass_xbar_resp_data;
-  coalescing_info_t                                                       bypass_xbar_resp_info;
+  coalescer_xbar_info_union_t                                              bypass_xbar_resp_info;
   logic                                                                   bypass_xbar_resp_write;
 
   /// Cache request
@@ -245,7 +287,7 @@ module cachepool_cache_ctrl #(
   coalescing_data_t bypass_pad_data;
   logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
   coal_ofst_t coalescing_first_ofst;
-  logic [LineOfstBits-1:0] coalescing_line_ofst;
+  logic [CoalescerLineOfstBits-1:0] coalescing_line_ofst;
   addr_t coalescing_req_addr_with_ofst;
 
   assign bypass_word_index =
@@ -270,7 +312,19 @@ module cachepool_cache_ctrl #(
   end
   assign coalescing_line_ofst = coalescing_first_ofst << WordOfstBits;
   assign coalescing_req_addr_with_ofst =
-    (coalescing_req_addr & ~(CacheLineWidth/8-1)) | coalescing_line_ofst;
+    (coalescing_req_addr & ~(CoalescerDataWidth/8-1)) | coalescing_line_ofst;
+  assign coalescing_req_part_idx =
+    (PartSplit > 1) ? coalescing_req_addr_with_ofst[LineOfstBits-1:CoalescerLineOfstBits] : '0;
+
+  always_comb begin
+    coalescing_req_wdata = '0;
+    coalescing_req_wmask = '0;
+    coalescing_req_wdata[coalescing_req_part_idx * CoalescerDataWidth +: CoalescerDataWidth] =
+      coal_req_wdata;
+    coalescing_req_wmask[
+      coalescing_req_part_idx * (CoalescerDataWidth/ByteWidth) +: (CoalescerDataWidth/ByteWidth)
+    ] = coal_req_wmask;
+  end
 
 
   /////////////////////////////////////
@@ -285,7 +339,7 @@ module cachepool_cache_ctrl #(
     .info_t                 (core_meta_t          ),
     .down_id_t              (logic                ),
     .UpstreamDataWidth      (WordWidth            ),
-    .DownstreamDataWidth    (CacheLineWidth       ),
+    .DownstreamDataWidth    (CoalescerDataWidth   ),
     .ByteWidth              (ByteWidth            )
   ) i_par_coalescer_for_spatz (
     .clk_i,
@@ -311,8 +365,8 @@ module cachepool_cache_ctrl #(
     .downstream_req_addr_o  (coalescing_req_addr  ),
     .downstream_req_info_o  (coalescing_req_info  ),
     .downstream_req_write_o (coalescing_req_write ),
-    .downstream_req_wdata_o (coalescing_req_wdata ),
-    .downstream_req_wmask_o (coalescing_req_wmask ),
+    .downstream_req_wdata_o (coal_req_wdata       ),
+    .downstream_req_wmask_o (coal_req_wmask       ),
 
     .downstream_resp_valid_i(coalescing_resp_valid),
     .downstream_resp_ready_o(coalescing_resp_ready),
@@ -322,28 +376,6 @@ module cachepool_cache_ctrl #(
   );
 
   //1.mux/demux to divide snitch and spatz req/resp
-  localparam int unsigned BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
-  typedef logic [BypassAddrOfstWidth-1:0]    bypass_addr_ofst_t;
-  typedef struct packed {
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
-    core_meta_t                       core_meta;
-    bypass_addr_ofst_t                addr_offset;
-    logic                             bypass_coalescer;
-  } bypass_info_t;
-
-  typedef union packed {
-    coalescing_info_t   coalescer;
-    bypass_info_t       bypass;
-  } coalescer_xbar_info_union_t;
-
-  // Ensure the packed union members overlay cleanly
-  initial begin
-    if ($bits(bypass_info_t) != $bits(coalescing_info_t)) begin
-      $error("Width mismatch: bypass_info_t=%0d, coalescing_info_t=%0d",
-            $bits(bypass_info_t), $bits(coalescing_info_t));
-    end
-  end
-
   typedef struct packed {
     addr_t              addr;
     coalescer_xbar_info_union_t   info;
@@ -363,7 +395,12 @@ module cachepool_cache_ctrl #(
 
   assign coalescer_req = '{
     addr    : coalescing_req_addr_with_ofst,
-    info    : coalescer_xbar_info_union_t'(coalescing_req_info),
+    info    : coalescer_xbar_info_union_t'(
+      coal_cache_info_t'{
+        part_idx: coalescing_req_part_idx,
+        coal    : coalescing_req_info
+      }
+    ),
     write   : coalescing_req_write,
     wdata   : coalescing_req_wdata,
     wmask   : coalescing_req_wmask
@@ -399,7 +436,7 @@ module cachepool_cache_ctrl #(
   logic bypass_xbar_resp_sel;
   always_comb begin
     bypass_xbar_resp_sel = 1'b0;
-    if (bypass_xbar_resp_info.bypass_coalescer === 1'b1) begin
+    if (bypass_xbar_resp_info.bypass.bypass_coalescer === 1'b1) begin
       bypass_xbar_resp_sel = 1'b1;
     end
   end
@@ -435,8 +472,10 @@ module cachepool_cache_ctrl #(
   );
 
     // resp xbar to coalescer
-  assign coalescing_resp_data  = coalescer_resp.data;
-  assign coalescing_resp_info  = coalescer_resp.meta.coalescer;
+  assign coalescing_resp_part_idx = coalescer_resp.meta.coal.part_idx;
+  assign coalescing_resp_data =
+    coalescer_resp.data[coalescing_resp_part_idx * CoalescerDataWidth +: CoalescerDataWidth];
+  assign coalescing_resp_info  = coalescer_resp.meta.coal.coal;
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
   assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
@@ -447,7 +486,7 @@ module cachepool_cache_ctrl #(
   insitu_cache_tcdm_wrapper #(
     .ReqAddrWidth           (AddrWidth              ),
     .TagWidth               (TagWidth               ),
-    .info_t                 (coalescing_info_t      ),
+    .info_t                 (coalescer_xbar_info_union_t),
     .CacheLineWidth         (CacheLineWidth         ),
     .NumCacheEntry          (NumCacheEntry          ),
     .SetAssociativity       (SetAssociativity       ),
