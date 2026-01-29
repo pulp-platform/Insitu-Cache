@@ -542,16 +542,19 @@ module insitu_cache_tcdm_wrapper
         assign winfo_fifo_push             =    ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
         assign winfo_fifo_in               =    upstream_req_info_i;
 
-        assign upstream_req_to_cache_payload.addr = cache_addr_hashing(
-                                                        upstream_req_addr_i,
-                                                        $clog2(DownstreamWidth/8),
-                                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
-                                                        AddrHashLength
-                                                    );
-        assign upstream_req_to_cache_payload.info = upstream_req_info_i;
-        assign upstream_req_to_cache_payload.write = upstream_req_write_i;
-        assign upstream_req_to_cache_payload.wdata = upstream_req_wdata_i;
-        assign upstream_req_to_cache_payload.wmask = upstream_req_wmask_i;
+        assign upstream_req_to_cache_payload = '{
+            addr:  cache_addr_hashing(
+                                        upstream_req_addr_i,
+                                        $clog2(DownstreamWidth/8),
+                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                        AddrHashLength
+                                     ),
+            info:  upstream_req_info_i,
+            write: upstream_req_write_i,
+            wdata: upstream_req_wdata_i,
+            wmask: upstream_req_wmask_i,
+            default:'0
+        };
 
         /***************************************/
         /*  Cache Flush + Invalidation Process */
