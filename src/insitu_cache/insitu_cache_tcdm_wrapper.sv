@@ -465,6 +465,7 @@ module insitu_cache_tcdm_wrapper
     logic [1:0]                                             sync_ctrl_insn_q, sync_ctrl_insn_d;
     cache_bank_depth_ptr_t                                  sync_ctrl_ptr_q,sync_ctrl_ptr_d;
     down_req_t                                              sync_ctrl_payload_q,sync_ctrl_payload_d;
+    logic                                                   clear_pend_cnt;
     `FFARN (sync_ctrl_status_q, sync_ctrl_status_d,         SYNC_CTRL_IDLE, clk_i, rst_ni)
     `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
@@ -660,6 +661,7 @@ module insitu_cache_tcdm_wrapper
             write_through_valid         = '0;
 
             cache_sync_ready_o          = '0;
+            clear_pend_cnt              = 1'b0;
 
             //FSM
             case (sync_ctrl_status_q)
@@ -688,6 +690,7 @@ module insitu_cache_tcdm_wrapper
                 end
 
                 SYNC_CTRL_INIT : begin
+                    clear_pend_cnt              = 1'b1;
                     flush_write_cache_addr      = sync_ctrl_ptr_q;
                     flush_write_cache_status    = '0;
                     flush_write_cache_dirty     = '0;
@@ -706,6 +709,10 @@ module insitu_cache_tcdm_wrapper
                 end
 
                 SYNC_CTRL_CHECK_PEND : begin
+                    if (sync_ctrl_insn_q != 2'b01) begin
+                        // For flush+invalidate or invalidate-only, drop pending lines and proceed.
+                        clear_pend_cnt = 1'b1;
+                    end
                     if (~sync_ctrl_still_pending) begin
                         sync_ctrl_status_d = SYNC_CTRL_FLUSH;
                         sync_ctrl_ptr_d = cache_part_base_i;
@@ -850,6 +857,7 @@ module insitu_cache_tcdm_wrapper
         .clk_i,
         .rst_ni,
         .has_pend_line_o                (sync_ctrl_still_pending),
+        .clear_pend_cnt_i               (clear_pend_cnt),
 
         .upstream_req_valid_i           (upstream_req_to_cache_valid),
         .upstream_req_ready_o           (upstream_req_to_cache_ready),

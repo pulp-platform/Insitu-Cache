@@ -451,6 +451,7 @@ module insitu_cache_top #(
         .clk_i,
         .rst_ni,
         .has_pend_line_o                (/*open*/),
+        .clear_pend_cnt_i               (1'b0),
 
         .upstream_req_valid_i           (upstream_req_to_cache_valid),
         .upstream_req_ready_o           (upstream_req_to_cache_ready),

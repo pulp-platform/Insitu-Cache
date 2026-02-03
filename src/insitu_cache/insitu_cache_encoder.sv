@@ -73,6 +73,7 @@ module insitu_cache_encoder
     input  logic                                            enc_mod_data_with_mask_i,
     input  cache_mask_t                                     enc_mod_mask_i,
     input  cache_data_t                                     enc_mod_write_data_i,
+    input  logic                                            clear_pend_cnt_i,
 
     /// Cache Banks Reads
     input  cache_status_t           [SetAssociativity-1:0]  bank_read_cache_status_i,
@@ -218,6 +219,12 @@ module insitu_cache_encoder
                 bank_write_cache_status_o[enc_way_i],
                 bank_read_cache_LRU_i,
                 bank_write_cache_LRU_o);
+        end
+
+        //flush/invalidate can clear pending lines without going through encoder updates
+        if (clear_pend_cnt_i) begin
+            pendline_cnt_d = '0;
+            has_pend_line_o = 1'b0;
         end
 
 `ifdef ENABLE_MULTI_READ_PEND

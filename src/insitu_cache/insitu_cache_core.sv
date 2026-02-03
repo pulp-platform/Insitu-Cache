@@ -103,6 +103,8 @@ module insitu_cache_core
     input  logic                                            rst_ni,
     /// Indicate Pend Lines
     output logic                                            has_pend_line_o,
+    /// Clear pending-line counter (used by flush/invalidate)
+    input  logic                                            clear_pend_cnt_i,
 
     /// Upstream request -- cache requests channel
     input  logic                                            upstream_req_valid_i,
@@ -186,6 +188,11 @@ module insitu_cache_core
     localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoWidth;
     localparam int unsigned TaskPayloadPad                  = ReqAddrWidth + CacheLineWidth/ByteWidth + InfoWidth - $bits(downstream_info_t);
     localparam type subarray_cnt_t                          = logic [SubarrayCntWidth-1:0];
+`ifdef INSITU_CACHE_CORE_USE_MSHR_PADING
+    localparam int unsigned MshrPadBits                     = MSHRPadWidth;
+`else
+    localparam int unsigned MshrPadBits                     = 0;
+`endif
 
 
 
@@ -255,6 +262,29 @@ module insitu_cache_core
         cache_mask_t                                        wmask;
         info_t                                              info;
     } cache_request_payload_t;
+
+    function automatic cache_mask_t mshr_subarray_mask(input subarray_cnt_t idx);
+        automatic cache_mask_t mask;
+        automatic int unsigned bit_base;
+        automatic int unsigned byte_base;
+        automatic int unsigned byte_end;
+        mask = '0;
+        bit_base = MshrPadBits + (idx * InfoWidth);
+        byte_base = bit_base / ByteWidth;
+        byte_end = (bit_base + InfoWidth + ByteWidth - 1) / ByteWidth;
+        for (int bt = byte_base; bt < byte_end; bt++) begin
+            mask[bt] = 1'b1;
+        end
+        return mask;
+    endfunction
+
+    function automatic cache_data_t mshr_subarray_data(input subarray_cnt_t idx, input info_t info);
+        automatic cache_payload_union_t payload;
+        payload = '0;
+        payload.mshr.subarrays = '0;
+        payload.mshr.subarrays[idx] = info;
+        return payload.data;
+    endfunction
 
     //Payload of cache refill
     typedef struct packed {
@@ -943,6 +973,7 @@ module insitu_cache_core
         .enc_mod_data_with_mask_i (enc_mod_data_with_mask ),
         .enc_mod_mask_i           (enc_mod_mask           ),
         .enc_mod_write_data_i     (enc_mod_write_data     ),
+        .clear_pend_cnt_i         (clear_pend_cnt_i       ),
 `ifdef ENABLE_MULTI_READ_PEND
         .enc_link_exec_i          (enc_link_exec          ),
         .enc_link_src_way_i       (enc_link_src_way       ),
@@ -1192,9 +1223,17 @@ module insitu_cache_core
                                 automatic subarray_cnt_t subarray_cnt;
                                 subarray_cnt = dec_cache_mask[SubarrayCntWidth-1:0];
                                 //7.2 Update subarrays
-                                cache_payload.mshr.subarrays[subarray_cnt] = preread_task_q.task_pay.request.info;
                                 enc_cache_mask = cache_mask_t'(subarray_cnt + 1'b1);
-                                enc_cache_data = cache_payload.data;
+                                if (PartSplit > 1) begin
+                                    enc_mod_data_with_mask = 1'b1;
+                                    enc_mod_mask = mshr_subarray_mask(subarray_cnt);
+                                    enc_mod_write_data =
+                                        mshr_subarray_data(subarray_cnt, preread_task_q.task_pay.request.info);
+                                end else begin
+                                    cache_payload.mshr.subarrays[subarray_cnt] =
+                                        preread_task_q.task_pay.request.info;
+                                    enc_cache_data = cache_payload.data;
+                                end
 
                                 //7.3 update full signal if needed
                                 if (enc_cache_mask >= NumSubarray) begin
@@ -1273,9 +1312,17 @@ module insitu_cache_core
 
                                 /*Allow merge subarray*/
                                 //7.2 Update subarrays
-                                cache_payload.mshr.subarrays[subarray_cnt] = preread_task_q.task_pay.request.info;
                                 enc_cache_mask = cache_mask_t'(subarray_cnt + 1'b1);
-                                enc_cache_data = cache_payload.data;
+                                if (PartSplit > 1) begin
+                                    enc_mod_data_with_mask = 1'b1;
+                                    enc_mod_mask = mshr_subarray_mask(subarray_cnt);
+                                    enc_mod_write_data =
+                                        mshr_subarray_data(subarray_cnt, preread_task_q.task_pay.request.info);
+                                end else begin
+                                    cache_payload.mshr.subarrays[subarray_cnt] =
+                                        preread_task_q.task_pay.request.info;
+                                    enc_cache_data = cache_payload.data;
+                                end
 
                                 //7.4 Write to bank
                                 bank_write_req_o = 1;
