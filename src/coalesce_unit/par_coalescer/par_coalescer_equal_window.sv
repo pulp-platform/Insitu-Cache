@@ -107,6 +107,12 @@ module par_coalescer_equal_window #(
         info_t                                      info;
     } upstream_resp_t;
 
+    typedef struct packed {
+        downstream_data_t                           data;
+        downstream_info_t                           info;
+        logic                                       write;
+    } downstream_resp_t;
+
     //////////////////////////////////////
     //        Signal Definition         //
     //////////////////////////////////////
@@ -122,6 +128,13 @@ module par_coalescer_equal_window #(
     upstream_data_t    [NumPorts-1:0]               buffer_req_wdata;
     upstream_strb_t    [NumPorts-1:0]               buffer_req_wstrb;
 
+    logic              [NumPorts-1:0]               req_info_full;
+    logic              [NumPorts-1:0]               req_wdata_full;
+    logic              [NumPorts-1:0]               req_wstrb_full;
+    logic              [NumPorts-1:0]               req_fifo_full;
+    logic              [NumPorts-1:0]               upstream_req_valid_gated;
+    logic              [NumPorts-1:0]               upstream_req_ready_raw;
+
 
     logic              [NumPorts-1:0]               upstream_resp_valid;
     logic              [NumPorts-1:0]               upstream_resp_ready;
@@ -131,6 +144,11 @@ module par_coalescer_equal_window #(
 
     upstream_resp_t    [NumPorts-1:0]               upstream_resp_spillin;
     upstream_resp_t    [NumPorts-1:0]               upstream_resp_spillout;
+
+    downstream_resp_t                               downstream_resp_bundle_in;
+    downstream_resp_t                               downstream_resp_bundle;
+    logic                                           downstream_resp_valid;
+    logic                                           downstream_resp_ready;
 
     //////////////////////////////////
     //        Instance Modules      //
@@ -144,6 +162,10 @@ module par_coalescer_equal_window #(
         assign write_mixed_addr[i] = {upstream_req_write_i[i], upstream_req_addr_i[i]};
     end
 
+    assign req_fifo_full = req_info_full | req_wdata_full | req_wstrb_full;
+    assign upstream_req_valid_gated = upstream_req_valid_i & ~req_fifo_full;
+    assign upstream_req_ready_o = upstream_req_ready_raw & ~req_fifo_full;
+
     req_coalescer_v2 #(
         .UpstreamDataWidth         (UpstreamDataWidth),
         .DownstreamDataWidth       (DownstreamDataWidth),
@@ -155,8 +177,8 @@ module par_coalescer_equal_window #(
         .rst_ni,
 
         .upstream_addr_i           (write_mixed_addr           ),
-        .upstream_valid_i          (upstream_req_valid_i       ),
-        .upstream_ready_o          (upstream_req_ready_o       ),
+        .upstream_valid_i          (upstream_req_valid_gated   ),
+        .upstream_ready_o          (upstream_req_ready_raw     ),
 
         .coal_valid_o              (coal_req_valid             ),
         .coal_ready_i              (coal_req_ready             ),
@@ -197,7 +219,7 @@ module par_coalescer_equal_window #(
             .rst_ni,
             .flush_i               (1'b0                       ),
             .testmode_i            (1'b0                       ),
-            .full_o                (/*open*/),
+            .full_o                (req_info_full[i]           ),
             .empty_o               (/*open*/),
             .usage_o               (/*open*/                   ),
             .data_i                (upstream_req_info_i[i]     ),
@@ -215,7 +237,7 @@ module par_coalescer_equal_window #(
             .rst_ni,
             .flush_i               (1'b0                       ),
             .testmode_i            (1'b0                       ),
-            .full_o                (/*open*/),
+            .full_o                (req_wdata_full[i]          ),
             .empty_o               (/*open*/),
             .usage_o               (/*open*/                   ),
             .data_i                (upstream_req_wdata_i[i]    ),
@@ -233,7 +255,7 @@ module par_coalescer_equal_window #(
             .rst_ni,
             .flush_i               (1'b0                       ),
             .testmode_i            (1'b0                       ),
-            .full_o                (/*open*/),
+            .full_o                (req_wstrb_full[i]          ),
             .empty_o               (/*open*/),
             .usage_o               (/*open*/                   ),
             .data_i                (upstream_req_wstrb_i[i]    ),
@@ -289,6 +311,26 @@ module par_coalescer_equal_window #(
     /*  Resp Phase  */
     /****************/
 
+    always_comb begin
+        downstream_resp_bundle_in.data = downstream_resp_data_i;
+        downstream_resp_bundle_in.info = downstream_resp_info_i;
+        downstream_resp_bundle_in.write = downstream_resp_write_i;
+    end
+
+    spill_register #(
+        .T                         (downstream_resp_t          ),
+        .Bypass                    (~SpliterSpillReg          )
+    ) i_spill_downstream_resp (
+        .clk_i,
+        .rst_ni,
+        .valid_i                   (downstream_resp_valid_i    ),
+        .ready_o                   (downstream_resp_ready_o    ),
+        .data_i                    (downstream_resp_bundle_in  ),
+        .valid_o                   (downstream_resp_valid      ),
+        .ready_i                   (downstream_resp_ready      ),
+        .data_o                    (downstream_resp_bundle     )
+    );
+
     rsp_spliter_v2 #(
         .UpstreamDataWidth          (UpstreamDataWidth),
         .DownstreamDataWidth        (DownstreamDataWidth),
@@ -296,28 +338,28 @@ module par_coalescer_equal_window #(
     ) i_rsp_spliter (
         .clk_i,
         .rst_ni,
-        .downstream_valid_i         (downstream_resp_valid_i         ),
-        .downstream_ready_o         (downstream_resp_ready_o         ),
-        .downstream_data_i          (downstream_resp_data_i          ),
+        .downstream_valid_i         (downstream_resp_valid           ),
+        .downstream_ready_o         (downstream_resp_ready           ),
+        .downstream_data_i          (downstream_resp_bundle.data     ),
 
         .rsp_ready_i                (upstream_resp_ready           ), 
         .rsp_valid_o                (upstream_resp_valid           ), 
         .rsp_data_o                 (upstream_resp_data            ), 
 
-        .coal_strb_i                (downstream_resp_info_i.hitmap   ),
+        .coal_strb_i                (downstream_resp_bundle.info.hitmap),
         .coal_strb_empty_i          ('0                              ),
         .coal_strb_pop_o            (/*open*/),
 
-        .coal_port_addr_ofst_i      (downstream_resp_info_i.ofsts    ),
+        .coal_port_addr_ofst_i      (downstream_resp_bundle.info.ofsts),
         .coal_port_addr_ofst_empty_i('0                              ),
         .coal_port_addr_ofst_pop_o  (/*open*/)
     );
 
     always_comb begin : gen_up_resp_data
-        upstream_resp_info = downstream_resp_info_i.infos;
+        upstream_resp_info = downstream_resp_bundle.info.infos;
         upstream_resp_write = '0;
         for (int i = 0; i<NumPorts ; i++ ) begin
-            upstream_resp_write[i] = downstream_resp_info_i.hitmap[i]? downstream_resp_write_i: '0;
+            upstream_resp_write[i] = downstream_resp_bundle.info.hitmap[i] ? downstream_resp_bundle.write : '0;
         end
     end
 

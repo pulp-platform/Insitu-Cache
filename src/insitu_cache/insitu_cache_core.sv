@@ -181,11 +181,12 @@ module insitu_cache_core
     //////////////////////////////////////
 
     localparam int unsigned InfoWidth                       = $bits(info_t);
+    localparam int unsigned InfoStoreWidth                  = ((InfoWidth + ByteWidth - 1) / ByteWidth) * ByteWidth;
     localparam int unsigned SubarrayCounterWidth            = CacheLineWidth/WordWidth;
-    localparam int unsigned MaxNumSubarray                  = CacheLineWidth/InfoWidth;
+    localparam int unsigned MaxNumSubarray                  = CacheLineWidth/InfoStoreWidth;
     localparam int unsigned NumSubarray                     = MaxNumSubarray > (2**SubarrayCounterWidth)-2? (2**SubarrayCounterWidth)-2 : MaxNumSubarray;
     localparam int unsigned SubarrayCntWidth                = (NumSubarray > 0) ? $clog2(NumSubarray + 1) : 1;
-    localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoWidth;
+    localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoStoreWidth;
     localparam int unsigned TaskPayloadPad                  = ReqAddrWidth + CacheLineWidth/ByteWidth + InfoWidth - $bits(downstream_info_t);
     localparam type subarray_cnt_t                          = logic [SubarrayCntWidth-1:0];
 `ifdef INSITU_CACHE_CORE_USE_MSHR_PADING
@@ -205,7 +206,7 @@ module insitu_cache_core
     /**********/
 
     //MSHR types
-    typedef info_t  [MaxNumSubarray-1:0]                    mshr_subarrays;
+    typedef logic [MaxNumSubarray-1:0][InfoStoreWidth-1:0] mshr_subarrays;
 
     //MSHR payload
 `ifdef INSITU_CACHE_CORE_USE_MSHR_PADING
@@ -269,9 +270,10 @@ module insitu_cache_core
         automatic int unsigned byte_base;
         automatic int unsigned byte_end;
         mask = '0;
-        bit_base = MshrPadBits + (idx * InfoWidth);
+        // Use byte-aligned subarray slots to avoid overlap between adjacent infos.
+        bit_base = MshrPadBits + (idx * InfoStoreWidth);
         byte_base = bit_base / ByteWidth;
-        byte_end = (bit_base + InfoWidth + ByteWidth - 1) / ByteWidth;
+        byte_end = (bit_base + InfoStoreWidth + ByteWidth - 1) / ByteWidth;
         for (int bt = byte_base; bt < byte_end; bt++) begin
             mask[bt] = 1'b1;
         end
@@ -282,7 +284,7 @@ module insitu_cache_core
         automatic cache_payload_union_t payload;
         payload = '0;
         payload.mshr.subarrays = '0;
-        payload.mshr.subarrays[idx] = info;
+        payload.mshr.subarrays[idx][InfoWidth-1:0] = info;
         return payload.data;
     endfunction
 
@@ -638,7 +640,9 @@ module insitu_cache_core
         data: downstream_resp_refill_data_i,
         pad: '0
     };
-    assign downstream_refill_valid                  = (downstream_refill_lockup_q | (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2))) & downstream_resp_refill_valid_i;
+    assign downstream_refill_valid                  =
+        (downstream_refill_lockup_q | (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2))) &
+        downstream_resp_refill_valid_i;
     assign downstream_resp_refill_ready_o           =
         (downstream_refill_lockup_q | (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2))) &
         downstream_refill_ready & ~evict_full_block;
@@ -786,21 +790,32 @@ module insitu_cache_core
     );
 
     //Control signals
-    assign retr_resp_valid = ~retr_fifo_empty;
+    subarray_cnt_t                                          retr_num_subarray;
+    logic                                                   retr_entry_empty;
+    logic                                                   retr_last_resp;
+
+    assign retr_num_subarray = retr_fifo_out.num_subarray[SubarrayCntWidth-1:0];
+    assign retr_entry_empty  = (retr_num_subarray == '0);
+    assign retr_last_resp    = (resp_cnt_q == (retr_num_subarray - 1'b1));
+
+    // If a malformed/empty retrieval entry sneaks in, drop it without emitting
+    // response beats to prevent out-of-bound subarray indexing and X propagation.
+    assign retr_resp_valid = ~retr_fifo_empty & ~retr_entry_empty;
     assign retr_fifo_pop = ~retr_fifo_empty &
-                           (resp_cnt_q == (retr_fifo_out.num_subarray[SubarrayCntWidth-1:0] - 1'b1)) &
-                           retr_resp_ready;
-    assign resp_cnt_d = retr_fifo_pop? 0:
-                        retr_resp_valid & retr_resp_ready? resp_cnt_q + 1:
+                           (retr_entry_empty | (retr_last_resp & retr_resp_ready));
+    assign resp_cnt_d = retr_fifo_pop ? '0 :
+                        (retr_resp_valid & retr_resp_ready) ? (resp_cnt_q + 1'b1) :
                         resp_cnt_q;
 
     //Datapath
     always_comb begin
-        if ((resp_cnt_q == (retr_fifo_out.num_subarray[SubarrayCntWidth-1:0] - 1'b1)) &
-            retr_fifo_out.one_more) begin
-            retr_resp_payload.info = retr_fifo_out.extra_subarray;
-        end else begin
-            retr_resp_payload.info = retr_fifo_out.subarrays[resp_cnt_q];
+        retr_resp_payload.info = '0;
+        if (~retr_entry_empty) begin
+            if (retr_last_resp & retr_fifo_out.one_more) begin
+                retr_resp_payload.info = retr_fifo_out.extra_subarray;
+            end else begin
+                retr_resp_payload.info = retr_fifo_out.subarrays[resp_cnt_q][InfoWidth-1:0];
+            end
         end
         retr_resp_payload.data = retr_fifo_out.data;
     end
@@ -1227,10 +1242,13 @@ module insitu_cache_core
                                 if (PartSplit > 1) begin
                                     enc_mod_data_with_mask = 1'b1;
                                     enc_mod_mask = mshr_subarray_mask(subarray_cnt);
-                                    enc_mod_write_data =
-                                        mshr_subarray_data(subarray_cnt, preread_task_q.task_pay.request.info);
+                                    // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
+                                    // The byte mask can touch bytes that contain adjacent subarray fields.
+                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                        preread_task_q.task_pay.request.info;
+                                    enc_mod_write_data = cache_payload.data;
                                 end else begin
-                                    cache_payload.mshr.subarrays[subarray_cnt] =
+                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
                                     enc_cache_data = cache_payload.data;
                                 end
@@ -1265,7 +1283,7 @@ module insitu_cache_core
 
                                 //7.8 generate MSHR info
                                 cache_payload.mshr.subarrays = '0;
-                                cache_payload.mshr.subarrays[0] = preread_task_q.task_pay.request.info;
+                                cache_payload.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
                                 enc_cache_data = cache_payload.data;
 
                                 //7.9 Write to Bank
@@ -1316,10 +1334,13 @@ module insitu_cache_core
                                 if (PartSplit > 1) begin
                                     enc_mod_data_with_mask = 1'b1;
                                     enc_mod_mask = mshr_subarray_mask(subarray_cnt);
-                                    enc_mod_write_data =
-                                        mshr_subarray_data(subarray_cnt, preread_task_q.task_pay.request.info);
+                                    // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
+                                    // The byte mask can touch bytes that contain adjacent subarray fields.
+                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                        preread_task_q.task_pay.request.info;
+                                    enc_mod_write_data = cache_payload.data;
                                 end else begin
-                                    cache_payload.mshr.subarrays[subarray_cnt] =
+                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
                                     enc_cache_data = cache_payload.data;
                                 end
@@ -1410,7 +1431,7 @@ module insitu_cache_core
                                 enc_cache_mask = 1;
                                 cache_payload = '0;
                                 cache_payload.mshr.subarrays = '0;
-                                cache_payload.mshr.subarrays[0] = preread_task_q.task_pay.request.info;
+                                cache_payload.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
                                 enc_cache_data = cache_payload.data;
 `ifdef ENABLE_MULTI_READ_PEND
                                 enc_cache_miss_meta = '0;
@@ -1858,6 +1879,7 @@ module insitu_cache_core
             automatic cache_mask_t write_storb;
             automatic way_ptr_t refill_way = dec_way;
             automatic logic is_stalled_req_write;
+            automatic subarray_cnt_t retr_subarray_cnt;
 
             {_req_tag,_req_depth,_req_ofst} = fsm_refill_stall_q.addr;
             cache_payload.data = dec_cache_data;
@@ -1867,8 +1889,9 @@ module insitu_cache_core
             if (~is_write_refill) begin
 
                 //1.1 Prepare retrieve payload
+                retr_subarray_cnt = dec_cache_mask[SubarrayCntWidth-1:0];
                 retr_fifo_in.data = preread_task_q.task_pay.refill.data;
-                retr_fifo_in.num_subarray = dec_cache_mask;
+                retr_fifo_in.num_subarray = cache_mask_t'(retr_subarray_cnt);
                 retr_fifo_in.subarrays = cache_payload.mshr.subarrays;
                 retr_fifo_in.one_more = 0;
                 retr_fifo_in.extra_subarray = '0;
@@ -1879,7 +1902,8 @@ module insitu_cache_core
                     preread_task_q.task_pay.refill.info.way == fsm_refill_way_q) begin
 
                     //1.2.1 Update retrieve payload
-                    retr_fifo_in.num_subarray = dec_cache_mask + 1'b1;
+                    retr_subarray_cnt = retr_subarray_cnt + 1'b1;
+                    retr_fifo_in.num_subarray = cache_mask_t'(retr_subarray_cnt);
                     retr_fifo_in.one_more = 1;
                     retr_fifo_in.extra_subarray = fsm_refill_stall_q.info;
 
@@ -1890,7 +1914,7 @@ module insitu_cache_core
                 end
 
                 //1.3 Push retrieve fifo
-                retr_fifo_push = 1;
+                retr_fifo_push = (retr_subarray_cnt != '0);
             end
 
             //2. Process of cache line refilling
@@ -2078,7 +2102,7 @@ module insitu_cache_core
                     enc_cache_mask = 1;
                     cache_payload = '0;
                     cache_payload.mshr.subarrays = '0;
-                    cache_payload.mshr.subarrays[0] = fsm_refill_stall_q.info;
+                    cache_payload.mshr.subarrays[0][InfoWidth-1:0] = fsm_refill_stall_q.info;
                     enc_cache_data = cache_payload.data;
 `ifdef ENABLE_MULTI_READ_PEND
                     enc_cache_miss_meta = '0;

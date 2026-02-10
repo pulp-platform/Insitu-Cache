@@ -298,6 +298,13 @@ module insitu_cache_tcdm_wrapper
     info_t                                                  core_resp_info;
     cache_resp_t                                            rresp_in;
     cache_resp_t                                            resp_out;
+    logic                                                   resp_mux_lock_q;
+    logic                                                   resp_mux_lock_d;
+    logic                                                   resp_mux_sel_q;
+    logic                                                   resp_mux_sel_d;
+    logic                                                   resp_mux_use_core;
+    logic                                                   resp_mux_use_wresp;
+    logic                                                   resp_mux_valid;
 
     /********************/
     /*  Cache Miss Req  */
@@ -942,7 +949,6 @@ module insitu_cache_tcdm_wrapper
     );
 
     assign wresp_valid = ~winfo_fifo_empty;
-    assign winfo_fifo_pop = wresp_valid & wresp_ready;
     assign wresp_in = '{
         data: '0,
         info: winfo_fifo_out,
@@ -955,16 +961,61 @@ module insitu_cache_tcdm_wrapper
         write: 1'b0
     };
 
-    stream_arbiter #(.DATA_T(cache_resp_t), .N_INP(2)) i_cache_resp_arbiter (
-        .clk_i,
-        .rst_ni,
-        .inp_data_i ({wresp_in,    rresp_in}),
-        .inp_valid_i({wresp_valid, core_resp_valid}),
-        .inp_ready_o({wresp_ready, core_resp_ready}),
-        .oup_data_o (resp_out),
-        .oup_valid_o(upstream_resp_valid_o),
-        .oup_ready_i(upstream_resp_ready_i)
-    );
+    // Prioritize read/refill responses over write responses. Keep the selected
+    // source stable under backpressure to satisfy valid/ready stability rules.
+    always_comb begin : proc_cache_resp_sel
+        resp_mux_lock_d    = resp_mux_lock_q;
+        resp_mux_sel_d     = resp_mux_sel_q;
+        resp_mux_use_core  = 1'b0;
+        resp_mux_use_wresp = 1'b0;
+        resp_mux_valid     = 1'b0;
+
+        if (resp_mux_lock_q) begin
+            resp_mux_use_core  = ~resp_mux_sel_q;
+            resp_mux_use_wresp =  resp_mux_sel_q;
+        end else begin
+            resp_mux_use_core  = core_resp_valid;
+            resp_mux_use_wresp = ~core_resp_valid & wresp_valid;
+        end
+
+        resp_mux_valid = (resp_mux_use_core & core_resp_valid) |
+                         (resp_mux_use_wresp & wresp_valid);
+
+        if (!resp_mux_lock_q) begin
+            if (resp_mux_valid && !upstream_resp_ready_i) begin
+                resp_mux_lock_d = 1'b1;
+                resp_mux_sel_d  = resp_mux_use_wresp;
+            end
+        end else if (resp_mux_valid && upstream_resp_ready_i) begin
+            resp_mux_lock_d = 1'b0;
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : proc_cache_resp_sel_ff
+        if (!rst_ni) begin
+            resp_mux_lock_q <= 1'b0;
+            resp_mux_sel_q  <= 1'b0;
+        end else begin
+            resp_mux_lock_q <= resp_mux_lock_d;
+            resp_mux_sel_q  <= resp_mux_sel_d;
+        end
+    end
+
+    always_comb begin : proc_cache_resp_mux
+        resp_out             = '0;
+        upstream_resp_valid_o = resp_mux_valid;
+        wresp_ready          = 1'b0;
+        core_resp_ready      = 1'b0;
+        if (resp_mux_use_core) begin
+            resp_out              = rresp_in;
+            core_resp_ready       = upstream_resp_ready_i;
+        end else if (resp_mux_use_wresp) begin
+            resp_out              = wresp_in;
+            wresp_ready           = upstream_resp_ready_i;
+        end
+    end
+
+    assign winfo_fifo_pop = wresp_valid & wresp_ready;
 
     assign {upstream_resp_data_o, upstream_resp_info_o, upstream_resp_write_o} = resp_out;
 
