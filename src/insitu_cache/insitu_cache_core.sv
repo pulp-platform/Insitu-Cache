@@ -1510,6 +1510,10 @@ module insitu_cache_core
                             miss_is_full_masked_write_tmp = req_is_write_tmp & (&preread_task_q.task_pay.request.wmask);
                             if (miss_is_full_masked_write_tmp) begin
                                 enc_cache_status = VALID;
+                            end else begin
+                                // Hold off the next preread for one cycle so the newly-created
+                                // pending line is visible to the following bank lookup.
+                                preread_allowed = 1'b0;
                             end
 
                             //11.8 Write to Bank
@@ -2169,6 +2173,11 @@ module insitu_cache_core
                 //7.7 Return status and continue preread for request
                 cache_status_d = REQ_PROC;
                 preread_allowed = 1;
+                if (~refill_all_pend_is_full_masked_write_tmp) begin
+                    // Hold off the next preread for one cycle so the newly-created
+                    // pending line is visible to the following bank lookup.
+                    preread_allowed = 1'b0;
+                end
 
                 //7.8 update life-cycle state
                 `ifndef TARGET_SYNTHESIS
