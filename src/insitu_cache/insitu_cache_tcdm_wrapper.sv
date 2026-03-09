@@ -1483,7 +1483,13 @@ module pseudo_dual_port_tcdm_wrapper #(
                 status = WR_DIFF_BANK;
             end else
             if (read_addr_i == write_addr_i) begin
-                status = WR_SAME_ADDR;
+                if (read_all_parts_i) begin
+                    // A masked write only carries the updated part; bypassing it as a full-line
+                    // read would zero the untouched parts. Serialize full-line reads instead.
+                    status = WR_CONFLICT;
+                end else begin
+                    status = WR_SAME_ADDR;
+                end
             end else begin
                 status = WR_CONFLICT;
             end
@@ -1553,7 +1559,8 @@ module pseudo_dual_port_tcdm_wrapper #(
         /*********************/
         /* Read Ready Logics */
         /*********************/
-        if (write_has_data & (read_addr_i != write_addr_i) & (read_bank_select == write_bank_select)) begin
+        if (write_has_data && (read_bank_select == write_bank_select) &&
+            ((read_addr_i != write_addr_i) || read_all_parts_i)) begin
             read_ready_o = 1'b0;
         end
     end
