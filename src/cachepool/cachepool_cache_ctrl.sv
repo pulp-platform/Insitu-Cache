@@ -206,16 +206,10 @@ module cachepool_cache_ctrl #(
     bypass_addr_ofst_t                                                    addr_offset;
     logic                                                                 bypass_coalescer;
   } bypass_info_t;
-  typedef struct packed {
-    core_meta_t                                                           core_meta;
-    bypass_addr_ofst_t                                                    addr_offset;
-  } bypass_resp_meta_t;
-
   typedef union packed {
     coal_cache_info_t                                                     coal;
     bypass_info_t                                                         bypass;
   } coalescer_xbar_info_union_t;
-  localparam int unsigned                                                 RespRouteFifoDepth = 16;
 
   // Ensure the packed union members overlay cleanly
   initial begin
@@ -259,21 +253,6 @@ module cachepool_cache_ctrl #(
   coalescing_data_t                                                       bypass_xbar_resp_data;
   coalescer_xbar_info_union_t                                              bypass_xbar_resp_info;
   logic                                                                   bypass_xbar_resp_write;
-  logic                                                                   bypass_req_hs;
-  logic                                                                   coalescing_req_hs;
-  logic                                                                   cache_resp_hs;
-  logic                                                                   resp_route_push;
-  logic                                                                   resp_route_pop;
-  logic                                                                   resp_route_full;
-  logic                                                                   resp_route_empty;
-  logic                                                                   resp_route_is_bypass_in;
-  logic                                                                   resp_route_is_bypass_out;
-  bypass_resp_meta_t                                                      bypass_resp_meta_in;
-  bypass_resp_meta_t                                                      bypass_resp_meta_out;
-  logic                                                                   bypass_resp_meta_push;
-  logic                                                                   bypass_resp_meta_pop;
-  logic                                                                   bypass_resp_meta_full;
-  logic                                                                   bypass_resp_meta_empty;
 
   /// Cache request
   logic                                                                   cache_req_valid;
@@ -454,7 +433,12 @@ module cachepool_cache_ctrl #(
     meta    : bypass_xbar_resp_info
   };
   logic bypass_xbar_resp_sel;
-  assign bypass_xbar_resp_sel = (~resp_route_empty) ? resp_route_is_bypass_out : 1'b0;
+  always_comb begin
+    bypass_xbar_resp_sel = 1'b0;
+    if (bypass_xbar_resp_info.bypass.bypass_coalescer === 1'b1) begin
+      bypass_xbar_resp_sel = 1'b1;
+    end
+  end
 
   reqrsp_xbar #(
     .NumInp           (2                ),
@@ -486,70 +470,6 @@ module cachepool_cache_ctrl #(
     .mst_rr_i         ('0               )
   );
 
-  assign bypass_req_hs = core_req_valid_i[NumPorts-1] & core_req_ready_o[NumPorts-1];
-  assign coalescing_req_hs = coalescing_req_valid & coalescing_req_ready;
-  assign cache_resp_hs = bypass_xbar_resp_valid & bypass_xbar_resp_ready;
-
-  assign resp_route_push = bypass_req_hs | coalescing_req_hs;
-  assign resp_route_pop = cache_resp_hs;
-  assign resp_route_is_bypass_in = bypass_req_hs;
-
-  fifo_v3 #(
-    .dtype        (logic),
-    .DEPTH        (RespRouteFifoDepth),
-    .FALL_THROUGH (1'b1)
-  ) i_resp_route_fifo (
-    .clk_i      (clk_i                  ),
-    .rst_ni     (rst_ni                 ),
-    .flush_i    (1'b0                   ),
-    .testmode_i (1'b0                   ),
-    .full_o     (resp_route_full        ),
-    .empty_o    (resp_route_empty       ),
-    .usage_o    (/* unused */           ),
-    .data_i     (resp_route_is_bypass_in),
-    .push_i     (resp_route_push        ),
-    .data_o     (resp_route_is_bypass_out),
-    .pop_i      (resp_route_pop         )
-  );
-
-  assign bypass_resp_meta_in = '{
-    core_meta: core_req_meta_i[NumPorts-1],
-    addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)]
-  };
-  assign bypass_resp_meta_push = bypass_req_hs;
-  assign bypass_resp_meta_pop = cache_resp_hs & bypass_xbar_resp_sel;
-
-  fifo_v3 #(
-    .dtype        (bypass_resp_meta_t  ),
-    .DEPTH        (RespRouteFifoDepth  ),
-    .FALL_THROUGH (1'b1                )
-  ) i_bypass_resp_meta_fifo (
-    .clk_i      (clk_i                 ),
-    .rst_ni     (rst_ni                ),
-    .flush_i    (1'b0                  ),
-    .testmode_i (1'b0                  ),
-    .full_o     (bypass_resp_meta_full ),
-    .empty_o    (bypass_resp_meta_empty),
-    .usage_o    (/* unused */          ),
-    .data_i     (bypass_resp_meta_in   ),
-    .push_i     (bypass_resp_meta_push ),
-    .data_o     (bypass_resp_meta_out  ),
-    .pop_i      (bypass_resp_meta_pop  )
-  );
-
-`ifndef TARGET_SYNTHESIS
-  always_ff @(posedge clk_i) begin
-    if (rst_ni) begin
-      if (resp_route_push && resp_route_full && !resp_route_pop) begin
-        $error("[cachepool_cache_ctrl] response route FIFO overflow");
-      end
-      if (bypass_resp_meta_push && bypass_resp_meta_full && !bypass_resp_meta_pop) begin
-        $error("[cachepool_cache_ctrl] bypass response meta FIFO overflow");
-      end
-    end
-  end
-`endif
-
     // resp xbar to coalescer
   assign coalescing_resp_part_idx = coalescer_resp.meta.coal.part_idx;
   assign coalescing_resp_data =
@@ -558,8 +478,8 @@ module cachepool_cache_ctrl #(
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
   assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
-  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp_meta_out.addr_offset * WordWidth +: WordWidth];
-  assign core_resp_meta_o [NumPorts-1]    = bypass_resp_meta_out.core_meta;
+  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset * WordWidth +: WordWidth];
+  assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
 
   //2.Insitu-Cache controller
   insitu_cache_tcdm_wrapper #(
