@@ -550,6 +550,40 @@ module insitu_cache_core
     `FFARN (fsm_refill_stall_q,     fsm_refill_stall_d,     '0, clk_i, rst_ni)
     `FFARN (fsm_refill_way_q,       fsm_refill_way_d,       '0, clk_i, rst_ni)
 
+    //Waveform-visible temporary signals used in Cache_FSM
+    cache_tag_t                                             req_tag_tmp;
+    cache_bank_depth_ptr_t                                  req_depth_tmp;
+    byte_offset_t                                           req_ofst_tmp;
+    way_ptr_t                                               req_way_tmp;
+    logic                                                   req_is_write_tmp;
+    logic                                                   req_is_hit_tmp;
+    logic                                                   req_is_hit_pend_tmp;
+    logic                                                   req_is_hit_conflict_tmp;
+    logic                                                   req_is_all_pend_tmp;
+    logic                                                   req_is_write_through_ignore_tmp;
+    cache_payload_union_t                                   req_hit_pend_cache_payload_tmp;
+    subarray_cnt_t                                          req_hit_pend_subarray_cnt_tmp;
+    logic                                                   miss_is_full_masked_write_tmp;
+    cache_payload_union_t                                   miss_cache_payload_tmp;
+    logic                                                   refill_is_write_tmp;
+    cache_tag_t                                             refill_req_tag_tmp;
+    cache_bank_depth_ptr_t                                  refill_req_depth_tmp;
+    byte_offset_t                                           refill_req_ofst_tmp;
+    cache_payload_union_t                                   refill_cache_payload_tmp;
+    cache_data_in_words_t                                   refill_cache_data_in_words_tmp;
+    cache_data_in_words_t                                   refill_evic_data_in_words_tmp;
+    cache_data_in_words_t                                   refill_write_data_in_words_tmp;
+    cache_data_in_bytes_t                                   refill_cache_data_in_bytes_tmp;
+    cache_data_in_bytes_t                                   refill_write_data_in_bytes_tmp;
+    cache_mask_t                                            refill_write_storb_tmp;
+    way_ptr_t                                               refill_way_tmp;
+    logic                                                   refill_is_stalled_req_write_tmp;
+    subarray_cnt_t                                          refill_retr_subarray_cnt_tmp;
+    logic                                                   refill_all_pend_is_full_masked_write_tmp;
+    cache_payload_union_t                                   refill_all_pend_cache_payload_tmp;
+
+    logic [16-1:0] here_debug;
+
 `ifndef TARGET_SYNTHESIS
     //Debugging
     cache_tag_t                                             debug_req_tag;
@@ -1084,6 +1118,39 @@ module insitu_cache_core
         bank_write_way_o = '0;
         bank_write_LRU_req_o = '0;
 
+        //Waveform-visible temporary signals
+        req_tag_tmp = '0;
+        req_depth_tmp = '0;
+        req_ofst_tmp = '0;
+        req_way_tmp = dec_way;
+        req_is_write_tmp = dec_is_write_req;
+        req_is_hit_tmp = dec_is_hit;
+        req_is_hit_pend_tmp = dec_is_hit_pend;
+        req_is_hit_conflict_tmp = dec_is_hit_conflit;
+        req_is_all_pend_tmp = dec_is_all_pend;
+        req_is_write_through_ignore_tmp = 1'b0;
+        req_hit_pend_cache_payload_tmp = '0;
+        req_hit_pend_subarray_cnt_tmp = '0;
+        miss_is_full_masked_write_tmp = 1'b0;
+        miss_cache_payload_tmp = '0;
+        refill_is_write_tmp = preread_task_q.task_pay.refill.info.for_write_pend;
+        refill_req_tag_tmp = '0;
+        refill_req_depth_tmp = '0;
+        refill_req_ofst_tmp = '0;
+        refill_cache_payload_tmp = '0;
+        refill_cache_data_in_words_tmp = '0;
+        refill_evic_data_in_words_tmp = '0;
+        refill_write_data_in_words_tmp = '0;
+        refill_cache_data_in_bytes_tmp = '0;
+        refill_write_data_in_bytes_tmp = '0;
+        refill_write_storb_tmp = '0;
+        refill_way_tmp = dec_way;
+        refill_is_stalled_req_write_tmp = 1'b0;
+        refill_retr_subarray_cnt_tmp = '0;
+        refill_all_pend_is_full_masked_write_tmp = 1'b0;
+        refill_all_pend_cache_payload_tmp = '0;
+
+        here_debug = '0;
 `ifndef TARGET_SYNTHESIS
         //debug information
         if (LogDebug) begin
@@ -1126,27 +1193,17 @@ module insitu_cache_core
 
                 //1. Process when prereader got request task
                 if (preread_task_q.valid & ~preread_task_q.is_refill) begin : prec_req_process
-                    automatic cache_tag_t _tag;
-                    automatic cache_bank_depth_ptr_t _depth;
-                    automatic byte_offset_t _ofst;
-                    automatic way_ptr_t _way = dec_way;
-                    automatic logic is_write_req = dec_is_write_req;
-                    automatic logic is_hit = dec_is_hit;
-                    automatic logic is_hit_pend = dec_is_hit_pend;
-                    automatic logic is_hit_conflit = dec_is_hit_conflit;
-                    automatic logic is_all_pend = dec_is_all_pend;
-                    automatic logic is_write_through_ignore = 0;
-                    {_tag,_depth,_ofst} = preread_task_q.task_pay.request.addr;
-                    is_write_through_ignore = WriteThroughMode & is_write_req;
+                    {req_tag_tmp, req_depth_tmp, req_ofst_tmp} = preread_task_q.task_pay.request.addr;
+                    req_is_write_through_ignore_tmp = WriteThroughMode & req_is_write_tmp;
 
-                    bank_write_way_o = _way;
-                    bank_write_addr_o = _depth;
+                    bank_write_way_o = req_way_tmp;
+                    bank_write_addr_o = req_depth_tmp;
 
                     //4. Process for different request type
-                    if (is_hit) begin
+                    if (req_is_hit_tmp) begin
 
                         /*The request hit cache line*/
-                        if (~is_write_req) begin
+                        if (~req_is_write_tmp) begin
 
                             //5. Process of read hit
                             if (~resp_fifo_full) begin
@@ -1200,25 +1257,24 @@ module insitu_cache_core
                         end
 
                         //6.7 update life-cycle counter
-                        `ifndef TARGET_SYNTHESIS
+                            `ifndef TARGET_SYNTHESIS
                             if (LogLifeCycle) begin
-                                life_cycle_scoreboard_d[{_depth,_way}].usefull_cnt = $time -
-                                                                                     life_cycle_scoreboard_q[{_depth,_way}].last_record_time +
-                                                                                     life_cycle_scoreboard_q[{_depth,_way}].usefull_cnt;
-                                life_cycle_scoreboard_d[{_depth,_way}].current_state = LIFECYCLE_USELESS;
-                                life_cycle_scoreboard_d[{_depth,_way}].last_record_time = $time;
+                                life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].usefull_cnt = $time -
+                                                                                                   life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].last_record_time +
+                                                                                                   life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].usefull_cnt;
+                                life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].current_state = LIFECYCLE_USELESS;
+                                life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].last_record_time = $time;
                             end
                         `endif
 
                     end 
-                    else if (is_hit_pend & ~is_write_through_ignore) begin
+                    else if (req_is_hit_pend_tmp & ~req_is_write_through_ignore_tmp) begin
 
                         /*The request hit pending line with same access type*/
-                        if (~is_write_req) begin
+                        if (~req_is_write_tmp) begin
                             
                             //7. Process of read hit on read pend line
-                            automatic cache_payload_union_t cache_payload;
-                            cache_payload.data = dec_cache_data;
+                            req_hit_pend_cache_payload_tmp.data = dec_cache_data;
 `ifdef ENABLE_MULTI_READ_PEND
                             //Cases for multi-read-pending
                             //|-------------------------------------------------------------------------------------------------------------------|
@@ -1235,22 +1291,21 @@ module insitu_cache_core
 
                             if (~dec_is_hit_pend_new_entry) begin
                                 /*Situation A*/
-                                automatic subarray_cnt_t subarray_cnt;
-                                subarray_cnt = dec_cache_mask[SubarrayCntWidth-1:0];
+                                req_hit_pend_subarray_cnt_tmp = dec_cache_mask[SubarrayCntWidth-1:0];
                                 //7.2 Update subarrays
-                                enc_cache_mask = cache_mask_t'(subarray_cnt + 1'b1);
+                                enc_cache_mask = cache_mask_t'(req_hit_pend_subarray_cnt_tmp + 1'b1);
                                 if (PartSplit > 1) begin
                                     enc_mod_data_with_mask = 1'b1;
-                                    enc_mod_mask = mshr_subarray_mask(subarray_cnt);
+                                    enc_mod_mask = mshr_subarray_mask(req_hit_pend_subarray_cnt_tmp);
                                     // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
                                     // The byte mask can touch bytes that contain adjacent subarray fields.
-                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
-                                    enc_mod_write_data = cache_payload.data;
+                                    enc_mod_write_data = req_hit_pend_cache_payload_tmp.data;
                                 end else begin
-                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
-                                    enc_cache_data = cache_payload.data;
+                                    enc_cache_data = req_hit_pend_cache_payload_tmp.data;
                                 end
 
                                 //7.3 update full signal if needed
@@ -1273,7 +1328,7 @@ module insitu_cache_core
                                 enc_cache_status = READ_PEND;
                                 enc_cache_dirty = 0;
                                 enc_cache_mask = 1'b1;
-                                enc_cache_tag = _tag;
+                                enc_cache_tag = req_tag_tmp;
                                 enc_cache_miss_meta = '0;
 
                                 //7.7.1 update full signal if needed
@@ -1282,9 +1337,9 @@ module insitu_cache_core
                                 end
 
                                 //7.8 generate MSHR info
-                                cache_payload.mshr.subarrays = '0;
-                                cache_payload.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
-                                enc_cache_data = cache_payload.data;
+                                req_hit_pend_cache_payload_tmp.mshr.subarrays = '0;
+                                req_hit_pend_cache_payload_tmp.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
+                                enc_cache_data = req_hit_pend_cache_payload_tmp.data;
 
                                 //7.9 Write to Bank
                                 bank_write_req_o = 1;
@@ -1296,17 +1351,17 @@ module insitu_cache_core
                                 `ifndef TARGET_SYNTHESIS
                                     if (LogLifeCycle) begin
                                         if (dec_cache_status == INVALID) begin
-                                            life_cycle_scoreboard_d[{_depth,_way}].invalid_cnt = $time -
-                                                                                                 life_cycle_scoreboard_q[{_depth,_way}].last_record_time +
-                                                                                                 life_cycle_scoreboard_q[{_depth,_way}].invalid_cnt;
+                                            life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].invalid_cnt = $time -
+                                                                                                               life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].last_record_time +
+                                                                                                               life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].invalid_cnt;
                                         end else begin
-                                            life_cycle_scoreboard_d[{_depth,_way}].useless_cnt = $time -
-                                                                                                 life_cycle_scoreboard_q[{_depth,_way}].last_record_time +
-                                                                                                 life_cycle_scoreboard_q[{_depth,_way}].useless_cnt;
+                                            life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].useless_cnt = $time -
+                                                                                                               life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].last_record_time +
+                                                                                                               life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].useless_cnt;
                                         end
 
-                                        life_cycle_scoreboard_d[{_depth,_way}].current_state = LIFECYCLE_READ_PENDING;
-                                        life_cycle_scoreboard_d[{_depth,_way}].last_record_time = $time;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].current_state = LIFECYCLE_READ_PENDING;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].last_record_time = $time;
                                     end
 
                                     //multi-read-pend counter
@@ -1323,26 +1378,26 @@ module insitu_cache_core
                                 preread_allowed = 0;
                             end
 `else //No -- ENABLE_MULTI_READ_PEND
+                            begin : proc_read_hit_pend_no_mrp
                             //7.1 Check whether subarrays are full
-                            automatic subarray_cnt_t subarray_cnt;
-                            subarray_cnt = dec_cache_mask[SubarrayCntWidth-1:0];
-                            if (subarray_cnt < NumSubarray) begin
+                            req_hit_pend_subarray_cnt_tmp = dec_cache_mask[SubarrayCntWidth-1:0];
+                            if (req_hit_pend_subarray_cnt_tmp < NumSubarray) begin
 
                                 /*Allow merge subarray*/
                                 //7.2 Update subarrays
-                                enc_cache_mask = cache_mask_t'(subarray_cnt + 1'b1);
+                                enc_cache_mask = cache_mask_t'(req_hit_pend_subarray_cnt_tmp + 1'b1);
                                 if (PartSplit > 1) begin
                                     enc_mod_data_with_mask = 1'b1;
-                                    enc_mod_mask = mshr_subarray_mask(subarray_cnt);
+                                    enc_mod_mask = mshr_subarray_mask(req_hit_pend_subarray_cnt_tmp);
                                     // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
                                     // The byte mask can touch bytes that contain adjacent subarray fields.
-                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
-                                    enc_mod_write_data = cache_payload.data;
+                                    enc_mod_write_data = req_hit_pend_cache_payload_tmp.data;
                                 end else begin
-                                    cache_payload.mshr.subarrays[subarray_cnt][InfoWidth-1:0] =
+                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
                                         preread_task_q.task_pay.request.info;
-                                    enc_cache_data = cache_payload.data;
+                                    enc_cache_data = req_hit_pend_cache_payload_tmp.data;
                                 end
 
                                 //7.4 Write to bank
@@ -1356,12 +1411,13 @@ module insitu_cache_core
                                 /*will stall of subarray full*/
                                 //7.6 Prepare meta-data
                                 fsm_refill_stall_d = preread_task_q.task_pay.request;
-                                fsm_refill_way_d = _way;
+                                fsm_refill_way_d = req_way_tmp;
 
                                 //7.7 Change status and stop preread for request
                                 cache_status_d = MSHR_FULL_STALL;
                                 preread_allowed = 0;
 
+                            end
                             end
 `endif //ENABLE_MULTI_READ_PEND
                         end else begin
@@ -1386,7 +1442,7 @@ module insitu_cache_core
 
                         end
                     end
-                    else if (is_hit_conflit) begin
+                    else if (req_is_hit_conflict_tmp) begin
 
                         /*The request hit pending line with opposite access type*/
                         //    ** NOTE! **
@@ -1397,42 +1453,40 @@ module insitu_cache_core
                         //9. Process hit conflict
                         //9.1 Prepare request infomation
                         fsm_refill_stall_d = preread_task_q.task_pay.request;
-                        fsm_refill_way_d = _way;
+                        fsm_refill_way_d = req_way_tmp;
 
                         //9.2 Change status and stop preread for request
                         cache_status_d = WR_CONFLICT_STALL;
                         preread_allowed = 0;
 
                     end
-                    else if (~is_write_through_ignore) begin
+                    else if (~req_is_write_through_ignore_tmp) begin
 
                         /*The request is cache miss*/
                         //10. Prcoess of miss
-                        if (~is_all_pend) begin
-                            automatic logic is_full_masked_write = 0;
+                        if (~req_is_all_pend_tmp) begin
 
                             /*exist cache line to replace*/
                             //11. Generate pending line
                             //11.1 Update cache line status
-                            enc_cache_status = is_write_req? WRITE_PEND: READ_PEND;
+                            enc_cache_status = req_is_write_tmp? WRITE_PEND: READ_PEND;
 
                             //11.2 Update dirty bit & mask
-                            enc_cache_dirty = is_write_req? 1:0;
-                            enc_cache_mask = is_write_req? preread_task_q.task_pay.request.wmask: '0;
+                            enc_cache_dirty = req_is_write_tmp? 1:0;
+                            enc_cache_mask = req_is_write_tmp? preread_task_q.task_pay.request.wmask: '0;
 
                             //11.3 Update tag
-                            enc_cache_tag = _tag;
+                            enc_cache_tag = req_tag_tmp;
 
                             //11.4 Update payload
-                            if (~is_write_req) begin
-
+                            if (~req_is_write_tmp) begin
+                                here_debug[0] = 1;
                                 //11.5 Generate Subarrays
-                                automatic cache_payload_union_t cache_payload;
                                 enc_cache_mask = 1;
-                                cache_payload = '0;
-                                cache_payload.mshr.subarrays = '0;
-                                cache_payload.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
-                                enc_cache_data = cache_payload.data;
+                                miss_cache_payload_tmp = '0;
+                                miss_cache_payload_tmp.mshr.subarrays = '0;
+                                miss_cache_payload_tmp.mshr.subarrays[0][InfoWidth-1:0] = preread_task_q.task_pay.request.info;
+                                enc_cache_data = miss_cache_payload_tmp.data;
 `ifdef ENABLE_MULTI_READ_PEND
                                 enc_cache_miss_meta = '0;
                                 enc_cache_miss_meta.is_prime = 1'b1;
@@ -1453,8 +1507,8 @@ module insitu_cache_core
 
                             //11.7 Check whether the miss is a full masked write
                             //     If yes, we directly refill line w/o fetching
-                            is_full_masked_write = is_write_req & (&preread_task_q.task_pay.request.wmask);
-                            if (is_full_masked_write) begin
+                            miss_is_full_masked_write_tmp = req_is_write_tmp & (&preread_task_q.task_pay.request.wmask);
+                            if (miss_is_full_masked_write_tmp) begin
                                 enc_cache_status = VALID;
                             end
 
@@ -1468,59 +1522,59 @@ module insitu_cache_core
                             `ifndef TARGET_SYNTHESIS
                                 if (LogLifeCycle) begin
                                     if (dec_cache_status == INVALID) begin
-                                        life_cycle_scoreboard_d[{_depth,_way}].invalid_cnt = $time -
-                                                                                             life_cycle_scoreboard_q[{_depth,_way}].last_record_time +
-                                                                                             life_cycle_scoreboard_q[{_depth,_way}].invalid_cnt;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].invalid_cnt = $time -
+                                                                                                           life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].last_record_time +
+                                                                                                           life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].invalid_cnt;
                                     end else begin
-                                        life_cycle_scoreboard_d[{_depth,_way}].useless_cnt = $time -
-                                                                                             life_cycle_scoreboard_q[{_depth,_way}].last_record_time +
-                                                                                             life_cycle_scoreboard_q[{_depth,_way}].useless_cnt;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].useless_cnt = $time -
+                                                                                                           life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].last_record_time +
+                                                                                                           life_cycle_scoreboard_q[{req_depth_tmp,req_way_tmp}].useless_cnt;
                                     end
 
                                     if (enc_cache_status == WRITE_PEND) begin
-                                        life_cycle_scoreboard_d[{_depth,_way}].current_state = LIFECYCLE_WRITE_PENDING;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].current_state = LIFECYCLE_WRITE_PENDING;
                                     end else
                                     if (enc_cache_status == READ_PEND) begin
-                                        life_cycle_scoreboard_d[{_depth,_way}].current_state = LIFECYCLE_READ_PENDING;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].current_state = LIFECYCLE_READ_PENDING;
                                     end else
                                     if (enc_cache_status == VALID) begin
-                                        life_cycle_scoreboard_d[{_depth,_way}].current_state = LIFECYCLE_USELESS;
+                                        life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].current_state = LIFECYCLE_USELESS;
                                     end
 
-                                    life_cycle_scoreboard_d[{_depth,_way}].last_record_time = $time;
+                                    life_cycle_scoreboard_d[{req_depth_tmp,req_way_tmp}].last_record_time = $time;
                                 end
                             `endif
 
                             //12. Check to replace cache line dirty
-                            if (dec_cache_status == VALID && dec_cache_dirty == 1 && is_full_masked_write==0) begin
+                            if (dec_cache_status == VALID && dec_cache_dirty == 1 && miss_is_full_masked_write_tmp == 0) begin
 
                                 //12.1 Need both eviction and send miss req to DRAM
                                 if (~miss_fifo_full & ~evic_fifo_full) begin
 
                                     /*Push both miss + evic fifo*/
                                     //12.1.1 Prepare miss payload
-                                    _ofst = '0;
-                                    miss_fifo_in.addr = {_tag,_depth,_ofst};
-                                    miss_fifo_in.info.for_write_pend = is_write_req;
-                                    miss_fifo_in.info.way = _way;
-                                    miss_fifo_in.info.depth = _depth;
+                                    req_ofst_tmp = '0;
+                                    miss_fifo_in.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    miss_fifo_in.info.for_write_pend = req_is_write_tmp;
+                                    miss_fifo_in.info.way = req_way_tmp;
+                                    miss_fifo_in.info.depth = req_depth_tmp;
 
                                     //12.1.2 Push miss fifo
                                     miss_fifo_push = 1;
 
                                     if (PartSplit > 1) begin
-                                        fsm_evic_stall_d.addr = {dec_cache_tag,_depth,_ofst};
+                                        fsm_evic_stall_d.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         fsm_evic_stall_d.wdata = '0;
                                         fsm_evic_stall_d.wmask = dec_cache_mask;
-                                        evict_stall_way_d = _way;
-                                        evict_stall_depth_d = _depth;
+                                        evict_stall_way_d = req_way_tmp;
+                                        evict_stall_depth_d = req_depth_tmp;
                                         evict_full_data_valid_d = 1'b0;
                                         evict_full_wait_d = 1'b0;
                                         cache_status_d = EVIC_STALL;
                                         preread_allowed = 0;
                                     end else begin
                                         //12.1.3 Prepare evic payload
-                                        evic_fifo_in.addr = {dec_cache_tag,_depth,_ofst};
+                                        evic_fifo_in.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         evic_fifo_in.wdata = dec_cache_data;
                                         evic_fifo_in.wmask = dec_cache_mask;
 
@@ -1532,21 +1586,21 @@ module insitu_cache_core
 
                                     /*Push miss fifo + will stall of evic*/
                                     //12.1.5 Prepare miss payload
-                                    _ofst = '0;
-                                    miss_fifo_in.addr = {_tag,_depth,_ofst};
-                                    miss_fifo_in.info.for_write_pend = is_write_req;
-                                    miss_fifo_in.info.way = _way;
-                                    miss_fifo_in.info.depth = _depth;
+                                    req_ofst_tmp = '0;
+                                    miss_fifo_in.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    miss_fifo_in.info.for_write_pend = req_is_write_tmp;
+                                    miss_fifo_in.info.way = req_way_tmp;
+                                    miss_fifo_in.info.depth = req_depth_tmp;
 
                                     //12.1.6 Push miss fifo
                                     miss_fifo_push = 1;
 
                                     //12.1.7 Prepare evic meta-data
-                                    fsm_evic_stall_d.addr = {dec_cache_tag,_depth,_ofst};
+                                    fsm_evic_stall_d.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                     fsm_evic_stall_d.wdata = dec_cache_data;
                                     fsm_evic_stall_d.wmask = dec_cache_mask;
-                                    evict_stall_way_d = _way;
-                                    evict_stall_depth_d = _depth;
+                                    evict_stall_way_d = req_way_tmp;
+                                    evict_stall_depth_d = req_depth_tmp;
                                     evict_full_data_valid_d = 1'b0;
                                     evict_full_wait_d = 1'b0;
 
@@ -1558,15 +1612,15 @@ module insitu_cache_core
 
                                     /*Will stall of miss + push evic fifo*/
                                     //12.1.9 Prepare miss meta-data
-                                    _ofst = '0;
+                                    req_ofst_tmp = '0;
                                     fsm_miss_stall_d.evic_stall = 0;
                                     fsm_miss_stall_d.evic = '0;
                                     fsm_miss_stall_d.evic_way = '0;
                                     fsm_miss_stall_d.evic_depth = '0;
-                                    fsm_miss_stall_d.miss.addr = {_tag,_depth,_ofst};
-                                    fsm_miss_stall_d.miss.info.for_write_pend = is_write_req;
-                                    fsm_miss_stall_d.miss.info.way = _way;
-                                    fsm_miss_stall_d.miss.info.depth = _depth;
+                                    fsm_miss_stall_d.miss.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    fsm_miss_stall_d.miss.info.for_write_pend = req_is_write_tmp;
+                                    fsm_miss_stall_d.miss.info.way = req_way_tmp;
+                                    fsm_miss_stall_d.miss.info.depth = req_depth_tmp;
 
                                     //12.1.10 Change status and stop preread for request
                                     cache_status_d = MISS_STALL;
@@ -1574,14 +1628,14 @@ module insitu_cache_core
 
                                     if (PartSplit > 1) begin
                                         fsm_miss_stall_d.evic_stall = 1;
-                                        fsm_miss_stall_d.evic.addr = {dec_cache_tag,_depth,_ofst};
+                                        fsm_miss_stall_d.evic.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         fsm_miss_stall_d.evic.wdata = '0;
                                         fsm_miss_stall_d.evic.wmask = dec_cache_mask;
-                                        fsm_miss_stall_d.evic_way = _way;
-                                        fsm_miss_stall_d.evic_depth = _depth;
+                                        fsm_miss_stall_d.evic_way = req_way_tmp;
+                                        fsm_miss_stall_d.evic_depth = req_depth_tmp;
                                     end else begin
                                         //12.1.11 Prepare evic payload
-                                        evic_fifo_in.addr = {dec_cache_tag,_depth,_ofst};
+                                        evic_fifo_in.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         evic_fifo_in.wdata = dec_cache_data;
                                         evic_fifo_in.wmask = dec_cache_mask;
 
@@ -1593,42 +1647,42 @@ module insitu_cache_core
 
                                     /*Will stall of miss fifo*/
                                     //12.1.13 Prepare miss meta-data
-                                    _ofst = '0;
+                                    req_ofst_tmp = '0;
                                     fsm_miss_stall_d.evic_stall = 1;
-                                    fsm_miss_stall_d.evic.addr = {dec_cache_tag,_depth,_ofst};
+                                    fsm_miss_stall_d.evic.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                     fsm_miss_stall_d.evic.wdata = dec_cache_data;
                                     fsm_miss_stall_d.evic.wmask = dec_cache_mask;
-                                    fsm_miss_stall_d.evic_way = _way;
-                                    fsm_miss_stall_d.evic_depth = _depth;
-                                    fsm_miss_stall_d.miss.addr = {_tag,_depth,_ofst};
-                                    fsm_miss_stall_d.miss.info.for_write_pend = is_write_req;
-                                    fsm_miss_stall_d.miss.info.way = _way;
-                                    fsm_miss_stall_d.miss.info.depth = _depth;
+                                    fsm_miss_stall_d.evic_way = req_way_tmp;
+                                    fsm_miss_stall_d.evic_depth = req_depth_tmp;
+                                    fsm_miss_stall_d.miss.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    fsm_miss_stall_d.miss.info.for_write_pend = req_is_write_tmp;
+                                    fsm_miss_stall_d.miss.info.way = req_way_tmp;
+                                    fsm_miss_stall_d.miss.info.depth = req_depth_tmp;
 
                                     //12.1.14 Change status and stop preread for request
                                     cache_status_d = MISS_STALL;
                                     preread_allowed = 0;
 
                                 end
-                            end else if (dec_cache_status == VALID && dec_cache_dirty == 1 && is_full_masked_write==1) begin
+                            end else if (dec_cache_status == VALID && dec_cache_dirty == 1 && miss_is_full_masked_write_tmp == 1) begin
 
                                 //12.2 Only eviction, we don't need to send miss request
                                 if (~evic_fifo_full) begin
 
                                     /*Allow to push evic fifo*/
                                     if (PartSplit > 1) begin
-                                        fsm_evic_stall_d.addr = {dec_cache_tag,_depth,_ofst};
+                                        fsm_evic_stall_d.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         fsm_evic_stall_d.wdata = '0;
                                         fsm_evic_stall_d.wmask = dec_cache_mask;
-                                        evict_stall_way_d = _way;
-                                        evict_stall_depth_d = _depth;
+                                        evict_stall_way_d = req_way_tmp;
+                                        evict_stall_depth_d = req_depth_tmp;
                                         evict_full_data_valid_d = 1'b0;
                                         evict_full_wait_d = 1'b0;
                                         cache_status_d = EVIC_STALL;
                                         preread_allowed = 0;
                                     end else begin
                                         //12.2.1 Prepare evic payload
-                                        evic_fifo_in.addr = {dec_cache_tag,_depth,_ofst};
+                                        evic_fifo_in.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                         evic_fifo_in.wdata = dec_cache_data;
                                         evic_fifo_in.wmask = dec_cache_mask;
 
@@ -1640,11 +1694,11 @@ module insitu_cache_core
 
                                     /*Will stall of evic fifo*/
                                     //12.2.3 Prepare evic meta-data
-                                    fsm_evic_stall_d.addr = {dec_cache_tag,_depth,_ofst};
+                                    fsm_evic_stall_d.addr = {dec_cache_tag,req_depth_tmp,req_ofst_tmp};
                                     fsm_evic_stall_d.wdata = dec_cache_data;
                                     fsm_evic_stall_d.wmask = dec_cache_mask;
-                                    evict_stall_way_d = _way;
-                                    evict_stall_depth_d = _depth;
+                                    evict_stall_way_d = req_way_tmp;
+                                    evict_stall_depth_d = req_depth_tmp;
                                     evict_full_data_valid_d = 1'b0;
                                     evict_full_wait_d = 1'b0;
 
@@ -1653,18 +1707,18 @@ module insitu_cache_core
                                     preread_allowed = 0;
 
                                 end
-                            end else if (~is_full_masked_write) begin
+                            end else if (~miss_is_full_masked_write_tmp) begin
 
                                 //12.3 No eviction needed
                                 if (~miss_fifo_full) begin
 
                                     /*Allow to push miss fifo*/
                                     //12.3.1 Prepare miss payload
-                                    _ofst = '0;
-                                    miss_fifo_in.addr = {_tag,_depth,_ofst};
-                                    miss_fifo_in.info.for_write_pend = is_write_req;
-                                    miss_fifo_in.info.way = _way;
-                                    miss_fifo_in.info.depth = _depth;
+                                    req_ofst_tmp = '0;
+                                    miss_fifo_in.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    miss_fifo_in.info.for_write_pend = req_is_write_tmp;
+                                    miss_fifo_in.info.way = req_way_tmp;
+                                    miss_fifo_in.info.depth = req_depth_tmp;
 
                                     //12.3.2 Push miss fifo
                                     miss_fifo_push = 1;
@@ -1673,15 +1727,15 @@ module insitu_cache_core
 
                                     /*Will stall of miss fifo*/
                                     //12.3.3 Prepare miss meta-data
-                                    _ofst = '0;
+                                    req_ofst_tmp = '0;
                                     fsm_miss_stall_d.evic_stall = 0;
                                     fsm_miss_stall_d.evic = '0;
                                     fsm_miss_stall_d.evic_way = '0;
                                     fsm_miss_stall_d.evic_depth = '0;
-                                    fsm_miss_stall_d.miss.addr = {_tag,_depth,_ofst};
-                                    fsm_miss_stall_d.miss.info.for_write_pend = is_write_req;
-                                    fsm_miss_stall_d.miss.info.way = _way;
-                                    fsm_miss_stall_d.miss.info.depth = _depth;
+                                    fsm_miss_stall_d.miss.addr = {req_tag_tmp,req_depth_tmp,req_ofst_tmp};
+                                    fsm_miss_stall_d.miss.info.for_write_pend = req_is_write_tmp;
+                                    fsm_miss_stall_d.miss.info.way = req_way_tmp;
+                                    fsm_miss_stall_d.miss.info.depth = req_depth_tmp;
 
                                     //12.3.4 Change status and stop preread for request
                                     cache_status_d = MISS_STALL;
@@ -1708,19 +1762,19 @@ module insitu_cache_core
 `ifndef TARGET_SYNTHESIS
                     /*Set Debug Information*/
                     if (LogDebug) begin
-                        debug_req_tag = _tag;
-                        debug_req_depth = _depth;
-                        debug_req_ofst = _ofst;
+                        debug_req_tag = req_tag_tmp;
+                        debug_req_depth = req_depth_tmp;
+                        debug_req_ofst = req_ofst_tmp;
                         debug_modway_read_data = dec_cache_data;
                         debug_modway_write_data = enc_cache_data;
-                        debug_way = _way;
-                        debug_is_write_req = is_write_req;
-                        debug_is_hit = is_hit;
-                        debug_is_hit_pend = is_hit_pend;
-                        debug_is_hit_conflit = is_hit_conflit;
-                        debug_is_all_pend = is_all_pend;
-                        debug_num_hit_d = is_hit? debug_num_hit_q + 1'b1 : debug_num_hit_q;
-                        debug_num_miss_d = is_hit? debug_num_miss_q : debug_num_miss_q + 1'b1;
+                        debug_way = req_way_tmp;
+                        debug_is_write_req = req_is_write_tmp;
+                        debug_is_hit = req_is_hit_tmp;
+                        debug_is_hit_pend = req_is_hit_pend_tmp;
+                        debug_is_hit_conflit = req_is_hit_conflict_tmp;
+                        debug_is_all_pend = req_is_all_pend_tmp;
+                        debug_num_hit_d = req_is_hit_tmp ? debug_num_hit_q + 1'b1 : debug_num_hit_q;
+                        debug_num_miss_d = req_is_hit_tmp ? debug_num_miss_q : debug_num_miss_q + 1'b1;
                         fsmcnt_REQ_PROC_d += 1;
                     end
 `endif
@@ -1866,44 +1920,29 @@ module insitu_cache_core
         /************************/
 
         if (preread_task_q.valid & preread_task_q.is_refill) begin : proc_refill
-            automatic logic is_write_refill = preread_task_q.task_pay.refill.info.for_write_pend;
-            automatic cache_tag_t _req_tag;
-            automatic cache_bank_depth_ptr_t _req_depth;
-            automatic byte_offset_t _req_ofst;
-            automatic cache_payload_union_t cache_payload;
-            automatic cache_data_in_words_t cache_data_in_words;
-            automatic cache_data_in_words_t evic_data_in_words;
-            automatic cache_data_in_words_t write_data_in_words;
-            automatic cache_data_in_bytes_t cache_data_in_bytes;
-            automatic cache_data_in_bytes_t write_data_in_bytes;
-            automatic cache_mask_t write_storb;
-            automatic way_ptr_t refill_way = dec_way;
-            automatic logic is_stalled_req_write;
-            automatic subarray_cnt_t retr_subarray_cnt;
-
-            {_req_tag,_req_depth,_req_ofst} = fsm_refill_stall_q.addr;
-            cache_payload.data = dec_cache_data;
-            is_stalled_req_write = fsm_refill_stall_q.write;
+            {refill_req_tag_tmp, refill_req_depth_tmp, refill_req_ofst_tmp} = fsm_refill_stall_q.addr;
+            refill_cache_payload_tmp.data = dec_cache_data;
+            refill_is_stalled_req_write_tmp = fsm_refill_stall_q.write;
 
             //1. Check whether it is read refill, then we can push to retrieval fifo
-            if (~is_write_refill) begin
+            if (~refill_is_write_tmp) begin
 
                 //1.1 Prepare retrieve payload
-                retr_subarray_cnt = dec_cache_mask[SubarrayCntWidth-1:0];
+                refill_retr_subarray_cnt_tmp = dec_cache_mask[SubarrayCntWidth-1:0];
                 retr_fifo_in.data = preread_task_q.task_pay.refill.data;
-                retr_fifo_in.num_subarray = cache_mask_t'(retr_subarray_cnt);
-                retr_fifo_in.subarrays = cache_payload.mshr.subarrays;
+                retr_fifo_in.num_subarray = cache_mask_t'(refill_retr_subarray_cnt_tmp);
+                retr_fifo_in.subarrays = refill_cache_payload_tmp.mshr.subarrays;
                 retr_fifo_in.one_more = 0;
                 retr_fifo_in.extra_subarray = '0;
                 
                 //1.2 Check whether a read request is pending due to the same line has full subarrays
                 if (cache_status_q == MSHR_FULL_STALL && 
-                    preread_task_q.task_pay.refill.info.depth == _req_depth &&
+                    preread_task_q.task_pay.refill.info.depth == refill_req_depth_tmp &&
                     preread_task_q.task_pay.refill.info.way == fsm_refill_way_q) begin
 
                     //1.2.1 Update retrieve payload
-                    retr_subarray_cnt = retr_subarray_cnt + 1'b1;
-                    retr_fifo_in.num_subarray = cache_mask_t'(retr_subarray_cnt);
+                    refill_retr_subarray_cnt_tmp = refill_retr_subarray_cnt_tmp + 1'b1;
+                    retr_fifo_in.num_subarray = cache_mask_t'(refill_retr_subarray_cnt_tmp);
                     retr_fifo_in.one_more = 1;
                     retr_fifo_in.extra_subarray = fsm_refill_stall_q.info;
 
@@ -1914,7 +1953,7 @@ module insitu_cache_core
                 end
 
                 //1.3 Push retrieve fifo
-                retr_fifo_push = (retr_subarray_cnt != '0);
+                retr_fifo_push = (refill_retr_subarray_cnt_tmp != '0);
             end
 
             //2. Process of cache line refilling
@@ -1922,29 +1961,29 @@ module insitu_cache_core
             enc_cache_status = VALID;
 
             //2.2 Form cache line data
-            cache_data_in_words = preread_task_q.task_pay.refill.data;
+            refill_cache_data_in_words_tmp = preread_task_q.task_pay.refill.data;
 
             //2.3 Update accroding to dirty bits
             if (dec_cache_dirty) begin
-                write_data_in_words = dec_cache_data;
-                cache_data_in_bytes = cache_data_in_words;
-                write_data_in_bytes = write_data_in_words;
-                write_storb = dec_cache_mask;
+                refill_write_data_in_words_tmp = dec_cache_data;
+                refill_cache_data_in_bytes_tmp = refill_cache_data_in_words_tmp;
+                refill_write_data_in_bytes_tmp = refill_write_data_in_words_tmp;
+                refill_write_storb_tmp = dec_cache_mask;
                 for (int bt = 0; bt < CacheLineWidth/ByteWidth; bt++ ) begin
-                    if (write_storb[bt]) begin
-                        cache_data_in_bytes[bt] = write_data_in_bytes[bt];
+                    if (refill_write_storb_tmp[bt]) begin
+                        refill_cache_data_in_bytes_tmp[bt] = refill_write_data_in_bytes_tmp[bt];
                     end
                 end
-                cache_data_in_words = cache_data_in_bytes;
+                refill_cache_data_in_words_tmp = refill_cache_data_in_bytes_tmp;
             end
 
             //2.4 Update cache line data
-            enc_cache_data = cache_data_in_words;
+            enc_cache_data = refill_cache_data_in_words_tmp;
 `ifdef ENABLE_MULTI_READ_PEND
             enc_cache_miss_meta = '0;
 
             //Process of Multi-Read-Pending Line
-            if (~is_write_refill) begin
+            if (~refill_is_write_tmp) begin
                 if (dec_cache_miss_meta.is_prime == 1'b1) begin
                     enc_cache_status = VALID;
                     if (dec_cache_miss_meta.link_enable) begin
@@ -1974,10 +2013,10 @@ module insitu_cache_core
             //2.5 Write to bank
             bank_write_req_o = 1;
             bank_write_addr_o = preread_task_q.task_pay.refill.info.depth;
-            bank_write_way_o = refill_way;
+            bank_write_way_o = refill_way_tmp;
 
             //2.6 Record data in case of eviction
-            evic_data_in_words = cache_data_in_words;
+            refill_evic_data_in_words_tmp = refill_cache_data_in_words_tmp;
 
             //3 Write to LRU
             bank_write_LRU_req_o = 1;
@@ -2010,18 +2049,18 @@ module insitu_cache_core
             ***
             */
             if (cache_status_q == WR_CONFLICT_STALL && 
-                preread_task_q.task_pay.refill.info.depth == _req_depth &&
+                preread_task_q.task_pay.refill.info.depth == refill_req_depth_tmp &&
                 preread_task_q.task_pay.refill.info.way == fsm_refill_way_q) begin : proc_refill_wr_conflict
 
                 /*The stalled request hit refill cache line*/
-                if (~is_stalled_req_write) begin
+                if (~refill_is_stalled_req_write_tmp) begin
 
                     //5. Process of RAW
                     if (~resp_fifo_full) begin
 
                         //5.1 Prepare resp data to fifo
                         resp_fifo_in = '{
-                            data: cache_data_in_words,
+                            data: refill_cache_data_in_words_tmp,
                             info: fsm_refill_stall_q.info
                         };
 
@@ -2036,7 +2075,7 @@ module insitu_cache_core
 
                         //5.4 Prepare resp data to reg
                         fsm_resp_stall_d = '{
-                            data: cache_data_in_words,
+                            data: refill_cache_data_in_words_tmp,
                             info: fsm_refill_stall_q.info
                         };
 
@@ -2059,7 +2098,7 @@ module insitu_cache_core
                     enc_cache_mask = dec_cache_mask | fsm_refill_stall_q.wmask;
 
                     //6.3 Update data line
-                    enc_cache_data = cache_data_in_words;
+                    enc_cache_data = refill_cache_data_in_words_tmp;
                     enc_mod_data_with_mask = 1'b1;
                     enc_mod_mask = fsm_refill_stall_q.wmask;
                     enc_mod_write_data = fsm_refill_stall_q.wdata;
@@ -2079,31 +2118,29 @@ module insitu_cache_core
             ***
             */
             if (cache_status_q == ALL_PEND_STALL && 
-                preread_task_q.task_pay.refill.info.depth == _req_depth ) begin : proc_refill_all_pend
-                automatic logic is_full_masked_write = 0;
+                preread_task_q.task_pay.refill.info.depth == refill_req_depth_tmp ) begin : proc_refill_all_pend
 
                 /*Use the refilled cache line to replace*/
                 //7. Generate pending line
                 //7.1 Update cache line status
-                enc_cache_status = is_stalled_req_write? WRITE_PEND: READ_PEND;
+                enc_cache_status = refill_is_stalled_req_write_tmp ? WRITE_PEND : READ_PEND;
 
                 //7.2 Update dirty bit & mask
-                enc_cache_dirty = is_stalled_req_write? 1:0;
-                enc_cache_mask = is_stalled_req_write? fsm_refill_stall_q.wmask: '0;
+                enc_cache_dirty = refill_is_stalled_req_write_tmp ? 1 : 0;
+                enc_cache_mask = refill_is_stalled_req_write_tmp ? fsm_refill_stall_q.wmask : '0;
 
                 //7.3 Update tag
-                enc_cache_tag = _req_tag;
+                enc_cache_tag = refill_req_tag_tmp;
 
                 //7.4 Update payload
-                if (~is_stalled_req_write) begin
+                if (~refill_is_stalled_req_write_tmp) begin
 
                     //7.4.1 Generate Subarrays
-                    automatic cache_payload_union_t cache_payload;
                     enc_cache_mask = 1;
-                    cache_payload = '0;
-                    cache_payload.mshr.subarrays = '0;
-                    cache_payload.mshr.subarrays[0][InfoWidth-1:0] = fsm_refill_stall_q.info;
-                    enc_cache_data = cache_payload.data;
+                    refill_all_pend_cache_payload_tmp = '0;
+                    refill_all_pend_cache_payload_tmp.mshr.subarrays = '0;
+                    refill_all_pend_cache_payload_tmp.mshr.subarrays[0][InfoWidth-1:0] = fsm_refill_stall_q.info;
+                    enc_cache_data = refill_all_pend_cache_payload_tmp.data;
 `ifdef ENABLE_MULTI_READ_PEND
                     enc_cache_miss_meta = '0;
                     enc_cache_miss_meta.is_prime = 1'b1;
@@ -2115,7 +2152,7 @@ module insitu_cache_core
                 end else begin
 
                     //7.4.2 Generate written data
-                    enc_cache_data = cache_data_in_words;
+                    enc_cache_data = refill_cache_data_in_words_tmp;
                     enc_mod_data_with_mask = 1'b1;
                     enc_mod_mask = fsm_refill_stall_q.wmask;
                     enc_mod_write_data = fsm_refill_stall_q.wdata;
@@ -2124,8 +2161,8 @@ module insitu_cache_core
 
                 //7.5 Check whether the miss is a full masked write
                 //     If yes, we directly refill line w/o fetching
-                is_full_masked_write = is_stalled_req_write & (&fsm_refill_stall_q.wmask);
-                if (is_full_masked_write) begin
+                refill_all_pend_is_full_masked_write_tmp = refill_is_stalled_req_write_tmp & (&fsm_refill_stall_q.wmask);
+                if (refill_all_pend_is_full_masked_write_tmp) begin
                     enc_cache_status = VALID;
                 end
 
@@ -2136,43 +2173,43 @@ module insitu_cache_core
                 //7.8 update life-cycle state
                 `ifndef TARGET_SYNTHESIS
                     if (LogLifeCycle) begin
-                        life_cycle_scoreboard_d[{_req_depth,refill_way}].current_state = is_full_masked_write? LIFECYCLE_USELESS :
-                                                                                         is_stalled_req_write? LIFECYCLE_WRITE_PENDING :
-                                                                                                               LIFECYCLE_READ_PENDING;
+                        life_cycle_scoreboard_d[{refill_req_depth_tmp,refill_way_tmp}].current_state = refill_all_pend_is_full_masked_write_tmp ? LIFECYCLE_USELESS :
+                                                                                                       refill_is_stalled_req_write_tmp       ? LIFECYCLE_WRITE_PENDING :
+                                                                                                                                             LIFECYCLE_READ_PENDING;
                     end
                 `endif
 
                 //8. Check to replace cache line dirty
-                if (dec_cache_dirty == 1 && is_full_masked_write==0) begin
+                if (dec_cache_dirty == 1 && refill_all_pend_is_full_masked_write_tmp == 0) begin
 
                     //8.1 Need both eviction and send miss req to DRAM
                     if (~miss_fifo_full & ~evic_fifo_full) begin
 
                         /*Push both miss + evic fifo*/
                         //8.1.1 Prepare miss payload
-                        _req_ofst = '0;
-                        miss_fifo_in.addr = {_req_tag,_req_depth,_req_ofst};
-                        miss_fifo_in.info.for_write_pend = is_stalled_req_write;
-                        miss_fifo_in.info.way = refill_way;
-                        miss_fifo_in.info.depth = _req_depth;
+                        refill_req_ofst_tmp = '0;
+                        miss_fifo_in.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        miss_fifo_in.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        miss_fifo_in.info.way = refill_way_tmp;
+                        miss_fifo_in.info.depth = refill_req_depth_tmp;
 
                         //8.1.2 Push miss fifo
                         miss_fifo_push = 1;
 
                         if (PartSplit > 1) begin
-                            fsm_evic_stall_d.addr = {dec_cache_tag,_req_depth,_req_ofst};
+                            fsm_evic_stall_d.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
                             fsm_evic_stall_d.wdata = '0;
                             fsm_evic_stall_d.wmask = dec_cache_mask;
-                            evict_stall_way_d = refill_way;
-                            evict_stall_depth_d = _req_depth;
+                            evict_stall_way_d = refill_way_tmp;
+                            evict_stall_depth_d = refill_req_depth_tmp;
                             evict_full_data_valid_d = 1'b0;
                             evict_full_wait_d = 1'b0;
                             cache_status_d = EVIC_STALL;
                             preread_allowed = 0;
                         end else begin
                             //8.1.3 Prepare evic payload
-                            evic_fifo_in.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                            evic_fifo_in.wdata = evic_data_in_words;
+                            evic_fifo_in.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                            evic_fifo_in.wdata = refill_evic_data_in_words_tmp;
                             evic_fifo_in.wmask = dec_cache_mask;
 
                             //8.1.4 Push evic fifo
@@ -2183,21 +2220,21 @@ module insitu_cache_core
 
                         /*Push miss fifo + will stall of evic*/
                         //8.1.5 Prepare miss payload
-                        _req_ofst = '0;
-                        miss_fifo_in.addr = {_req_tag,_req_depth,_req_ofst};
-                        miss_fifo_in.info.for_write_pend = is_stalled_req_write;
-                        miss_fifo_in.info.way = refill_way;
-                        miss_fifo_in.info.depth = _req_depth;
+                        refill_req_ofst_tmp = '0;
+                        miss_fifo_in.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        miss_fifo_in.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        miss_fifo_in.info.way = refill_way_tmp;
+                        miss_fifo_in.info.depth = refill_req_depth_tmp;
 
                         //8.1.6 Push miss fifo
                         miss_fifo_push = 1;
 
                         //8.1.7 Prepare evic meta-data
-                        fsm_evic_stall_d.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                        fsm_evic_stall_d.wdata = evic_data_in_words;
+                        fsm_evic_stall_d.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_evic_stall_d.wdata = refill_evic_data_in_words_tmp;
                         fsm_evic_stall_d.wmask = dec_cache_mask;
-                        evict_stall_way_d = refill_way;
-                        evict_stall_depth_d = _req_depth;
+                        evict_stall_way_d = refill_way_tmp;
+                        evict_stall_depth_d = refill_req_depth_tmp;
                         evict_full_data_valid_d = 1'b0;
                         evict_full_wait_d = 1'b0;
 
@@ -2209,15 +2246,15 @@ module insitu_cache_core
 
                         /*Will stall of miss + push evic fifo*/
                         //8.1.9 Prepare miss meta-data
-                        _req_ofst = '0;
+                        refill_req_ofst_tmp = '0;
                         fsm_miss_stall_d.evic_stall = 0;
                         fsm_miss_stall_d.evic = '0;
                         fsm_miss_stall_d.evic_way = '0;
                         fsm_miss_stall_d.evic_depth = '0;
-                        fsm_miss_stall_d.miss.addr = {_req_tag,_req_depth,_req_ofst};
-                        fsm_miss_stall_d.miss.info.for_write_pend = is_stalled_req_write;
-                        fsm_miss_stall_d.miss.info.way = refill_way;
-                        fsm_miss_stall_d.miss.info.depth = _req_depth;
+                        fsm_miss_stall_d.miss.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_miss_stall_d.miss.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        fsm_miss_stall_d.miss.info.way = refill_way_tmp;
+                        fsm_miss_stall_d.miss.info.depth = refill_req_depth_tmp;
 
                         //8.1.10 Change status and stop preread for request
                         cache_status_d = MISS_STALL;
@@ -2225,15 +2262,15 @@ module insitu_cache_core
 
                         if (PartSplit > 1) begin
                             fsm_miss_stall_d.evic_stall = 1;
-                            fsm_miss_stall_d.evic.addr = {dec_cache_tag,_req_depth,_req_ofst};
+                            fsm_miss_stall_d.evic.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
                             fsm_miss_stall_d.evic.wdata = '0;
                             fsm_miss_stall_d.evic.wmask = dec_cache_mask;
-                            fsm_miss_stall_d.evic_way = refill_way;
-                            fsm_miss_stall_d.evic_depth = _req_depth;
+                            fsm_miss_stall_d.evic_way = refill_way_tmp;
+                            fsm_miss_stall_d.evic_depth = refill_req_depth_tmp;
                         end else begin
                             //8.1.11 Prepare evic payload
-                            evic_fifo_in.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                            evic_fifo_in.wdata = evic_data_in_words;
+                            evic_fifo_in.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                            evic_fifo_in.wdata = refill_evic_data_in_words_tmp;
                             evic_fifo_in.wmask = dec_cache_mask;
 
                             //8.1.12 Push evic fifo
@@ -2244,43 +2281,43 @@ module insitu_cache_core
 
                         /*Will stall of miss fifo*/
                         //8.1.13 Prepare miss meta-data
-                        _req_ofst = '0;
+                        refill_req_ofst_tmp = '0;
                         fsm_miss_stall_d.evic_stall = 1;
-                        fsm_miss_stall_d.evic.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                        fsm_miss_stall_d.evic.wdata = evic_data_in_words;
+                        fsm_miss_stall_d.evic.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_miss_stall_d.evic.wdata = refill_evic_data_in_words_tmp;
                         fsm_miss_stall_d.evic.wmask = dec_cache_mask;
-                        fsm_miss_stall_d.evic_way = refill_way;
-                        fsm_miss_stall_d.evic_depth = _req_depth;
-                        fsm_miss_stall_d.miss.addr = {_req_tag,_req_depth,_req_ofst};
-                        fsm_miss_stall_d.miss.info.for_write_pend = is_stalled_req_write;
-                        fsm_miss_stall_d.miss.info.way = refill_way;
-                        fsm_miss_stall_d.miss.info.depth = _req_depth;
+                        fsm_miss_stall_d.evic_way = refill_way_tmp;
+                        fsm_miss_stall_d.evic_depth = refill_req_depth_tmp;
+                        fsm_miss_stall_d.miss.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_miss_stall_d.miss.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        fsm_miss_stall_d.miss.info.way = refill_way_tmp;
+                        fsm_miss_stall_d.miss.info.depth = refill_req_depth_tmp;
 
                         //8.1.14 Change status and stop preread for request
                         cache_status_d = MISS_STALL;
                         preread_allowed = 0;
 
                     end
-                end else if (dec_cache_dirty == 1 && is_full_masked_write==1) begin
+                end else if (dec_cache_dirty == 1 && refill_all_pend_is_full_masked_write_tmp == 1) begin
 
                     //8.2 Only eviction, we don't need to send miss request
                     if (~evic_fifo_full) begin
 
                         /*Allow to push evic fifo*/
                         if (PartSplit > 1) begin
-                            fsm_evic_stall_d.addr = {dec_cache_tag,_req_depth,_req_ofst};
+                            fsm_evic_stall_d.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
                             fsm_evic_stall_d.wdata = '0;
                             fsm_evic_stall_d.wmask = dec_cache_mask;
-                            evict_stall_way_d = refill_way;
-                            evict_stall_depth_d = _req_depth;
+                            evict_stall_way_d = refill_way_tmp;
+                            evict_stall_depth_d = refill_req_depth_tmp;
                             evict_full_data_valid_d = 1'b0;
                             evict_full_wait_d = 1'b0;
                             cache_status_d = EVIC_STALL;
                             preread_allowed = 0;
                         end else begin
                             //12.2.1 Prepare evic payload
-                            evic_fifo_in.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                            evic_fifo_in.wdata = evic_data_in_words;
+                            evic_fifo_in.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                            evic_fifo_in.wdata = refill_evic_data_in_words_tmp;
                             evic_fifo_in.wmask = dec_cache_mask;
 
                             //12.2.2 Push evic fifo
@@ -2291,11 +2328,11 @@ module insitu_cache_core
 
                         /*Will stall of evic fifo*/
                         //12.2.3 Prepare evic meta-data
-                        fsm_evic_stall_d.addr = {dec_cache_tag,_req_depth,_req_ofst};
-                        fsm_evic_stall_d.wdata = evic_data_in_words;
+                        fsm_evic_stall_d.addr = {dec_cache_tag,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_evic_stall_d.wdata = refill_evic_data_in_words_tmp;
                         fsm_evic_stall_d.wmask = dec_cache_mask;
-                        evict_stall_way_d = refill_way;
-                        evict_stall_depth_d = _req_depth;
+                        evict_stall_way_d = refill_way_tmp;
+                        evict_stall_depth_d = refill_req_depth_tmp;
                         evict_full_data_valid_d = 1'b0;
                         evict_full_wait_d = 1'b0;
 
@@ -2304,18 +2341,18 @@ module insitu_cache_core
                         preread_allowed = 0;
 
                     end
-                end else if (is_full_masked_write == 0) begin
+                end else if (refill_all_pend_is_full_masked_write_tmp == 0) begin
 
                     //8.3 No eviction needed
                     if (~miss_fifo_full) begin
 
                         /*Allow to push miss fifo*/
                         //8.3.1 Prepare miss payload
-                        _req_ofst = '0;
-                        miss_fifo_in.addr = {_req_tag,_req_depth,_req_ofst};
-                        miss_fifo_in.info.for_write_pend = is_stalled_req_write;
-                        miss_fifo_in.info.way = refill_way;
-                        miss_fifo_in.info.depth = _req_depth;
+                        refill_req_ofst_tmp = '0;
+                        miss_fifo_in.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        miss_fifo_in.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        miss_fifo_in.info.way = refill_way_tmp;
+                        miss_fifo_in.info.depth = refill_req_depth_tmp;
 
                         //8.3.2 Push miss fifo
                         miss_fifo_push = 1;
@@ -2324,15 +2361,15 @@ module insitu_cache_core
 
                         /*Will stall of miss fifo*/
                         //8.3.3 Prepare miss meta-data
-                        _req_ofst = '0;
+                        refill_req_ofst_tmp = '0;
                         fsm_miss_stall_d.evic_stall = 0;
                         fsm_miss_stall_d.evic = '0;
                         fsm_miss_stall_d.evic_way = '0;
                         fsm_miss_stall_d.evic_depth = '0;
-                        fsm_miss_stall_d.miss.addr = {_req_tag,_req_depth,_req_ofst};
-                        fsm_miss_stall_d.miss.info.for_write_pend = is_stalled_req_write;
-                        fsm_miss_stall_d.miss.info.way = refill_way;
-                        fsm_miss_stall_d.miss.info.depth = _req_depth;
+                        fsm_miss_stall_d.miss.addr = {refill_req_tag_tmp,refill_req_depth_tmp,refill_req_ofst_tmp};
+                        fsm_miss_stall_d.miss.info.for_write_pend = refill_is_stalled_req_write_tmp;
+                        fsm_miss_stall_d.miss.info.way = refill_way_tmp;
+                        fsm_miss_stall_d.miss.info.depth = refill_req_depth_tmp;
 
                         //8.3.4 Change status and stop preread for request
                         cache_status_d = MISS_STALL;
@@ -2346,8 +2383,8 @@ module insitu_cache_core
 `ifndef TARGET_SYNTHESIS
             /*Set Debug Information*/
             if (LogDebug) begin
-                debug_stalled_req_depth = _req_depth;
-                debug_stalled_req_tag = _req_tag;
+                debug_stalled_req_depth = refill_req_depth_tmp;
+                debug_stalled_req_tag = refill_req_tag_tmp;
                 debug_stalled_way = fsm_refill_way_q;
             end
 `endif
