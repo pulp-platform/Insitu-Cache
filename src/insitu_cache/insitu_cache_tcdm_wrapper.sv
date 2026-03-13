@@ -422,6 +422,7 @@ module insitu_cache_tcdm_wrapper
 
     cache_bank_depth_ptr_t                                  proc_write_cache_addr;
     logic                                                   proc_write_cache_req;
+    way_ptr_t                                               proc_write_cache_way;
     cache_status_t          [SetAssociativity - 1 : 0]      proc_write_cache_status;
     logic                   [SetAssociativity - 1 : 0]      proc_write_cache_dirty;
     miss_meta_t             [SetAssociativity - 1 : 0]      proc_write_cache_miss_meta;
@@ -460,7 +461,10 @@ module insitu_cache_tcdm_wrapper
     way_ptr_t               [SetAssociativity - 1 : 0]      flush_write_cache_LRU;
 
     logic                                                   flush_read_select_q, flush_read_select_d;
+    logic                   [SetAssociativity - 1 : 0]      bank_read_way_mask_q, bank_read_way_mask_d;
+    logic                                                   bank_read_sel_flush;
     `FFARN (flush_read_select_q, flush_read_select_d,       '0, clk_i, rst_ni)
+    `FFARN (bank_read_way_mask_q, bank_read_way_mask_d,     '0, clk_i, rst_ni)
     logic          [PartIdxWidth-1:0]                       flush_read_part_idx;
     logic                                                   flush_read_all_parts;
     logic                   [SetAssociativity - 1 : 0]      flush_read_way_mask;
@@ -473,10 +477,16 @@ module insitu_cache_tcdm_wrapper
     cache_bank_depth_ptr_t                                  sync_ctrl_ptr_q,sync_ctrl_ptr_d;
     down_req_t                                              sync_ctrl_payload_q,sync_ctrl_payload_d;
     logic                                                   clear_pend_cnt;
+    localparam int unsigned OutstandingRefillCntWidth =
+        ((CacheBankDepth * SetAssociativity) > 1) ? $clog2((CacheBankDepth * SetAssociativity) + 1) : 1;
+    logic [OutstandingRefillCntWidth-1:0]                   outstanding_refill_cnt_q, outstanding_refill_cnt_d;
+    logic                                                   consumed_refill_resp;
+    logic                                                   issued_refill_req;
     `FFARN (sync_ctrl_status_q, sync_ctrl_status_d,         SYNC_CTRL_IDLE, clk_i, rst_ni)
     `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_payload_q,sync_ctrl_payload_d,        '0, clk_i, rst_ni)
+    `FFARN (outstanding_refill_cnt_q, outstanding_refill_cnt_d, '0, clk_i, rst_ni)
     cache_data_t                                            flush_full_data_q, flush_full_data_d;
     cache_mask_t                                            flush_full_mask_q, flush_full_mask_d;
     cache_tag_t                                             flush_full_tag_q, flush_full_tag_d;
@@ -638,6 +648,7 @@ module insitu_cache_tcdm_wrapper
             sync_ctrl_insn_d            = sync_ctrl_insn_q;
             sync_ctrl_ptr_d             = sync_ctrl_ptr_q;
             sync_ctrl_payload_d         = sync_ctrl_payload_q;
+            outstanding_refill_cnt_d    = outstanding_refill_cnt_q;
             flush_full_data_d           = flush_full_data_q;
             flush_full_mask_d           = flush_full_mask_q;
             flush_full_tag_d            = flush_full_tag_q;
@@ -716,11 +727,11 @@ module insitu_cache_tcdm_wrapper
                 end
 
                 SYNC_CTRL_CHECK_PEND : begin
-                    if (sync_ctrl_insn_q != 2'b01) begin
-                        // For flush+invalidate or invalidate-only, drop pending lines and proceed.
-                        clear_pend_cnt = 1'b1;
-                    end
-                    if (~sync_ctrl_still_pending) begin
+                    if ((outstanding_refill_cnt_q == '0) &&
+                        ~sync_ctrl_still_pending &&
+                        ~core_miss_valid &&
+                        ~core_evic_valid &&
+                        ~write_through_valid) begin
                         sync_ctrl_status_d = SYNC_CTRL_FLUSH;
                         sync_ctrl_ptr_d = cache_part_base_i;
                         flush_read_cache_addr = sync_ctrl_ptr_d;
@@ -833,6 +844,14 @@ module insitu_cache_tcdm_wrapper
                     sync_ctrl_status_d = SYNC_CTRL_IDLE;
                 end
             endcase
+
+            if (issued_refill_req && ~consumed_refill_resp) begin
+                outstanding_refill_cnt_d = outstanding_refill_cnt_q + 1'b1;
+            end else if (~issued_refill_req && consumed_refill_resp) begin
+                if (outstanding_refill_cnt_q != '0) begin
+                    outstanding_refill_cnt_d = outstanding_refill_cnt_q - 1'b1;
+                end
+            end
         end
     end
 
@@ -913,7 +932,7 @@ module insitu_cache_tcdm_wrapper
 
         .bank_write_req_o               (proc_write_cache_req),
         .bank_write_addr_o              (proc_write_cache_addr),
-        .bank_write_way_o               (/*open*/),
+        .bank_write_way_o               (proc_write_cache_way),
         .bank_write_cache_status_o      (proc_write_cache_status),
         .bank_write_cache_dirty_o       (proc_write_cache_dirty),
         .bank_write_cache_miss_meta_o   (proc_write_cache_miss_meta),
@@ -1069,22 +1088,32 @@ module insitu_cache_tcdm_wrapper
     assign core_refill_data = downstream_resp_data_i;
     assign core_refill_info = downstream_resp_info_i;
     assign core_refill_valid = downstream_resp_valid_i & ~downstream_resp_write_i;
-    assign downstream_resp_ready_o = downstream_resp_write_i? 1'b1: core_refill_ready;
-
+    assign downstream_resp_ready_o = downstream_resp_write_i ? 1'b1 : core_refill_ready;
+    assign consumed_refill_resp = downstream_resp_valid_i & ~downstream_resp_write_i & downstream_resp_ready_o;
+    assign issued_refill_req = core_miss_valid & core_miss_ready;
 
     /***********************/
     /*  Flush Proc Arbiter */
     /***********************/
 
-    assign flush_read_select_d         = ~proc_read_cache_valid;
-    assign bank_read_cache_valid       = flush_read_select_d? flush_read_cache_valid : proc_read_cache_valid;
+    assign bank_read_sel_flush         = ~proc_read_cache_valid;
+    assign bank_read_cache_valid       = bank_read_sel_flush? flush_read_cache_valid : proc_read_cache_valid;
     assign proc_read_cache_ready       = bank_read_cache_ready;
-    assign flush_read_cache_ready      = flush_read_select_d? bank_read_cache_ready : '0;
-    assign bank_read_way_mask_sel      = flush_read_select_d? flush_read_way_mask : bank_read_way_mask;
-    assign bank_read_part_idx_sel      = flush_read_select_d? flush_read_part_idx : bank_read_part_idx;
-    assign bank_read_all_parts_sel     = flush_read_select_d? flush_read_all_parts : bank_read_all_parts;
+    assign flush_read_cache_ready      = bank_read_sel_flush? bank_read_cache_ready : '0;
+    assign bank_read_way_mask_sel      = bank_read_sel_flush? flush_read_way_mask : bank_read_way_mask;
+    assign bank_read_part_idx_sel      = bank_read_sel_flush? flush_read_part_idx : bank_read_part_idx;
+    assign bank_read_all_parts_sel     = bank_read_sel_flush? flush_read_all_parts : bank_read_all_parts;
 
-    assign bank_read_cache_addr        =  flush_read_select_d? flush_read_cache_addr: proc_read_cache_addr;
+    assign bank_read_cache_addr        =  bank_read_sel_flush? flush_read_cache_addr: proc_read_cache_addr;
+
+    always_comb begin : proc_read_source_sel
+        flush_read_select_d = flush_read_select_q;
+        bank_read_way_mask_d = bank_read_way_mask_q;
+        if (bank_read_cache_valid && bank_read_cache_ready) begin
+            flush_read_select_d = bank_read_sel_flush;
+            bank_read_way_mask_d = bank_read_way_mask_sel;
+        end
+    end
 
     assign proc_read_cache_status      =  flush_read_select_q? '0: bank_read_cache_status;
     assign proc_read_cache_dirty       =  flush_read_select_q? '0: bank_read_cache_dirty;
@@ -1212,6 +1241,16 @@ module insitu_cache_tcdm_wrapper
             end
         end
 
+        logic meta_proc_write_req;
+        always_comb begin
+            meta_proc_write_req = 1'b0;
+            if (bank_write_cache_req && (proc_write_cache_way == way_ptr_t'(i))) begin
+                meta_proc_write_req = 1'b1;
+            end else if (bank_write_LRU_req) begin
+                meta_proc_write_req = &bank_read_way_mask_q;
+            end
+        end
+
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (1),
@@ -1227,7 +1266,8 @@ module insitu_cache_tcdm_wrapper
             .upstream_read_data_o        (cache_meta_read_data[i]),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
-            .upstream_write_req_i        (bank_write_cache_req | bank_write_LRU_req),
+            .upstream_write_req_i        (proc_write_select ? meta_proc_write_req :
+                                          flush_write_cache_req_valid),
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
 
@@ -1481,16 +1521,11 @@ module pseudo_dual_port_tcdm_wrapper #(
         if (read_valid_i & write_has_data) begin
             if (read_bank_select != write_bank_select) begin
                 status = WR_DIFF_BANK;
-            end else
-            if (read_addr_i == write_addr_i) begin
-                if (read_all_parts_i) begin
-                    // A masked write only carries the updated part; bypassing it as a full-line
-                    // read would zero the untouched parts. Serialize full-line reads instead.
-                    status = WR_CONFLICT;
-                end else begin
-                    status = WR_SAME_ADDR;
-                end
             end else begin
+                // A masked write only carries the modified bytes. Returning the raw
+                // write buffer on a same-address read can therefore zero untouched
+                // bytes in the requested line/part. Serialize all same-bank read/write
+                // collisions instead of bypassing partial-line data.
                 status = WR_CONFLICT;
             end
         end else 
@@ -1559,8 +1594,7 @@ module pseudo_dual_port_tcdm_wrapper #(
         /*********************/
         /* Read Ready Logics */
         /*********************/
-        if (write_has_data && (read_bank_select == write_bank_select) &&
-            ((read_addr_i != write_addr_i) || read_all_parts_i)) begin
+        if (write_has_data && (read_bank_select == write_bank_select)) begin
             read_ready_o = 1'b0;
         end
     end
@@ -1666,17 +1700,20 @@ module insitu_cache_bank_access_controller #(
         /*FSM*/
         case (access_status_q)
             ACCESS_THROUGH: begin
-                if (bank_gnt_i == '0) begin
+                if (upstream_write_req_i == 1'b1) begin
                     upstream_read_ready_o = '0;
                     downstream_read_valid_o = '0;
-                    downstream_write_req_o = '0;
-
-                    if (upstream_write_req_i == 1'b1) begin
+                    if (bank_gnt_i == '0) begin
+                        downstream_write_req_o = '0;
                         access_status_d = ACCESS_STALL;
                         access_stall_data_d = upstream_write_data_i;
                         access_stall_addr_d = upstream_write_addr_i;
                         access_stall_mask_d = upstream_write_mask_i;
                     end
+                end else if (bank_gnt_i == '0) begin
+                    upstream_read_ready_o = '0;
+                    downstream_read_valid_o = '0;
+                    downstream_write_req_o = '0;
                 end
             end
 
@@ -1697,6 +1734,5 @@ module insitu_cache_bank_access_controller #(
             default : access_status_d = ACCESS_THROUGH;
         endcase
     end
-
 
 endmodule : insitu_cache_bank_access_controller

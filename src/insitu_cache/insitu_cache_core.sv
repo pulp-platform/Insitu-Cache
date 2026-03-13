@@ -375,6 +375,22 @@ module insitu_cache_core
         cache_miss_t                                        miss;
     } miss_stall_t;
 
+    typedef struct packed {
+        logic                                               valid;
+        cache_bank_depth_ptr_t                              addr;
+        way_ptr_t                                           way;
+        logic                                               LRU_update;
+        cache_status_t                                      cache_status;
+        logic                                               cache_dirty;
+        miss_meta_t                                         cache_miss_meta;
+        cache_mask_t                                        cache_mask;
+        cache_tag_t                                         cache_tag;
+        cache_data_t                                        cache_data;
+        logic                                               mod_data_with_mask;
+        cache_mask_t                                        mod_mask;
+        cache_data_t                                        mod_write_data;
+    } deferred_bank_write_t;
+
 `ifndef TARGET_SYNTHESIS
 
     /**********************/
@@ -470,13 +486,49 @@ module insitu_cache_core
     logic                                                   preread_refill_valid;
     logic                                                   preread_refill_ready;
     logic                                                   preread_refill_allowed;
+    logic                                                   preread_req_flow_allow;
     task_payload_t                                          preread_request_payload;
     task_payload_t                                          preread_refill_payload;
     task_payload_t                                          preread_arbiter_payload;
     task_payload_t                                          preread_task_q, preread_task_d;
+    cache_refill_payload_t                                  downstream_refill_payload_in;
+    cache_refill_payload_t                                  downstream_refill_payload;
+    logic                                                   downstream_refill_valid_raw;
+    logic                                                   downstream_refill_ready_raw;
     `FFARN (preread_task_q,         preread_task_d,         '0, clk_i, rst_ni)
+    localparam int unsigned                                PrereadReqHazardCycles = 2;
+    localparam int unsigned                                PrereadReqHazardCntWidth =
+        (PrereadReqHazardCycles > 0) ? $clog2(PrereadReqHazardCycles + 1) : 1;
+    cache_request_payload_t                                 req_buf_q, req_buf_d;
+    logic                                                   req_buf_valid_q, req_buf_valid_d;
+    logic                                                   req_buf_hold_q, req_buf_hold_d;
+    logic                                                   req_buf_issued_q, req_buf_issued_d;
+    logic                                                   req_buf_push;
+    logic                                                   req_buf_pop;
+    logic                                                   req_buf_issue_start;
+    logic                                                   req_buf_hazard_match;
+    logic                                                   upstream_req_hazard_match;
+    logic                                                   req_buf_issue_hazard_now;
+    logic                                                   upstream_req_issue_hazard_now;
+    cache_tag_t                                             upstream_req_tag_tmp;
+    cache_bank_depth_ptr_t                                  upstream_req_depth_tmp;
+    cache_tag_t                                             req_buf_tag_tmp;
+    cache_bank_depth_ptr_t                                  req_buf_depth_tmp;
+    logic                                                   preread_req_hazard_valid_q, preread_req_hazard_valid_d;
+    logic [PrereadReqHazardCntWidth-1:0]                    preread_req_hazard_cnt_q, preread_req_hazard_cnt_d;
+    cache_tag_t                                             preread_req_hazard_tag_q, preread_req_hazard_tag_d;
+    cache_bank_depth_ptr_t                                  preread_req_hazard_depth_q, preread_req_hazard_depth_d;
+    `FFARN (req_buf_q,                req_buf_d,                '0, clk_i, rst_ni)
+    `FFARN (req_buf_valid_q,          req_buf_valid_d,          '0, clk_i, rst_ni)
+    `FFARN (req_buf_hold_q,           req_buf_hold_d,           '0, clk_i, rst_ni)
+    `FFARN (req_buf_issued_q,         req_buf_issued_d,         '0, clk_i, rst_ni)
+    `FFARN (preread_req_hazard_valid_q, preread_req_hazard_valid_d, '0, clk_i, rst_ni)
+    `FFARN (preread_req_hazard_cnt_q, preread_req_hazard_cnt_d, '0, clk_i, rst_ni)
+    `FFARN (preread_req_hazard_tag_q,   preread_req_hazard_tag_d,   '0, clk_i, rst_ni)
+    `FFARN (preread_req_hazard_depth_q, preread_req_hazard_depth_d, '0, clk_i, rst_ni)
     logic           [PartIdxWidth-1:0]                      preread_part_idx;
     logic                                                   bank_read_valid_arb;
+    logic                                                   preread_bank_valid;
     cache_bank_depth_ptr_t                                  bank_read_addr_arb;
     logic                                                   evict_full_block;
     logic                                                   refill_full_read_req;
@@ -537,6 +589,7 @@ module insitu_cache_core
     cache_evic_t                                            fsm_evic_stall_q,       fsm_evic_stall_d;
     cache_request_payload_t                                 fsm_refill_stall_q,     fsm_refill_stall_d;
     way_ptr_t                                               fsm_refill_way_q,       fsm_refill_way_d;
+    deferred_bank_write_t                                   deferred_bank_write_q,  deferred_bank_write_d;
 
     `FFARN (cache_status_q,         cache_status_d,         REQ_PROC, clk_i, rst_ni)
     `FFARN (fsm_resp_stall_q,       fsm_resp_stall_d,       '0, clk_i, rst_ni)
@@ -549,6 +602,7 @@ module insitu_cache_core
     `FFARN (evict_full_wait_q,      evict_full_wait_d,      '0, clk_i, rst_ni)
     `FFARN (fsm_refill_stall_q,     fsm_refill_stall_d,     '0, clk_i, rst_ni)
     `FFARN (fsm_refill_way_q,       fsm_refill_way_d,       '0, clk_i, rst_ni)
+    `FFARN (deferred_bank_write_q,  deferred_bank_write_d,  '0, clk_i, rst_ni)
 
     //Waveform-visible temporary signals used in Cache_FSM
     cache_tag_t                                             req_tag_tmp;
@@ -645,12 +699,8 @@ module insitu_cache_core
     logic                       pesudo_refill_valid;
     logic                       pesudo_refill_ready;
 
-    cache_refill_payload_t      downstream_refill_payload;
     logic                       downstream_refill_valid;
     logic                       downstream_refill_ready;
-    logic                       downstream_refill_lockup_q, downstream_refill_lockup_d;
-    `FFARN (downstream_refill_lockup_q, downstream_refill_lockup_d,'0, clk_i, rst_ni)
-
     stream_arbiter #(.DATA_T(cache_refill_payload_t), .N_INP(2)) i_refill_arbiter (
         .clk_i,
         .rst_ni,
@@ -668,52 +718,89 @@ module insitu_cache_core
     assign pesudo_refill_fifo_pop                   = pesudo_refill_ready & ~pesudo_refill_fifo_empty;
 
     //downstream refill
-    assign downstream_refill_lockup_d = downstream_refill_valid & ~downstream_refill_ready;
-    assign downstream_refill_payload = '{
-        info: downstream_resp_refill_info_i,
-        data: downstream_resp_refill_data_i,
-        pad: '0
-    };
     assign downstream_refill_valid                  =
-        (downstream_refill_lockup_q | (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2))) &
-        downstream_resp_refill_valid_i;
-    assign downstream_resp_refill_ready_o           =
-        (downstream_refill_lockup_q | (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2))) &
+        (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2)) & downstream_refill_valid_raw;
+    assign downstream_refill_ready_raw              =
+        (pesudo_refill_cnt_q < (PesudoRefillFifoDepth-2)) &
         downstream_refill_ready & ~evict_full_block;
 
     //all refill
-    assign preread_refill_valid                     = all_refill_valid & ~evict_full_block;
+    assign preread_refill_valid                     = all_refill_valid;
     assign preread_refill_payload.task_pay.refill   = all_refill_payload;
     assign all_refill_ready                         = preread_refill_ready;
 
     //break request process if needed
-    assign preread_request_valid = upstream_req_valid_i & preread_allowed & ~multi_read_pend_break &
-                                   (pesudo_refill_cnt_q == '0) & ~evict_full_block;
+    assign preread_req_flow_allow = preread_allowed & ~multi_read_pend_break &
+                                    (pesudo_refill_cnt_q == '0) & ~evict_full_block;
 `else
-    assign preread_request_valid = upstream_req_valid_i & preread_allowed & ~evict_full_block;
-    assign preread_refill_valid = downstream_resp_refill_valid_i & ~evict_full_block;
+    assign preread_req_flow_allow = preread_allowed & ~evict_full_block;
+    assign preread_refill_valid = downstream_refill_valid_raw;
+    assign preread_refill_payload.task_pay.refill = downstream_refill_payload;
+    assign downstream_refill_ready_raw = preread_refill_ready & ~evict_full_block;
 `endif
-    assign evict_full_block = (cache_status_q == EVIC_STALL) && (PartSplit > 1);
-    assign preread_refill_allowed = ~preread_arbiter_payload.is_refill | downstream_resp_refill_info_i.for_write_pend |  ((retr_fifo_usage < RetrFifoDepth - 2));
-
-    assign preread_request_payload.valid = 1;
-    assign preread_request_payload.is_refill = 0;
-    assign preread_request_payload.task_pay.request = '{
-        write: upstream_req_write_i,
-        addr: upstream_req_addr_i,
-        wdata: upstream_req_wdata_i,
-        wmask: upstream_req_wmask_i,
-        info: upstream_req_info_i
-    };
-
-    assign preread_refill_payload.valid = 1;
-    assign preread_refill_payload.is_refill = 1;
-`ifndef ENABLE_MULTI_READ_PEND
-    assign preread_refill_payload.task_pay.refill = '{
+    assign downstream_refill_payload_in = '{
         info: downstream_resp_refill_info_i,
         data: downstream_resp_refill_data_i,
         pad: '0
     };
+    spill_register #(
+        .T      (cache_refill_payload_t),
+        .Bypass (1'b0)
+    ) i_spill_downstream_refill (
+        .clk_i,
+        .rst_ni,
+        .valid_i (downstream_resp_refill_valid_i),
+        .ready_o (downstream_resp_refill_ready_o),
+        .data_i  (downstream_refill_payload_in),
+        .valid_o (downstream_refill_valid_raw),
+        .ready_i (downstream_refill_ready_raw),
+        .data_o  (downstream_refill_payload)
+    );
+    assign evict_full_block = (cache_status_q == EVIC_STALL) && (PartSplit > 1);
+    assign preread_refill_allowed = ~preread_arbiter_payload.is_refill |
+                                    (~evict_full_block &
+                                     (preread_arbiter_payload.task_pay.refill.info.for_write_pend |
+                                      (retr_fifo_usage < RetrFifoDepth - 2)));
+    assign preread_bank_valid = bank_read_valid_arb & preread_refill_allowed;
+    assign upstream_req_tag_tmp = upstream_req_addr_i[ReqAddrWidth-1:$clog2(CacheBankDepth) + $clog2(CacheLineWidth/8)];
+    assign upstream_req_depth_tmp = upstream_req_addr_i[$clog2(CacheBankDepth) + $clog2(CacheLineWidth/8)-1:$clog2(CacheLineWidth/8)];
+    assign req_buf_tag_tmp = req_buf_q.addr[ReqAddrWidth-1:$clog2(CacheBankDepth) + $clog2(CacheLineWidth/8)];
+    assign req_buf_depth_tmp = req_buf_q.addr[$clog2(CacheBankDepth) + $clog2(CacheLineWidth/8)-1:$clog2(CacheLineWidth/8)];
+    assign upstream_req_hazard_match = preread_req_hazard_valid_q &
+                                       (preread_req_hazard_tag_q == upstream_req_tag_tmp) &
+                                       (preread_req_hazard_depth_q == upstream_req_depth_tmp);
+    assign req_buf_hazard_match = preread_req_hazard_valid_q &
+                                  (preread_req_hazard_tag_q == req_buf_tag_tmp) &
+                                  (preread_req_hazard_depth_q == req_buf_depth_tmp);
+    // The meta/data banks are read with latency, so a request to the same cache line
+    // must not issue in the same cycle that line is being written back. This needs
+    // to cover refill writes to VALID as well, not only pending-line updates.
+    assign upstream_req_issue_hazard_now = upstream_req_valid_i & bank_write_req_o &
+                                           (bank_write_addr_o == upstream_req_depth_tmp) &
+                                           (bank_write_cache_tag_o[bank_write_way_o] == upstream_req_tag_tmp);
+    assign req_buf_issue_hazard_now = req_buf_valid_q & bank_write_req_o &
+                                      (bank_write_addr_o == req_buf_depth_tmp) &
+                                      (bank_write_cache_tag_o[bank_write_way_o] == req_buf_tag_tmp);
+    assign req_buf_push = upstream_req_valid_i & upstream_req_ready_o;
+    // Once the pre-reader arbiter actually selects the buffered request, keep the
+    // request visible until the handshake completes. Deriving this from the real
+    // arbiter output avoids deasserting req_i under LockIn when the request-side
+    // preconditions change late in the cycle.
+    assign req_buf_issue_start = bank_read_valid_arb & ~preread_arbiter_payload.is_refill &
+                                 req_buf_valid_q & ~req_buf_hold_q;
+    assign preread_request_valid = req_buf_valid_q & ~req_buf_hold_q &
+                                   (req_buf_issued_q |
+                                    (preread_req_flow_allow & ~req_buf_issue_hazard_now &
+                                     ~req_buf_hazard_match));
+    assign req_buf_pop = preread_request_valid & preread_request_ready;
+
+    assign preread_request_payload.valid = 1;
+    assign preread_request_payload.is_refill = 0;
+    assign preread_request_payload.task_pay.request = req_buf_q;
+
+    assign preread_refill_payload.valid = 1;
+    assign preread_refill_payload.is_refill = 1;
+`ifndef ENABLE_MULTI_READ_PEND
 `endif
 
     stream_arbiter #(.DATA_T(task_payload_t), .N_INP(2)) i_pre_reader_arbiter (
@@ -727,13 +814,39 @@ module insitu_cache_core
         .oup_ready_i(bank_read_ready_i & preread_refill_allowed)
     );
 
-    assign preread_task_d.valid = bank_read_valid_arb & bank_read_ready_i & preread_refill_allowed;
+    assign preread_task_d.valid = preread_bank_valid & bank_read_ready_i;
     assign preread_task_d.is_refill = preread_arbiter_payload.is_refill;
     assign preread_task_d.task_pay = preread_arbiter_payload.task_pay;
-    assign upstream_req_ready_o = bank_read_valid_arb & bank_read_ready_i & preread_request_ready;
-`ifndef ENABLE_MULTI_READ_PEND
-    assign downstream_resp_refill_ready_o = preread_refill_ready & ~evict_full_block;
-`endif
+    assign upstream_req_ready_o = preread_req_flow_allow & (~req_buf_valid_q | req_buf_pop);
+
+    always_comb begin
+        req_buf_d = req_buf_q;
+        req_buf_valid_d = req_buf_valid_q;
+        req_buf_hold_d = 1'b0;
+        req_buf_issued_d = req_buf_issued_q;
+
+        if (req_buf_issue_start) begin
+            req_buf_issued_d = 1'b1;
+        end
+
+        if (req_buf_pop) begin
+            req_buf_valid_d = 1'b0;
+            req_buf_issued_d = 1'b0;
+        end
+
+        if (req_buf_push) begin
+            req_buf_d = '{
+                write: upstream_req_write_i,
+                addr: upstream_req_addr_i,
+                wdata: upstream_req_wdata_i,
+                wmask: upstream_req_wmask_i,
+                info: upstream_req_info_i
+            };
+            req_buf_valid_d = 1'b1;
+            req_buf_hold_d = upstream_req_hazard_match | upstream_req_issue_hazard_now;
+            req_buf_issued_d = 1'b0;
+        end
+    end
 
     assign bank_read_addr_arb = preread_task_d.is_refill?
                                 preread_arbiter_payload.task_pay.refill.info.depth :
@@ -741,11 +854,11 @@ module insitu_cache_core
 
     always_comb begin
         preread_part_idx = '0;
-        if ((PartSplit > 1) && bank_read_valid_arb && ~preread_arbiter_payload.is_refill) begin
+        if ((PartSplit > 1) && preread_bank_valid && ~preread_arbiter_payload.is_refill) begin
             preread_part_idx = preread_arbiter_payload.task_pay.request.addr[$clog2(LineBytes)-1 : $clog2(PartBytes)];
         end
     end
-    assign refill_full_read_req = (PartSplit > 1) && bank_read_valid_arb && preread_arbiter_payload.is_refill;
+    assign refill_full_read_req = (PartSplit > 1) && preread_bank_valid && preread_arbiter_payload.is_refill;
     generate
         if (SetAssociativity == 1) begin : gen_evict_way_mask_single
             assign evict_read_way_mask = 1'b1;
@@ -769,7 +882,7 @@ module insitu_cache_core
 
     assign bank_read_part_idx_o = (evict_full_read_req || refill_full_read_req) ? '0 : preread_part_idx;
     assign bank_read_addr_o = evict_full_read_req ? evict_full_read_addr : bank_read_addr_arb;
-    assign bank_read_valid_o = evict_full_read_req ? 1'b1 : bank_read_valid_arb;
+    assign bank_read_valid_o = evict_full_read_req ? 1'b1 : preread_bank_valid;
     assign bank_read_all_parts_o = evict_full_read_req | refill_full_read_req;
     assign bank_read_way_mask_o = evict_full_read_req ? evict_read_way_mask :
                                   refill_full_read_req ? refill_read_way_mask :
@@ -840,6 +953,40 @@ module insitu_cache_core
     assign resp_cnt_d = retr_fifo_pop ? '0 :
                         (retr_resp_valid & retr_resp_ready) ? (resp_cnt_q + 1'b1) :
                         resp_cnt_q;
+
+`ifndef TARGET_SYNTHESIS
+    always_ff @(posedge clk_i) begin : proc_assert_empty_retr_entry
+        if (rst_ni && ~retr_fifo_empty && retr_entry_empty) begin
+            $error("[insitu_cache_core] empty retrieval entry reached output path");
+        end
+    end
+
+    always_ff @(posedge clk_i) begin : proc_assert_read_refill_reread
+        if (rst_ni &&
+            preread_task_q.valid &&
+            preread_task_q.is_refill &&
+            ~preread_task_q.task_pay.refill.info.for_write_pend) begin
+            if (dec_cache_status != READ_PEND) begin
+                $error("[insitu_cache_core] read refill did not reread a READ_PEND line: for_write_pend=%0b depth=%0d way=%0d dec_status=%0d dec_mask=0x%0h dec_tag=0x%0h",
+                       preread_task_q.task_pay.refill.info.for_write_pend,
+                       preread_task_q.task_pay.refill.info.depth,
+                       preread_task_q.task_pay.refill.info.way,
+                       dec_cache_status,
+                       dec_cache_mask,
+                       dec_cache_tag);
+            end
+            if (dec_cache_mask[SubarrayCntWidth-1:0] == '0) begin
+                $error("[insitu_cache_core] read refill has zero stored MSHR subarray count: for_write_pend=%0b depth=%0d way=%0d dec_status=%0d dec_mask=0x%0h dec_tag=0x%0h",
+                       preread_task_q.task_pay.refill.info.for_write_pend,
+                       preread_task_q.task_pay.refill.info.depth,
+                       preread_task_q.task_pay.refill.info.way,
+                       dec_cache_status,
+                       dec_cache_mask,
+                       dec_cache_tag);
+            end
+        end
+    end
+`endif
 
     //Datapath
     always_comb begin
@@ -965,13 +1112,13 @@ module insitu_cache_core
         .WordWidth       (WordWidth),
         .ByteWidth       (ByteWidth)
     ) i_insitu_cache_decoder (
-        .bank_read_cache_status_i,
-        .bank_read_cache_dirty_i,
-        .bank_read_cache_miss_meta_i,
-        .bank_read_cache_mask_i,
-        .bank_read_cache_tag_i,
-        .bank_read_cache_data_i,
-        .bank_read_cache_LRU_i,
+        .bank_read_cache_status_i      (bank_read_cache_status_i),
+        .bank_read_cache_dirty_i       (bank_read_cache_dirty_i),
+        .bank_read_cache_miss_meta_i   (bank_read_cache_miss_meta_i),
+        .bank_read_cache_mask_i        (bank_read_cache_mask_i),
+        .bank_read_cache_tag_i         (bank_read_cache_tag_i),
+        .bank_read_cache_data_i        (bank_read_cache_data_i),
+        .bank_read_cache_LRU_i         (bank_read_cache_LRU_i),
 `ifdef ENABLE_MULTI_READ_PEND
         .dec_is_hit_pend_new_entry_o     (dec_is_hit_pend_new_entry),
         .dec_read_hit_pend_prime_way_o   (dec_read_hit_pend_prime_way),
@@ -1029,13 +1176,13 @@ module insitu_cache_core
         .enc_link_dst_way_i       (enc_link_dst_way       ),
 `endif
 
-        .bank_read_cache_status_i,
-        .bank_read_cache_dirty_i,
-        .bank_read_cache_miss_meta_i,
-        .bank_read_cache_mask_i,
-        .bank_read_cache_tag_i,
-        .bank_read_cache_data_i,
-        .bank_read_cache_LRU_i,
+        .bank_read_cache_status_i      (bank_read_cache_status_i),
+        .bank_read_cache_dirty_i       (bank_read_cache_dirty_i),
+        .bank_read_cache_miss_meta_i   (bank_read_cache_miss_meta_i),
+        .bank_read_cache_mask_i        (bank_read_cache_mask_i),
+        .bank_read_cache_tag_i         (bank_read_cache_tag_i),
+        .bank_read_cache_data_i        (bank_read_cache_data_i),
+        .bank_read_cache_LRU_i         (bank_read_cache_LRU_i),
 
         .bank_write_cache_status_o,
         .bank_write_cache_dirty_o,
@@ -1086,6 +1233,20 @@ module insitu_cache_core
         evict_full_read_addr = evict_stall_depth_q;
         fsm_refill_stall_d = fsm_refill_stall_q;
         fsm_refill_way_d = fsm_refill_way_q;
+        deferred_bank_write_d = deferred_bank_write_q;
+        preread_req_hazard_valid_d = preread_req_hazard_valid_q;
+        preread_req_hazard_cnt_d = preread_req_hazard_cnt_q;
+        preread_req_hazard_tag_d = preread_req_hazard_tag_q;
+        preread_req_hazard_depth_d = preread_req_hazard_depth_q;
+        if (preread_req_hazard_valid_q) begin
+            if (preread_req_hazard_cnt_q > 0) begin
+                preread_req_hazard_cnt_d = preread_req_hazard_cnt_q - 1'b1;
+            end
+            if (preread_req_hazard_cnt_q <= 1) begin
+                preread_req_hazard_valid_d = 1'b0;
+                preread_req_hazard_cnt_d = '0;
+            end
+        end
 
         //Cache Bank Encoder
         enc_way = dec_way;
@@ -1511,9 +1672,6 @@ module insitu_cache_core
                             if (miss_is_full_masked_write_tmp) begin
                                 enc_cache_status = VALID;
                             end else begin
-                                // Hold off the next preread for one cycle so the newly-created
-                                // pending line is visible to the following bank lookup.
-                                preread_allowed = 1'b0;
                             end
 
                             //11.8 Write to Bank
@@ -1551,6 +1709,26 @@ module insitu_cache_core
 
                             //12. Check to replace cache line dirty
                             if (dec_cache_status == VALID && dec_cache_dirty == 1 && miss_is_full_masked_write_tmp == 0) begin
+
+                                if (PartSplit > 1) begin
+                                    deferred_bank_write_d = '{
+                                        valid: 1'b1,
+                                        addr: req_depth_tmp,
+                                        way: req_way_tmp,
+                                        LRU_update: 1'b1,
+                                        cache_status: enc_cache_status,
+                                        cache_dirty: enc_cache_dirty,
+                                        cache_miss_meta: enc_cache_miss_meta,
+                                        cache_mask: enc_cache_mask,
+                                        cache_tag: enc_cache_tag,
+                                        cache_data: enc_cache_data,
+                                        mod_data_with_mask: enc_mod_data_with_mask,
+                                        mod_mask: enc_mod_mask,
+                                        mod_write_data: enc_mod_write_data
+                                    };
+                                    bank_write_req_o = 1'b0;
+                                    bank_write_LRU_req_o = 1'b1;
+                                end
 
                                 //12.1 Need both eviction and send miss req to DRAM
                                 if (~miss_fifo_full & ~evic_fifo_full) begin
@@ -1669,6 +1847,26 @@ module insitu_cache_core
 
                                 end
                             end else if (dec_cache_status == VALID && dec_cache_dirty == 1 && miss_is_full_masked_write_tmp == 1) begin
+
+                                if (PartSplit > 1) begin
+                                    deferred_bank_write_d = '{
+                                        valid: 1'b1,
+                                        addr: req_depth_tmp,
+                                        way: req_way_tmp,
+                                        LRU_update: 1'b1,
+                                        cache_status: enc_cache_status,
+                                        cache_dirty: enc_cache_dirty,
+                                        cache_miss_meta: enc_cache_miss_meta,
+                                        cache_mask: enc_cache_mask,
+                                        cache_tag: enc_cache_tag,
+                                        cache_data: enc_cache_data,
+                                        mod_data_with_mask: enc_mod_data_with_mask,
+                                        mod_mask: enc_mod_mask,
+                                        mod_write_data: enc_mod_write_data
+                                    };
+                                    bank_write_req_o = 1'b0;
+                                    bank_write_LRU_req_o = 1'b1;
+                                end
 
                                 //12.2 Only eviction, we don't need to send miss request
                                 if (~evic_fifo_full) begin
@@ -1868,6 +2066,23 @@ module insitu_cache_core
                             evic_fifo_in.wmask = fsm_evic_stall_q.wmask;
                             evic_fifo_push = 1;
                             evict_full_data_valid_d = 1'b0;
+                            if (deferred_bank_write_q.valid) begin
+                                enc_way = deferred_bank_write_q.way;
+                                enc_cache_status = deferred_bank_write_q.cache_status;
+                                enc_cache_dirty = deferred_bank_write_q.cache_dirty;
+                                enc_cache_miss_meta = deferred_bank_write_q.cache_miss_meta;
+                                enc_cache_mask = deferred_bank_write_q.cache_mask;
+                                enc_cache_tag = deferred_bank_write_q.cache_tag;
+                                enc_cache_data = deferred_bank_write_q.cache_data;
+                                enc_mod_data_with_mask = deferred_bank_write_q.mod_data_with_mask;
+                                enc_mod_mask = deferred_bank_write_q.mod_mask;
+                                enc_mod_write_data = deferred_bank_write_q.mod_write_data;
+                                bank_write_addr_o = deferred_bank_write_q.addr;
+                                bank_write_way_o = deferred_bank_write_q.way;
+                                bank_write_req_o = 1'b1;
+                                bank_write_LRU_req_o = deferred_bank_write_q.LRU_update;
+                                deferred_bank_write_d = '0;
+                            end
                             preread_allowed = 1;
                             cache_status_d = REQ_PROC;
                         end
@@ -2022,8 +2237,9 @@ module insitu_cache_core
             //2.6 Record data in case of eviction
             refill_evic_data_in_words_tmp = refill_cache_data_in_words_tmp;
 
-            //3 Write to LRU
-            bank_write_LRU_req_o = 1;
+            //3 Request the normal encoder/LRU bookkeeping. The wrapper decides
+            //  whether the resulting meta write can safely touch the whole set.
+            bank_write_LRU_req_o = 1'b1;
 
             //4 update life-cycle counter
             `ifndef TARGET_SYNTHESIS
@@ -2173,11 +2389,6 @@ module insitu_cache_core
                 //7.7 Return status and continue preread for request
                 cache_status_d = REQ_PROC;
                 preread_allowed = 1;
-                if (~refill_all_pend_is_full_masked_write_tmp) begin
-                    // Hold off the next preread for one cycle so the newly-created
-                    // pending line is visible to the following bank lookup.
-                    preread_allowed = 1'b0;
-                end
 
                 //7.8 update life-cycle state
                 `ifndef TARGET_SYNTHESIS
@@ -2190,6 +2401,26 @@ module insitu_cache_core
 
                 //8. Check to replace cache line dirty
                 if (dec_cache_dirty == 1 && refill_all_pend_is_full_masked_write_tmp == 0) begin
+
+                    if (PartSplit > 1) begin
+                        deferred_bank_write_d = '{
+                            valid: 1'b1,
+                            addr: refill_req_depth_tmp,
+                            way: refill_way_tmp,
+                            LRU_update: 1'b1,
+                            cache_status: enc_cache_status,
+                            cache_dirty: enc_cache_dirty,
+                            cache_miss_meta: enc_cache_miss_meta,
+                            cache_mask: enc_cache_mask,
+                            cache_tag: enc_cache_tag,
+                            cache_data: enc_cache_data,
+                            mod_data_with_mask: enc_mod_data_with_mask,
+                            mod_mask: enc_mod_mask,
+                            mod_write_data: enc_mod_write_data
+                        };
+                        bank_write_req_o = 1'b0;
+                        bank_write_LRU_req_o = 1'b1;
+                    end
 
                     //8.1 Need both eviction and send miss req to DRAM
                     if (~miss_fifo_full & ~evic_fifo_full) begin
@@ -2309,6 +2540,26 @@ module insitu_cache_core
                     end
                 end else if (dec_cache_dirty == 1 && refill_all_pend_is_full_masked_write_tmp == 1) begin
 
+                    if (PartSplit > 1) begin
+                        deferred_bank_write_d = '{
+                            valid: 1'b1,
+                            addr: refill_req_depth_tmp,
+                            way: refill_way_tmp,
+                            LRU_update: 1'b1,
+                            cache_status: enc_cache_status,
+                            cache_dirty: enc_cache_dirty,
+                            cache_miss_meta: enc_cache_miss_meta,
+                            cache_mask: enc_cache_mask,
+                            cache_tag: enc_cache_tag,
+                            cache_data: enc_cache_data,
+                            mod_data_with_mask: enc_mod_data_with_mask,
+                            mod_mask: enc_mod_mask,
+                            mod_write_data: enc_mod_write_data
+                        };
+                        bank_write_req_o = 1'b0;
+                        bank_write_LRU_req_o = 1'b1;
+                    end
+
                     //8.2 Only eviction, we don't need to send miss request
                     if (~evic_fifo_full) begin
 
@@ -2399,6 +2650,13 @@ module insitu_cache_core
 `endif
 
         end : proc_refill
+
+        if (bank_write_req_o) begin
+            preread_req_hazard_valid_d = 1'b1;
+            preread_req_hazard_cnt_d = PrereadReqHazardCntWidth'(PrereadReqHazardCycles);
+            preread_req_hazard_depth_d = bank_write_addr_o;
+            preread_req_hazard_tag_d = bank_write_cache_tag_o[bank_write_way_o];
+        end
 
     end : Cache_FSM
 

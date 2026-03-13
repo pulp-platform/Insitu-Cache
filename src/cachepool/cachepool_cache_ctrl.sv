@@ -557,20 +557,24 @@ module cachepool_cache_ctrl #(
   coalescing_data_t   refill_data_d, refill_data_q;
   burst_cnt_t         refill_cnt_d,  refill_cnt_q;
   cache_info_t        refill_info_d, refill_info_q;
+  cache_info_t        refill_req_info_d, refill_req_info_q;
 
   coalescing_data_t   write_data_d, write_data_q;
   cache_strb_t        write_strb_d, write_strb_q;
   addr_t              write_addr_d, write_addr_q;
   burst_cnt_t         write_cnt_d,  write_cnt_q;
+  logic               refill_read_outstanding_d, refill_read_outstanding_q;
 
   `FF(refill_data_q, refill_data_d, '0)
   `FF(refill_cnt_q,  refill_cnt_d,  '0)
   `FF(refill_info_q, refill_info_d, '0)
+  `FF(refill_req_info_q, refill_req_info_d, '0)
 
   `FF(write_data_q, write_data_d, '0)
   `FF(write_strb_q, write_strb_d, '0)
   `FF(write_addr_q, write_addr_d, '0)
   `FF(write_cnt_q,  write_cnt_d,  '0)
+  `FF(refill_read_outstanding_q, refill_read_outstanding_d, 1'b0)
 
   typedef enum logic [1:0] {
     // idle until response comes
@@ -638,12 +642,14 @@ module cachepool_cache_ctrl #(
       refill_cnt_d        = refill_cnt_q;
       refill_rsp_state_d  = refill_rsp_state_q;
       refill_info_d       = refill_info_q;
+      refill_req_info_d   = refill_req_info_q;
 
       refill_req_state_d  = refill_req_state_q;
       write_data_d        = write_data_q;
       write_strb_d        = write_strb_q;
       write_addr_d        = write_addr_q;
       write_cnt_d         = write_cnt_q;
+      refill_read_outstanding_d = refill_read_outstanding_q;
 
       write_strb_is_zero  = 1'b0;
 
@@ -662,7 +668,7 @@ module cachepool_cache_ctrl #(
           // Judge if it is a read or write request
           // If read: send out burst
           // If write: send out single req and switch mode
-          if (cache_req_valid) begin
+          if (cache_req_valid && !refill_read_outstanding_q) begin
             // By default, send these info for valid request
             refill_req_o = '{
               addr : cache_req_addr,
@@ -706,6 +712,10 @@ module cachepool_cache_ctrl #(
               // read request side
               cache_req_ready     = refill_req_ready_i;
               refill_req_valid_o  = cache_req_valid;
+              if (cache_req_valid && refill_req_ready_i) begin
+                refill_read_outstanding_d = 1'b1;
+                refill_req_info_d = cache_req_info;
+              end
 
               refill_burst_o      = '{
                 // Send burst if the request is valid
@@ -788,7 +798,7 @@ module cachepool_cache_ctrl #(
               // Acknowledge the acceptance of the data
               refill_rsp_ready_o  = 1'b1;
               // Fill the refill info
-              refill_info_d       = refill_rsp_i.info;
+              refill_info_d       = refill_req_info_q;
               // Response not yet ready
               cache_resp_valid    = 1'b0;
               // move to the next state
@@ -802,9 +812,9 @@ module cachepool_cache_ctrl #(
           end
         end
         Partial: begin
-          if (refill_rsp_valid_i) begin
-            // We got a valid response, is it from write?
-            if (refill_rsp_i.write == 1'b0) begin
+            if (refill_rsp_valid_i) begin
+              // We got a valid response, is it from write?
+              if (refill_rsp_i.write == 1'b0) begin
               // Add counter
               refill_cnt_d        = refill_cnt_q + 1;
               // Move data to right to add new data
@@ -815,8 +825,8 @@ module cachepool_cache_ctrl #(
               refill_rsp_ready_o  = 1'b1;
               // The refill info should be the same, raise a warning if not
             `ifndef TARGET_SYNTHESIS
-              if (refill_rsp_i.info != refill_info_q) begin
-                $warning("[L1 D$ Ctrl] Info mismatch!");
+              if (refill_rsp_i.info != refill_req_info_q) begin
+                $warning("[L1 D$ Ctrl] Info mismatch! rsp=%p req=%p", refill_rsp_i.info, refill_req_info_q);
               end
             `endif
               // Response not yet ready
@@ -832,7 +842,7 @@ module cachepool_cache_ctrl #(
           // The refill data
           cache_resp_data     = refill_data_q;
           // The refill info
-          cache_resp_info     = refill_info_q;
+          cache_resp_info     = refill_req_info_q;
           // Write response is not handled here
           cache_resp_write    = 1'b0;
           // raise the valid flag
@@ -843,6 +853,7 @@ module cachepool_cache_ctrl #(
 
           if (cache_resp_ready) begin
             // The refill is accepted
+            refill_read_outstanding_d = 1'b0;
             // Clear all FF and reset the state
             if (refill_rsp_valid_i & (refill_rsp_i.write == 1'b0)) begin
               // If we already have a valid response
@@ -856,7 +867,7 @@ module cachepool_cache_ctrl #(
               // Acknowledge the acceptance of the data
               refill_rsp_ready_o  = 1'b1;
               // Fill the refill info
-              refill_info_d       = refill_rsp_i.info;
+              refill_info_d       = refill_req_info_q;
               // move to the next state
               refill_rsp_state_d  = Partial;
             end else begin
@@ -868,6 +879,7 @@ module cachepool_cache_ctrl #(
         end
       endcase
     end
+
   end
 
   //////////////////////////////////////
