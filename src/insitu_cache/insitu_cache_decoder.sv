@@ -25,6 +25,8 @@ module insitu_cache_decoder
     parameter int unsigned NumCacheEntry                    = 512,
     /// Number of Associatity
     parameter int unsigned SetAssociativity                 = 16,
+    /// Use deterministic hash-based way selection.
+    parameter bit          UseHashWaySelect                 = 1'b0,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                        = 64,
     /// Width of byte (granularity of byte mask)
@@ -112,58 +114,106 @@ always_comb begin : proc_bank_decode
         automatic cache_tag_t _tag;
         automatic cache_bank_depth_ptr_t _depth;
         automatic byte_offset_t _ofst;
+        automatic way_ptr_t _hash_way;
 
 
         {_tag,_depth,_ofst} = cache_task_i.task_pay.request.addr;
+        _hash_way = '0;
+        if (SetAssociativity > 1) begin
+            _hash_way = way_ptr_t'(
+                cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) + $clog2(CacheBankDepth) +: $clog2(SetAssociativity)] ^
+                cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) +: $clog2(SetAssociativity)]
+            );
+        end
         dec_is_write_req_o = cache_task_i.task_pay.request.write;
 
 
-        //2. Check request type
-        for (int way = 0; way < SetAssociativity; way ++) begin : proc2_check_req_type
+        if (UseHashWaySelect && (SetAssociativity > 1)) begin : proc_hash_way_req
+            dec_way_o = _hash_way;
 
-            //2.1 Check hit on valid line
-            if (bank_read_cache_status_i[way] == VALID && (bank_read_cache_tag_i[way] == _tag)) begin
+            if (bank_read_cache_status_i[_hash_way] == VALID &&
+                (bank_read_cache_tag_i[_hash_way] == _tag)) begin
                 dec_is_hit_o = 1;
-                dec_way_o = way;
-            end
-            //2.2 Check hit on same type pend line/ on the opposite type pend line
-            if (bank_read_cache_status_i[way] == READ_PEND && (bank_read_cache_tag_i[way] == _tag)) begin
+                dec_is_all_pend_o = 1'b0;
+            end else if (bank_read_cache_status_i[_hash_way] == READ_PEND &&
+                         (bank_read_cache_tag_i[_hash_way] == _tag)) begin
                 if (dec_is_write_req_o) begin
                     dec_is_hit_conflit_o = 1;
-                    dec_way_o = way;
                 end else begin
                     dec_is_hit_pend_o = 1;
 `ifdef ENABLE_MULTI_READ_PEND
-                    if (bank_read_cache_miss_meta_i[way].is_full == 0) begin
+                    if (bank_read_cache_miss_meta_i[_hash_way].is_full == 0) begin
                         dec_is_hit_pend_new_entry_o = '0;
-                        dec_way_o = way;
                     end
-                    if (bank_read_cache_miss_meta_i[way].is_prime) begin
-                        dec_read_hit_pend_prime_way_o = way;
+                    if (bank_read_cache_miss_meta_i[_hash_way].is_prime) begin
+                        dec_read_hit_pend_prime_way_o = _hash_way;
                     end
-                    if (bank_read_cache_miss_meta_i[way].link_enable == 0) begin
-                        dec_read_hit_pend_linkable_way_o = way;
+                    if (bank_read_cache_miss_meta_i[_hash_way].link_enable == 0) begin
+                        dec_read_hit_pend_linkable_way_o = _hash_way;
                     end
-`else
-                    dec_way_o = way;
 `endif
                 end
-            end
-            if (bank_read_cache_status_i[way] == WRITE_PEND && (bank_read_cache_tag_i[way] == _tag)) begin
+            end else if (bank_read_cache_status_i[_hash_way] == WRITE_PEND &&
+                         (bank_read_cache_tag_i[_hash_way] == _tag)) begin
                 if (dec_is_write_req_o) begin
                     dec_is_hit_pend_o = 1;
-                    dec_way_o = way;
                 end else begin
                     dec_is_hit_conflit_o = 1;
-                    dec_way_o = way;
                 end
             end
-            //2.3 Check if all lines are in pending status
-            if (bank_read_cache_status_i[way] == VALID || bank_read_cache_status_i[way] == INVALID) begin
+
+            if (bank_read_cache_status_i[_hash_way] == VALID ||
+                bank_read_cache_status_i[_hash_way] == INVALID) begin
                 dec_is_all_pend_o = 0;
             end
+        end else begin : proc_full_assoc_req
+            //2. Check request type
+            for (int way = 0; way < SetAssociativity; way ++) begin : proc2_check_req_type
 
-        end : proc2_check_req_type
+                //2.1 Check hit on valid line
+                if (bank_read_cache_status_i[way] == VALID && (bank_read_cache_tag_i[way] == _tag)) begin
+                    dec_is_hit_o = 1;
+                    dec_way_o = way;
+                end
+                //2.2 Check hit on same type pend line/ on the opposite type pend line
+                if (bank_read_cache_status_i[way] == READ_PEND && (bank_read_cache_tag_i[way] == _tag)) begin
+                    if (dec_is_write_req_o) begin
+                        dec_is_hit_conflit_o = 1;
+                        dec_way_o = way;
+                    end else begin
+                        dec_is_hit_pend_o = 1;
+`ifdef ENABLE_MULTI_READ_PEND
+                        if (bank_read_cache_miss_meta_i[way].is_full == 0) begin
+                            dec_is_hit_pend_new_entry_o = '0;
+                            dec_way_o = way;
+                        end
+                        if (bank_read_cache_miss_meta_i[way].is_prime) begin
+                            dec_read_hit_pend_prime_way_o = way;
+                        end
+                        if (bank_read_cache_miss_meta_i[way].link_enable == 0) begin
+                            dec_read_hit_pend_linkable_way_o = way;
+                        end
+`else
+                        dec_way_o = way;
+`endif
+                    end
+                end
+                if (bank_read_cache_status_i[way] == WRITE_PEND && (bank_read_cache_tag_i[way] == _tag)) begin
+                    if (dec_is_write_req_o) begin
+                        dec_is_hit_pend_o = 1;
+                        dec_way_o = way;
+                    end else begin
+                        dec_is_hit_conflit_o = 1;
+                        dec_way_o = way;
+                    end
+                end
+                //2.3 Check if all lines are in pending status
+                if (bank_read_cache_status_i[way] == VALID || bank_read_cache_status_i[way] == INVALID) begin
+                    dec_is_all_pend_o = 0;
+                end
+
+            end : proc2_check_req_type
+        end
 
 
 

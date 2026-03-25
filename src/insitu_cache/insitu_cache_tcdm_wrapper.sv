@@ -46,6 +46,8 @@ module insitu_cache_tcdm_wrapper
     parameter int unsigned NumPseudoDualBanks       = 1,
     /// Number of parts per cache line for data banks (1 = unfolded).
     parameter int unsigned DataPartSplit            = 1,
+    /// Use hash-based way selection (1 way per lookup, no LRU).
+    parameter bit          UseHashWaySelect         = 1'b0,
     /// Width of word (granularity of non-blocking write)
     parameter int unsigned WordWidth                = 32,
     /// Width of byte (granularity of byte mask)
@@ -188,7 +190,7 @@ module insitu_cache_tcdm_wrapper
 
     /// Data Bank Request GNT for Cache
     input  logic             [SetAssociativity-1:0][NumDataBankPerWay-1:0]   tcdm_data_bank_gnt_i
-    
+
 );
 
     //////////////////////////////////////
@@ -364,7 +366,7 @@ module insitu_cache_tcdm_wrapper
     cache_tag_t             [SetAssociativity - 1 : 0]      bank_read_cache_tag;
     cache_data_t            [SetAssociativity - 1 : 0]      bank_read_cache_data;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_read_cache_LRU;
-    
+
     logic                   [SetAssociativity - 1 : 0]      data_bank_read_ready;
     logic                   [SetAssociativity - 1 : 0]      meta_bank_read_ready;
 
@@ -404,6 +406,8 @@ module insitu_cache_tcdm_wrapper
     cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask_sel;
     logic                                                   bank_write_LRU_req;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_write_cache_LRU;
+    logic                                                   bank_write_meta_skip;
+    logic                                                   bank_read_data_skip;
 
     /****************/
     /*  Cache Proc  */
@@ -431,6 +435,8 @@ module insitu_cache_tcdm_wrapper
     cache_data_t            [SetAssociativity - 1 : 0]      proc_write_cache_data;
     logic                                                   proc_write_LRU_req;
     way_ptr_t               [SetAssociativity - 1 : 0]      proc_write_cache_LRU;
+    logic                                                   proc_write_meta_skip;
+    logic                                                   proc_read_data_skip;
 
     logic                                                   proc_write_select;
 
@@ -866,6 +872,7 @@ module insitu_cache_tcdm_wrapper
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
         .DataPartSplit   (PartSplit),
+        .UseHashWaySelect(UseHashWaySelect),
         .WordWidth       (WordWidth),
         .ByteWidth       (ByteWidth),
         .LogDebug        (LogDebug),
@@ -941,7 +948,9 @@ module insitu_cache_tcdm_wrapper
         .bank_write_cache_data_o        (proc_write_cache_data),
         .bank_write_data_mask_o         (bank_write_data_mask),
         .bank_write_LRU_req_o           (proc_write_LRU_req),
-        .bank_write_cache_LRU_o         (proc_write_cache_LRU)
+        .bank_write_cache_LRU_o         (proc_write_cache_LRU),
+        .bank_write_meta_skip_o         (proc_write_meta_skip),
+        .bank_read_data_skip_o          (proc_read_data_skip)
     );
 
     /***************************/
@@ -1145,20 +1154,89 @@ module insitu_cache_tcdm_wrapper
     assign bank_write_cache_data       = proc_write_select? proc_write_cache_data : flush_write_cache_data;
     assign bank_write_cache_LRU        = proc_write_select? proc_write_cache_LRU : flush_write_cache_LRU;
     assign bank_write_data_mask_sel    = proc_write_select? bank_write_data_mask : '{default: '1};
+    assign bank_write_meta_skip        = proc_write_select? proc_write_meta_skip : 1'b0;
+    assign bank_read_data_skip         = bank_read_sel_flush? 1'b0 : proc_read_data_skip;
 
 
     /*****************/
     /*  Cache Banks  */
     /*****************/
 
+    cache_bank_depth_ptr_t bank_read_cache_addr_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            bank_read_cache_addr_q <= '0;
+        end else if (bank_read_cache_valid && bank_read_cache_ready) begin
+            bank_read_cache_addr_q <= bank_read_cache_addr;
+        end
+    end
+
+    way_ptr_t [SetAssociativity-1:0] lru_read_data;
+    way_ptr_t [SetAssociativity-1:0] lru_meta_unused; // discarded LRU from meta SRAM
+    way_ptr_t [CacheBankDepth-1:0][SetAssociativity-1:0] lru_rf;
+
+    always_comb begin
+        lru_read_data = lru_rf[bank_read_cache_addr_q];
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            lru_rf <= '0;
+        end else if (bank_write_LRU_req || bank_write_cache_req) begin
+            lru_rf[bank_write_cache_addr] <= bank_write_cache_LRU;
+        end
+    end
+
+    // ── Dirty register file: true dual-port (1R + 1W per cycle) ──
+    // Separating dirty from meta SRAM so that on write hits where
+    // cache_mask is already all-1s, the meta SRAM write can be
+    // skipped entirely (dirty and LRU handled by register files).
+    logic [CacheBankDepth-1:0][SetAssociativity-1:0] dirty_rf;
+    logic [SetAssociativity-1:0] dirty_read_data;
+    logic [SetAssociativity-1:0] dirty_meta_unused; // discarded dirty from meta SRAM
+
+    // Read port: registered address to match SRAM 1-cycle read latency
+    always_comb begin
+        dirty_read_data = dirty_rf[bank_read_cache_addr_q];
+    end
+
+    // Write port: edge-triggered.
+    // With hash way select, only update the TARGET way's dirty bit
+    // to prevent the encoder's passthrough from corrupting non-target
+    // ways (which were not read from SRAM and may carry stale data).
+    // Flush writes still update all ways (proc_write_select = 0).
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            dirty_rf <= '0;
+        end else if (bank_write_cache_req) begin
+            if (UseHashWaySelect && proc_write_select) begin
+                dirty_rf[bank_write_cache_addr][proc_write_cache_way] <=
+                    bank_write_cache_dirty[proc_write_cache_way];
+            end else begin
+                dirty_rf[bank_write_cache_addr] <= bank_write_cache_dirty;
+            end
+        end
+    end
+
+    logic mc_suppress_meta_write;
+    assign mc_suppress_meta_write = 1'b0;
+    logic mc_hit;
+    assign mc_hit = 1'b0;
+
+    // Data forwarding buffer placeholder (for future implementation).
+    logic [SetAssociativity-1:0] dbuf_hit;
+    assign dbuf_hit = '0;
+
     for (genvar i = 0; i < SetAssociativity; i++) begin: gen_cache_banks
         always_comb begin
             {bank_read_cache_status[i],
-            bank_read_cache_dirty[i],
+            dirty_meta_unused[i],
             bank_read_cache_miss_meta[i],
             bank_read_cache_mask[i],
             bank_read_cache_tag[i],
-            bank_read_cache_LRU[i]} = cache_meta_read_data[i];
+            lru_meta_unused[i]} = cache_meta_read_data[i];
+            bank_read_cache_LRU[i]   = lru_read_data[i];
+            bank_read_cache_dirty[i] = dirty_read_data[i];
 
             cache_meta_write_data[i] = {
                 bank_write_cache_status[i],
@@ -1244,18 +1322,21 @@ module insitu_cache_tcdm_wrapper
         logic meta_proc_write_req;
         always_comb begin
             meta_proc_write_req = 1'b0;
-            if (bank_write_cache_req && (proc_write_cache_way == way_ptr_t'(i))) begin
+            if (bank_write_cache_req && !bank_write_meta_skip &&
+                !mc_suppress_meta_write &&
+                (proc_write_cache_way == way_ptr_t'(i))) begin
                 meta_proc_write_req = 1'b1;
-            end else if (bank_write_LRU_req) begin
-                meta_proc_write_req = &bank_read_way_mask_q;
             end
+            // LRU-only updates → LRU register file (no meta SRAM write).
+            // Write hits on VALID → dirty RF + LRU RF only (meta_skip=1).
         end
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (1),
             .WordWidth          ($bits(cache_meta_t)),
-            .ByteWidth          ($bits(cache_meta_t))
+            .ByteWidth          ($bits(cache_meta_t)),
+            .AllowReadDuringWrite (1'b0)
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1317,7 +1398,9 @@ module insitu_cache_tcdm_wrapper
         );
 
         assign bank_read_cache_ready_per_way[i] = bank_read_way_mask_sel[i] ?
-                                                   (data_bank_read_ready[i] & meta_bank_read_ready[i]) :
+                                                   (bank_read_data_skip ?
+                                                     meta_bank_read_ready[i] :
+                                                     (data_bank_read_ready[i] & meta_bank_read_ready[i])) :
                                                    1'b1;
     end
 
@@ -1447,8 +1530,15 @@ module pseudo_dual_port_tcdm_wrapper #(
     `FFARN (read_data_from_bank_select_q,
             read_data_from_bank_select_d,
             '0, clk_i, rst_ni)
+    logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_write_en_q;
+    word_t        [NumWordsPerLine-1:0]  write_line_buffer_words;
+    assign write_line_buffer_words = write_line_buffer;
+
     `FFARN (word_read_en_q,
             word_read_en,
+            '0, clk_i, rst_ni)
+    `FFARN (word_write_en_q,
+            word_write_en,
             '0, clk_i, rst_ni)
 
     initial begin
@@ -1476,8 +1566,13 @@ module pseudo_dual_port_tcdm_wrapper #(
             assign tcdm_bank_addr_o[i*NumWordsPerLine + j]   = bank_addr[i];
             assign tcdm_bank_wdata_o[i*NumWordsPerLine + j]  = bank_wdata_words[i][j];
             assign tcdm_bank_be_o[i*NumWordsPerLine + j]     = bank_wmask[i][j*WordBytes +: WordBytes];
-            assign bank_rdata_words[i][j]                    = word_read_en_q[i][j] ?
-                                                              tcdm_bank_rdata_i[i*NumWordsPerLine + j] : '0;
+            // Per-word forwarding: when a TCDM bank was both read and written
+            // (WR_SAME_ADDR overlap), the SRAM port was used for the write, so
+            // forward from write_line_buffer instead of unreliable SRAM rdata.
+            assign bank_rdata_words[i][j] =
+                (word_read_en_q[i][j] & word_write_en_q[i][j]) ? write_line_buffer_words[j] :
+                 word_read_en_q[i][j]                           ? tcdm_bank_rdata_i[i*NumWordsPerLine + j] :
+                                                                  '0;
         end
 
         assign bank_rdata[i] = bank_rdata_words[i];
@@ -1521,11 +1616,14 @@ module pseudo_dual_port_tcdm_wrapper #(
         if (read_valid_i & write_has_data) begin
             if (read_bank_select != write_bank_select) begin
                 status = WR_DIFF_BANK;
+            end else if (read_bank_addr == write_bank_addr) begin
+                // Same pseudo-bank, same address: issue both read and write.
+                // Non-overlapping TCDM words proceed independently (different
+                // parts of the line).  For overlapping words (same part),
+                // per-word forwarding from write_line_buffer provides correct
+                // data even when the SRAM port is used for the write.
+                status = WR_SAME_ADDR;
             end else begin
-                // A masked write only carries the modified bytes. Returning the raw
-                // write buffer on a same-address read can therefore zero untouched
-                // bytes in the requested line/part. Serialize all same-bank read/write
-                // collisions instead of bypassing partial-line data.
                 status = WR_CONFLICT;
             end
         end else 
@@ -1569,13 +1667,19 @@ module pseudo_dual_port_tcdm_wrapper #(
             end
 
             WR_SAME_ADDR: begin
+                // Issue BOTH read and write to the same pseudo-bank.
+                // Each TCDM word-bank independently reads or writes:
+                //   - Read-only words  → SRAM read (correct data)
+                //   - Write-only words → SRAM write
+                //   - Overlapping words → SRAM write, forward from write buffer
                 bank_req_write[write_bank_select] = 1'b1;
+                bank_req_read[read_bank_select]   = 1'b1;
                 bank_addr[write_bank_select]    = write_bank_addr;
                 bank_wdata[write_bank_select]   = write_data_i;
                 bank_wmask[write_bank_select]   = write_mask_i;
 
-                read_data_from_line_buffer_d    = 1'b1;
-                read_data_from_bank_select_d    = '0;
+                read_data_from_line_buffer_d    = '0;
+                read_data_from_bank_select_d    = read_bank_select;
             end
 
             WR_CONFLICT: begin
@@ -1594,7 +1698,9 @@ module pseudo_dual_port_tcdm_wrapper #(
         /*********************/
         /* Read Ready Logics */
         /*********************/
-        if (write_has_data && (read_bank_select == write_bank_select)) begin
+        // Block read only on true conflict (same bank, different address).
+        // WR_SAME_ADDR uses the write-line-buffer bypass, so read can proceed.
+        if (status == WR_CONFLICT) begin
             read_ready_o = 1'b0;
         end
     end
@@ -1613,6 +1719,10 @@ module insitu_cache_bank_access_controller #(
     parameter int unsigned  WordWidth               = 32,
     /// Width of byte (granularity of byte mask)
     parameter int unsigned  ByteWidth               = 8,
+    /// Allow reads to proceed during writes (safe when the downstream
+    /// pseudo_dual_port has WR_SAME_ADDR bypass and there is no folded
+    /// banking that could silently drop the read).
+    parameter bit           AllowReadDuringWrite    = 1'b0,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. Byte mask type.
@@ -1701,8 +1811,14 @@ module insitu_cache_bank_access_controller #(
         case (access_status_q)
             ACCESS_THROUGH: begin
                 if (upstream_write_req_i == 1'b1) begin
-                    upstream_read_ready_o = '0;
-                    downstream_read_valid_o = '0;
+                    if (AllowReadDuringWrite && bank_gnt_i) begin
+                        // Safe path (meta banks): let the pseudo_dual_port
+                        // resolve the R/W conflict via WR_SAME_ADDR bypass.
+                        upstream_read_ready_o = downstream_read_ready_i;
+                    end else begin
+                        upstream_read_ready_o = '0;
+                        downstream_read_valid_o = '0;
+                    end
                     if (bank_gnt_i == '0) begin
                         downstream_write_req_o = '0;
                         access_status_d = ACCESS_STALL;

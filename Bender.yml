@@ -15,7 +15,7 @@ sources:
 
   - target: rtl
     defines:
-      ENABLE_MULTI_READ_PEND: ~
+      # ENABLE_MULTI_READ_PEND: ~
       INSITU_CACHE_CORE_USE_MSHR_PADING: ~
     files:
     #level1

@@ -42,6 +42,8 @@ module cachepool_cache_ctrl #(
   parameter int unsigned SetAssociativity                                 = 4,
   /// Number of parts per cache line for data banks (1 = unfolded).
   parameter int unsigned DataPartSplit                                    = 1,
+  /// Use hash-based way selection (1 way per lookup, no LRU).
+  parameter bit          UseHashWaySelect                                = 1'b0,
   /// Number of Pseudo-Dual Banks
   parameter int unsigned BankFactor                                       = 2,
 
@@ -490,6 +492,7 @@ module cachepool_cache_ctrl #(
     .NumCacheEntry          (NumCacheEntry          ),
     .SetAssociativity       (SetAssociativity       ),
     .DataPartSplit          (DataPartSplit          ),
+    .UseHashWaySelect       (UseHashWaySelect       ),
     .NumPseudoDualBanks     (BankFactor             ),
     .WriteThroughMode       (0                      ),
     .WordWidth              (WordWidth              ),

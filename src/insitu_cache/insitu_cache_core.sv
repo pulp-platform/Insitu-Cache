@@ -48,6 +48,11 @@ module insitu_cache_core
     parameter int unsigned LogDebug                         = 1,
     /// Counter cache line life cycle information for questa-sim.
     parameter int unsigned LogLifeCycle                     = 0,
+    /// Use hash-based way selection instead of full-associative LRU.
+    /// Each cache-line address deterministically maps to one way via
+    /// a hash, so only 1 way is read per lookup (vs all ways).
+    /// Eliminates LRU but increases conflict misses.
+    parameter bit          UseHashWaySelect                 = 1'b0,
     /// Depth of Retrieve Fifo.
     parameter int unsigned RetrFifoDepth                    = 16,
     /// Depth of Response Fifo.
@@ -166,8 +171,15 @@ module insitu_cache_core
     output cache_data_t             [SetAssociativity-1:0]  bank_write_cache_data_o,
     output cache_mask_t             [SetAssociativity-1:0]  bank_write_data_mask_o,
     output logic                                            bank_write_LRU_req_o,
-    output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o
-    
+    output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o,
+    /// When asserted with bank_write_req_o, the meta SRAM write can be
+    /// skipped (only dirty/LRU changed — handled by register files).
+    output logic                                            bank_write_meta_skip_o,
+    /// When asserted with bank_read_valid_o, the data bank read can be
+    /// skipped (write requests only need meta to verify the hit; the data
+    /// write uses byte masking so no old data merge is required).
+    output logic                                            bank_read_data_skip_o
+
 );
 
     initial begin
@@ -496,7 +508,7 @@ module insitu_cache_core
     logic                                                   downstream_refill_valid_raw;
     logic                                                   downstream_refill_ready_raw;
     `FFARN (preread_task_q,         preread_task_d,         '0, clk_i, rst_ni)
-    localparam int unsigned                                PrereadReqHazardCycles = 2;
+    localparam int unsigned                                PrereadReqHazardCycles = 0;
     localparam int unsigned                                PrereadReqHazardCntWidth =
         (PrereadReqHazardCycles > 0) ? $clog2(PrereadReqHazardCycles + 1) : 1;
     cache_request_payload_t                                 req_buf_q, req_buf_d;
@@ -884,9 +896,40 @@ module insitu_cache_core
     assign bank_read_addr_o = evict_full_read_req ? evict_full_read_addr : bank_read_addr_arb;
     assign bank_read_valid_o = evict_full_read_req ? 1'b1 : preread_bank_valid;
     assign bank_read_all_parts_o = evict_full_read_req | refill_full_read_req;
+
+    // Hash-based way selection: deterministic way from address.
+    // XOR low tag bits with low set-index bits for good distribution
+    // across ways for sequential access patterns.
+    way_ptr_t                                               hash_way_preread;
+    if (UseHashWaySelect && SetAssociativity > 1) begin : gen_hash_way
+        localparam int unsigned WayBits = $clog2(SetAssociativity);
+        localparam int unsigned DepthLo = $clog2(CacheLineWidth/8);
+        localparam int unsigned TagLo   = DepthLo + $clog2(CacheBankDepth);
+        wire [WayBits-1:0] preread_tag_bits  =
+            preread_arbiter_payload.task_pay.request.addr[TagLo +: WayBits];
+        wire [WayBits-1:0] preread_depth_bits =
+            preread_arbiter_payload.task_pay.request.addr[DepthLo +: WayBits];
+        assign hash_way_preread = way_ptr_t'(preread_tag_bits ^ preread_depth_bits);
+    end else begin : gen_no_hash_way
+        assign hash_way_preread = '0;
+    end
+
+    logic [SetAssociativity-1:0] hash_way_mask_preread;
+    always_comb begin
+        hash_way_mask_preread = '0;
+        hash_way_mask_preread[hash_way_preread] = 1'b1;
+    end
+
+    // For hash way select: use one-hot mask for both requests (hash)
+    // and refills (stored way from miss FIFO).
     assign bank_read_way_mask_o = evict_full_read_req ? evict_read_way_mask :
                                   refill_full_read_req ? refill_read_way_mask :
+                                  (UseHashWaySelect & ~preread_arbiter_payload.is_refill) ?
+                                      hash_way_mask_preread :
+                                  (UseHashWaySelect &  preread_arbiter_payload.is_refill) ?
+                                      refill_read_way_mask :
                                   {SetAssociativity{1'b1}};
+    assign bank_read_data_skip_o = 1'b0;
 
 
 
@@ -1109,6 +1152,7 @@ module insitu_cache_core
         .task_payload_t  (task_payload_t),
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
+        .UseHashWaySelect(UseHashWaySelect),
         .WordWidth       (WordWidth),
         .ByteWidth       (ByteWidth)
     ) i_insitu_cache_decoder (
@@ -1138,6 +1182,24 @@ module insitu_cache_core
         .dec_cache_tag_o         (dec_cache_tag         ),
         .dec_cache_data_o        (dec_cache_data        )
     );
+
+    // Hash-based way override: for miss replacement, the hashed way is
+    // always the victim.  For hits, the decoder already returns the
+    // correct way (only 1 way has valid meta due to the one-hot mask).
+    // Compute hash from the FSM-stage address (preread_task_q).
+    way_ptr_t hash_way_fsm;
+    if (UseHashWaySelect && SetAssociativity > 1) begin : gen_hash_way_fsm
+        localparam int unsigned WayBits = $clog2(SetAssociativity);
+        localparam int unsigned DepthLo = $clog2(CacheLineWidth/8);
+        localparam int unsigned TagLo   = DepthLo + $clog2(CacheBankDepth);
+        wire [WayBits-1:0] fsm_tag_bits  =
+            preread_task_q.task_pay.request.addr[TagLo +: WayBits];
+        wire [WayBits-1:0] fsm_depth_bits =
+            preread_task_q.task_pay.request.addr[DepthLo +: WayBits];
+        assign hash_way_fsm = way_ptr_t'(fsm_tag_bits ^ fsm_depth_bits);
+    end else begin : gen_no_hash_way_fsm
+        assign hash_way_fsm = '0;
+    end
 
 
     ///////////////////////////////////////
@@ -1249,7 +1311,16 @@ module insitu_cache_core
         end
 
         //Cache Bank Encoder
-        enc_way = dec_way;
+        // With hash way select, the encoder must index the hashed way
+        // (for requests) or the FIFO way (for refills), not dec_way
+        // which defaults to the decoder's LRU-based selection.
+        if (UseHashWaySelect && preread_task_q.valid) begin
+            enc_way = preread_task_q.is_refill ?
+                      preread_task_q.task_pay.refill.info.way :
+                      hash_way_fsm;
+        end else begin
+            enc_way = dec_way;
+        end
         enc_cache_status = dec_cache_status;
         enc_cache_dirty = dec_cache_dirty;
         enc_cache_miss_meta = dec_cache_miss_meta;
@@ -1278,12 +1349,13 @@ module insitu_cache_core
         bank_write_req_o = '0;
         bank_write_way_o = '0;
         bank_write_LRU_req_o = '0;
+        bank_write_meta_skip_o = '0;
 
         //Waveform-visible temporary signals
         req_tag_tmp = '0;
         req_depth_tmp = '0;
         req_ofst_tmp = '0;
-        req_way_tmp = dec_way;
+        req_way_tmp = UseHashWaySelect ? hash_way_fsm : dec_way;
         req_is_write_tmp = dec_is_write_req;
         req_is_hit_tmp = dec_is_hit;
         req_is_hit_pend_tmp = dec_is_hit_pend;
@@ -1305,7 +1377,10 @@ module insitu_cache_core
         refill_cache_data_in_bytes_tmp = '0;
         refill_write_data_in_bytes_tmp = '0;
         refill_write_storb_tmp = '0;
-        refill_way_tmp = dec_way;
+        // For refills, always use the way stored in the miss FIFO
+        // (hash_way_fsm reads the request union field which is garbage
+        // when is_refill=1).
+        refill_way_tmp = preread_task_q.task_pay.refill.info.way;
         refill_is_stalled_req_write_tmp = 1'b0;
         refill_retr_subarray_cnt_tmp = '0;
         refill_all_pend_is_full_masked_write_tmp = 1'b0;
@@ -1411,6 +1486,7 @@ module insitu_cache_core
 
                             //6.5 Write to bank
                             bank_write_req_o = 1;
+                            bank_write_meta_skip_o = &dec_cache_mask;
 
                             //6.6 Write to LRU
                             bank_write_LRU_req_o = 1;
@@ -2651,7 +2727,11 @@ module insitu_cache_core
 
         end : proc_refill
 
-        if (bank_write_req_o) begin
+        // With per-word forwarding in the pseudo_dual_port_tcdm_wrapper
+        // and WR_SAME_ADDR handling, same-cycle and next-cycle reads after
+        // a bank write always get correct data.  The countdown hazard is
+        // only needed when the wrapper lacks forwarding (PrereadReqHazardCycles > 0).
+        if (bank_write_req_o && PrereadReqHazardCycles > 0) begin
             preread_req_hazard_valid_d = 1'b1;
             preread_req_hazard_cnt_d = PrereadReqHazardCntWidth'(PrereadReqHazardCycles);
             preread_req_hazard_depth_d = bank_write_addr_o;
