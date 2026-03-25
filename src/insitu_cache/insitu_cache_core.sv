@@ -182,11 +182,13 @@ module insitu_cache_core
 
 );
 
+`ifndef SYNTHESIS
     initial begin
         if ((LineBytes % PartSplit) != 0) begin
             $fatal(1, "PartSplit (%0d) must divide line bytes (%0d).", PartSplit, LineBytes);
         end
     end
+`endif
 
     //////////////////////////////////////
     //        Local Parameters          //
@@ -286,8 +288,10 @@ module insitu_cache_core
         bit_base = MshrPadBits + (idx * InfoStoreWidth);
         byte_base = bit_base / ByteWidth;
         byte_end = (bit_base + InfoStoreWidth + ByteWidth - 1) / ByteWidth;
-        for (int bt = byte_base; bt < byte_end; bt++) begin
-            mask[bt] = 1'b1;
+        for (int bt = 0; bt < CacheLineWidth/ByteWidth; bt++) begin
+            if ((bt >= byte_base) && (bt < byte_end)) begin
+                mask[bt] = 1'b1;
+            end
         end
         return mask;
     endfunction

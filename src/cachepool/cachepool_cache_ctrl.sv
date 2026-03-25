@@ -213,6 +213,7 @@ module cachepool_cache_ctrl #(
     bypass_info_t                                                         bypass;
   } coalescer_xbar_info_union_t;
 
+  `ifndef SYNTHESIS
   // Ensure the packed union members overlay cleanly
   initial begin
     if ($bits(bypass_info_t) != $bits(coal_cache_info_t)) begin
@@ -220,6 +221,7 @@ module cachepool_cache_ctrl #(
             $bits(bypass_info_t), $bits(coal_cache_info_t));
     end
   end
+  `endif
 
 
   //////////////////////////////////////

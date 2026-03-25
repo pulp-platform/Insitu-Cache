@@ -222,6 +222,7 @@ module insitu_cache_tcdm_wrapper
     } down_req_t;
 
     // Guard against truncating cache metadata in tag/meta banks.
+`ifndef SYNTHESIS
     initial begin
         if (TagWidth < $bits(cache_meta_t)) begin
             $error("TagWidth (%0d) is smaller than cache_meta_t (%0d); update L1D_TAG_DATA_WIDTH for byte masks.",
@@ -234,6 +235,7 @@ module insitu_cache_tcdm_wrapper
                    PartSplit, (CacheLineWidth/WordWidth));
         end
     end
+`endif
 
     typedef enum logic[2:0] {
         SYNC_CTRL_IDLE = '0,
@@ -1541,12 +1543,14 @@ module pseudo_dual_port_tcdm_wrapper #(
             word_write_en,
             '0, clk_i, rst_ni)
 
+    // synopsys translate_off
     initial begin
         if ((PartSplit > 1) && ((NumWordsPerLine % PartSplit) != 0)) begin
             $fatal(1, "PartSplit (%0d) must divide NumWordsPerLine (%0d).",
                    PartSplit, NumWordsPerLine);
         end
     end
+    // synopsys translate_on
 
     //////////////////////////////////////
     //        Instance Modules          //
