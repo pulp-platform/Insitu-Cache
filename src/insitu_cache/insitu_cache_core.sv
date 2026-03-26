@@ -282,17 +282,13 @@ module insitu_cache_core
         automatic cache_mask_t mask;
         automatic int unsigned bit_base;
         automatic int unsigned byte_base;
-        automatic int unsigned byte_end;
+        automatic cache_mask_t slot_mask;
         mask = '0;
         // Use byte-aligned subarray slots to avoid overlap between adjacent infos.
         bit_base = MshrPadBits + (idx * InfoStoreWidth);
         byte_base = bit_base / ByteWidth;
-        byte_end = (bit_base + InfoStoreWidth + ByteWidth - 1) / ByteWidth;
-        for (int bt = 0; bt < CacheLineWidth/ByteWidth; bt++) begin
-            if ((bt >= byte_base) && (bt < byte_end)) begin
-                mask[bt] = 1'b1;
-            end
-        end
+        slot_mask = cache_mask_t'({(InfoStoreWidth/ByteWidth){1'b1}});
+        mask = slot_mask << byte_base;
         return mask;
     endfunction
 
