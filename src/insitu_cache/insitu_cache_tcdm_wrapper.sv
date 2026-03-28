@@ -1174,19 +1174,29 @@ module insitu_cache_tcdm_wrapper
     end
 
     way_ptr_t [SetAssociativity-1:0] lru_read_data;
-    way_ptr_t [SetAssociativity-1:0] lru_meta_unused; // discarded LRU from meta SRAM
-    way_ptr_t [CacheBankDepth-1:0][SetAssociativity-1:0] lru_rf;
+    way_ptr_t [SetAssociativity-1:0] lru_meta_unused;
 
-    always_comb begin
-        lru_read_data = lru_rf[bank_read_cache_addr_q];
-    end
+    if (!UseHashWaySelect) begin : gen_lru_rf
+        // LRU mode: full register file eliminates meta SRAM write on
+        // read hits (the LRU update goes to the RF, not the SRAM).
+        way_ptr_t [CacheBankDepth-1:0][SetAssociativity-1:0] lru_rf;
 
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            lru_rf <= '0;
-        end else if (bank_write_LRU_req || bank_write_cache_req) begin
-            lru_rf[bank_write_cache_addr] <= bank_write_cache_LRU;
+        always_comb begin
+            lru_read_data = lru_rf[bank_read_cache_addr_q];
         end
+
+        always_ff @(posedge clk_i or negedge rst_ni) begin
+            if (!rst_ni) begin
+                lru_rf <= '0;
+            end else if (bank_write_LRU_req || bank_write_cache_req) begin
+                lru_rf[bank_write_cache_addr] <= bank_write_cache_LRU;
+            end
+        end
+    end else begin : gen_no_lru_rf
+        // Hash mode: no LRU RF — way selection uses hash, not LRU.
+        // Read LRU from meta SRAM so the encoder's LRU_array_update
+        // still gets input for pendline_cnt tracking.
+        assign lru_read_data = lru_meta_unused;
     end
 
     // ── Dirty register file: true dual-port (1R + 1W per cycle) ──
