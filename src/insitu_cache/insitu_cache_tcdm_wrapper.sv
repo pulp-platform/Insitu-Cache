@@ -1193,13 +1193,13 @@ module insitu_cache_tcdm_wrapper
             end
         end
     end else begin : gen_no_lru_rf
-        // Hash mode: no LRU RF — way selection uses hash, not LRU.
+        // Hash mode: no LRU RF -- way selection uses hash, not LRU.
         // Read LRU from meta SRAM so the encoder's LRU_array_update
         // still gets input for pendline_cnt tracking.
         assign lru_read_data = lru_meta_unused;
     end
 
-    // ── Dirty register file: true dual-port (1R + 1W per cycle) ──
+    // -- Dirty register file: true dual-port (1R + 1W per cycle) --
     // Separating dirty from meta SRAM so that on write hits where
     // cache_mask is already all-1s, the meta SRAM write can be
     // skipped entirely (dirty and LRU handled by register files).
@@ -1264,7 +1264,8 @@ module insitu_cache_tcdm_wrapper
             .DEPTH              (CacheBankDepth),
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
             .WordWidth          (WordWidth),
-            .ByteWidth          (ByteWidth)
+            .ByteWidth          (ByteWidth),
+            .UseForwardingBuffer(1'b0),
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
@@ -1348,7 +1349,8 @@ module insitu_cache_tcdm_wrapper
             .NumWordsPerLine    (1),
             .WordWidth          ($bits(cache_meta_t)),
             .ByteWidth          ($bits(cache_meta_t)),
-            .AllowReadDuringWrite (1'b0)
+            .AllowReadDuringWrite (1'b0),
+            .UseForwardingBuffer(1'b0),
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1737,6 +1739,12 @@ module insitu_cache_bank_access_controller #(
     /// pseudo_dual_port has WR_SAME_ADDR bypass and there is no folded
     /// banking that could silently drop the read).
     parameter bit           AllowReadDuringWrite    = 1'b0,
+    /// Enable 1-entry write-back forwarding buffer.  Transparent to the
+    /// FSM: same handshake, same timing.  Buffer caches 1 SRAM row;
+    /// matching reads return buffer data, writes merge into buffer.
+    /// Dirty data written back on address change.
+    parameter bit           UseForwardingBuffer     = 1'b0,
+    /// Log forwarding buffer statistics at end of simulation
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. Byte mask type.
@@ -1800,9 +1808,40 @@ module insitu_cache_bank_access_controller #(
     `FFARN (access_stall_addr_q, access_stall_addr_d, '0, clk_i, rst_ni)
     `FFARN (access_stall_mask_q, access_stall_mask_d, '0, clk_i, rst_ni)
 
+    //////////////////////////////////////
+    //     Forwarding Buffer Instance   //
+    //////////////////////////////////////
+
+    data_t fwd_rdata;
+    logic  fwd_hit;
+
+    sram_forwarding_buffer #(
+        .Depth          (DEPTH),
+        .NumWordsPerLine(NumWordsPerLine),
+        .WordWidth      (WordWidth),
+        .ByteWidth      (ByteWidth),
+        .Enable         (UseForwardingBuffer),
+    ) i_fwd_buf (
+        .clk_i,
+        .rst_ni,
+        .rd_addr_i   (downstream_read_addr_o),
+        .rd_valid_i  (downstream_read_valid_o),
+        .rd_ready_i  (downstream_read_ready_i),
+        .wr_addr_i   (downstream_write_addr_o),
+        .wr_data_i   (downstream_write_data_o),
+        .wr_mask_i   (downstream_write_mask_o),
+        .wr_req_i    (downstream_write_req_o),
+        .sram_rdata_i(downstream_read_data_i),
+        .fwd_rdata_o (fwd_rdata),
+        .fwd_hit_o   (fwd_hit),
+        .stat_rd_hit_o  (),
+        .stat_rd_miss_o (),
+        .stat_wr_merge_o(),
+        .stat_wr_inval_o()
+    );
 
     //////////////////////////////////////
-    //        Access CTRL Logics        //
+    //   Access CTRL Logics (UNCHANGED) //
     //////////////////////////////////////
 
     always_comb begin
@@ -1815,13 +1854,15 @@ module insitu_cache_bank_access_controller #(
         downstream_read_valid_o = upstream_read_valid_i;
         downstream_write_req_o  = upstream_write_req_i;
 
-        upstream_read_data_o    = downstream_read_data_i;
+        // Read data: buffer intercept (only change from original)
+        upstream_read_data_o    = fwd_rdata;
+
         downstream_read_addr_o  = upstream_read_addr_i;
         downstream_write_addr_o = upstream_write_addr_i;
         downstream_write_data_o = upstream_write_data_i;
         downstream_write_mask_o = upstream_write_mask_i;
 
-        /*FSM*/
+        /*FSM -- completely unchanged*/
         case (access_status_q)
             ACCESS_THROUGH: begin
                 if (upstream_write_req_i == 1'b1) begin

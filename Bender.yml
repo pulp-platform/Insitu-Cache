@@ -20,6 +20,7 @@ sources:
     files:
     #level1
     - src/insitu_cache/insitu_cache_pkg.sv
+    - src/utilities/sram_forwarding_buffer.sv
     - src/utilities/pseudo_dual_port_bank.sv
     - src/utilities/pseudo_dual_port_way.sv
     - src/utilities/pseudo_dual_port_fifo.sv
