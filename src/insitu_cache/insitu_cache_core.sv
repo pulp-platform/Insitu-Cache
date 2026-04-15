@@ -178,7 +178,12 @@ module insitu_cache_core
     /// When asserted with bank_read_valid_o, the data bank read can be
     /// skipped (write requests only need meta to verify the hit; the data
     /// write uses byte masking so no old data merge is required).
-    output logic                                            bank_read_data_skip_o
+    output logic                                            bank_read_data_skip_o,
+    /// Forwarding buffer absorbed the data write (combinational, from
+    /// the written way's data bank access controller).  When high, the
+    /// write-read hazard can be relaxed because the buffer guarantees
+    /// the merged data is immediately available for subsequent reads.
+    input  logic                                            bank_write_data_buf_hit_i
 
 );
 
@@ -787,10 +792,14 @@ module insitu_cache_core
     // The meta/data banks are read with latency, so a request to the same cache line
     // must not issue in the same cycle that line is being written back. This needs
     // to cover refill writes to VALID as well, not only pending-line updates.
+    // No hazard when the forwarding buffer absorbed the data write:
+    // the buffer guarantees merged data is available for the next read.
     assign upstream_req_issue_hazard_now = upstream_req_valid_i & bank_write_req_o &
+                                           ~bank_write_data_buf_hit_i &
                                            (bank_write_addr_o == upstream_req_depth_tmp) &
                                            (bank_write_cache_tag_o[bank_write_way_o] == upstream_req_tag_tmp);
     assign req_buf_issue_hazard_now = req_buf_valid_q & bank_write_req_o &
+                                      ~bank_write_data_buf_hit_i &
                                       (bank_write_addr_o == req_buf_depth_tmp) &
                                       (bank_write_cache_tag_o[bank_write_way_o] == req_buf_tag_tmp);
     assign req_buf_push = upstream_req_valid_i & upstream_req_ready_o;
@@ -2731,7 +2740,7 @@ module insitu_cache_core
         // and WR_SAME_ADDR handling, same-cycle and next-cycle reads after
         // a bank write always get correct data.  The countdown hazard is
         // only needed when the wrapper lacks forwarding (PrereadReqHazardCycles > 0).
-        if (bank_write_req_o && PrereadReqHazardCycles > 0) begin
+        if (bank_write_req_o && !bank_write_data_buf_hit_i && PrereadReqHazardCycles > 0) begin
             preread_req_hazard_valid_d = 1'b1;
             preread_req_hazard_cnt_d = PrereadReqHazardCntWidth'(PrereadReqHazardCycles);
             preread_req_hazard_depth_d = bank_write_addr_o;

@@ -371,6 +371,7 @@ module insitu_cache_tcdm_wrapper
 
     logic                   [SetAssociativity - 1 : 0]      data_bank_read_ready;
     logic                   [SetAssociativity - 1 : 0]      meta_bank_read_ready;
+    logic                   [SetAssociativity - 1 : 0]      data_bank_write_hit;
 
     cache_meta_t            [SetAssociativity - 1 : 0][NumMetaBankPerWay-1:0] tcdm_meta_rdata_int;
     cache_meta_t            [SetAssociativity - 1 : 0][NumMetaBankPerWay-1:0] tcdm_meta_wdata_int;
@@ -867,6 +868,12 @@ module insitu_cache_tcdm_wrapper
     /*  Cache Core  */
     /****************/
 
+    // Forwarding buffer write hit for the written way's data bank.
+    // When high, the data write was absorbed by the buffer and the
+    // write-read hazard in the core can be relaxed.
+    logic bank_write_data_buf_hit;
+    assign bank_write_data_buf_hit = data_bank_write_hit[proc_write_cache_way];
+
     insitu_cache_core #(
         .ReqAddrWidth    (ReqAddrWidth),
         .CacheLineWidth  (CacheLineWidth),
@@ -952,7 +959,8 @@ module insitu_cache_tcdm_wrapper
         .bank_write_LRU_req_o           (proc_write_LRU_req),
         .bank_write_cache_LRU_o         (proc_write_cache_LRU),
         .bank_write_meta_skip_o         (proc_write_meta_skip),
-        .bank_read_data_skip_o          (proc_read_data_skip)
+        .bank_read_data_skip_o          (proc_read_data_skip),
+        .bank_write_data_buf_hit_i      (bank_write_data_buf_hit)
     );
 
     /***************************/
@@ -1266,6 +1274,9 @@ module insitu_cache_tcdm_wrapper
             .WordWidth          (WordWidth),
             .ByteWidth          (ByteWidth),
             .UseForwardingBuffer(1'b0),
+            .PartSplit          (PartSplit),
+            .UseSpecWbIdle      (1'b0),
+            .UseSpecWbAddrTrans (1'b0)
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
@@ -1274,6 +1285,8 @@ module insitu_cache_tcdm_wrapper
             .upstream_read_valid_i       (bank_read_cache_valid & bank_read_way_mask_sel[i]),
             .upstream_read_ready_o       (data_bank_read_ready[i]),
             .upstream_read_data_o        (bank_read_cache_data[i]),
+            .upstream_read_part_idx_i    (bank_read_part_idx_sel),
+            .upstream_read_all_parts_i   (bank_read_all_parts_sel),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
             .upstream_write_req_i        (bank_write_cache_req),
@@ -1290,7 +1303,8 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_data_o     (gnt_data_bank_write_data[i]),
             .downstream_write_mask_o     (gnt_data_bank_write_mask[i]),
 
-            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
+            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i])),
+            .fwd_wr_hit_o                (data_bank_write_hit[i])
 
         );
 
@@ -1350,7 +1364,10 @@ module insitu_cache_tcdm_wrapper
             .WordWidth          ($bits(cache_meta_t)),
             .ByteWidth          ($bits(cache_meta_t)),
             .AllowReadDuringWrite (1'b0),
-            .UseForwardingBuffer(1'b0),
+            .UseForwardingBuffer(1'b1),
+            .PartSplit          (1),
+            .UseSpecWbIdle      (1'b1),
+            .UseSpecWbAddrTrans (1'b1)
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1359,6 +1376,8 @@ module insitu_cache_tcdm_wrapper
             .upstream_read_valid_i       (bank_read_cache_valid & bank_read_way_mask_sel[i]),
             .upstream_read_ready_o       (meta_bank_read_ready[i]),
             .upstream_read_data_o        (cache_meta_read_data[i]),
+            .upstream_read_part_idx_i    ('0),
+            .upstream_read_all_parts_i   (1'b1),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
             .upstream_write_req_i        (proc_write_select ? meta_proc_write_req :
@@ -1376,7 +1395,8 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_data_o     (gnt_meta_bank_write_data[i]),
             .downstream_write_mask_o     (gnt_meta_bank_write_mask[i]),
 
-            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i]))
+            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i])),
+            .fwd_wr_hit_o                ()
 
         );
 
@@ -1739,12 +1759,22 @@ module insitu_cache_bank_access_controller #(
     /// pseudo_dual_port has WR_SAME_ADDR bypass and there is no folded
     /// banking that could silently drop the read).
     parameter bit           AllowReadDuringWrite    = 1'b0,
-    /// Enable 1-entry write-back forwarding buffer.  Transparent to the
-    /// FSM: same handshake, same timing.  Buffer caches 1 SRAM row;
-    /// matching reads return buffer data, writes merge into buffer.
-    /// Dirty data written back on address change.
+    /// Enable 1-entry write-back forwarding buffer.  Buffer caches 1
+    /// SRAM row; matching reads return buffer data, writes merge into
+    /// buffer.  Dirty data written back on address change.
     parameter bit           UseForwardingBuffer     = 1'b0,
-    /// Log forwarding buffer statistics at end of simulation
+    /// Number of parts per cache line (1 = no part gating).
+    /// Forwarding buffer tracks which part is cached and only reports
+    /// hits for that part, avoiding stale data with PartSplit > 1.
+    parameter int unsigned  PartSplit               = 1,
+    /// Speculative writeback: issue dirty-buffer writeback alongside
+    /// normal reads when the SRAM port is available.  The pseudo_dual_port
+    /// resolves R/W conflicts (WR_DIFF_BANK proceeds in 1 cycle).
+    /// Option A: writeback when buffer dirty and no upstream write.
+    parameter bit           UseSpecWbIdle           = 1'b0,
+    /// Option C: writeback when incoming read address differs from buffer
+    /// address (predict eviction, overlap writeback with miss fetch).
+    parameter bit           UseSpecWbAddrTrans      = 1'b0,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. Byte mask type.
@@ -1752,7 +1782,9 @@ module insitu_cache_bank_access_controller #(
     /// Dependent parameter, do not override. word type
     localparam type         word_t                  = logic [WordWidth-1:0],
     // Dependent parameter, do not override. Address type.
-    localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0]
+    localparam type         addr_t                  = logic [$clog2(DEPTH)-1:0],
+    // Dependent parameter, do not override. Part index width.
+    localparam int unsigned PartIdxWidth             = (PartSplit > 1) ? $clog2(PartSplit) : 1
     )(
     /// Clock, positive edge triggered.
     input  logic                                    clk_i,
@@ -1764,6 +1796,8 @@ module insitu_cache_bank_access_controller #(
     input  logic                                    upstream_read_valid_i,
     output logic                                    upstream_read_ready_o,
     output data_t                                   upstream_read_data_o,
+    input  logic [PartIdxWidth-1:0]                 upstream_read_part_idx_i,
+    input  logic                                    upstream_read_all_parts_i,
 
     /// Upstream write port
     input  addr_t                                   upstream_write_addr_i,
@@ -1784,7 +1818,9 @@ module insitu_cache_bank_access_controller #(
     output mask_t                                   downstream_write_mask_o,
 
     // Bank Access Grant
-    input  logic                                    bank_gnt_i
+    input  logic                                    bank_gnt_i,
+    // Forwarding buffer write hit (combinational, for hazard relaxation)
+    output logic                                    fwd_wr_hit_o
 );
     //////////////////////////////////////
     //        Types Definition          //
@@ -1808,12 +1844,39 @@ module insitu_cache_bank_access_controller #(
     `FFARN (access_stall_addr_q, access_stall_addr_d, '0, clk_i, rst_ni)
     `FFARN (access_stall_mask_q, access_stall_mask_d, '0, clk_i, rst_ni)
 
+    // -- Writeback state (forwarding buffer active mode) --
+    // wb_active: writeback write in progress (overrides main FSM outputs).
+    // wb_has_stall: after writeback, go to ACCESS_STALL to resend the
+    //              original write that triggered the dirty eviction.
+    logic wb_active_q, wb_active_d;
+    logic wb_has_stall_q, wb_has_stall_d;
+    `FFARN (wb_active_q, wb_active_d, 1'b0, clk_i, rst_ni)
+    `FFARN (wb_has_stall_q, wb_has_stall_d, 1'b0, clk_i, rst_ni)
+
     //////////////////////////////////////
     //     Forwarding Buffer Instance   //
     //////////////////////////////////////
 
     data_t fwd_rdata;
     logic  fwd_hit;
+    logic  fwd_rd_hit;     // combinational: buffer can serve this read
+    logic  fwd_wr_hit;     // combinational: buffer can absorb this write
+    logic  fwd_wb_needed;  // buffer dirty
+    addr_t fwd_wb_addr;    // writeback address
+    data_t fwd_wb_data;    // writeback data
+    mask_t fwd_wb_mask;    // writeback byte mask (only cached parts)
+
+    // -- Speculative writeback --
+    // Fire-and-forget: issue writeback alongside normal read when the
+    // SRAM port is available.  No stall on denial.
+    logic spec_wb_fire;
+
+    // Writeback done: fires on explicit writeback OR speculative writeback.
+    logic  fwd_wb_done;
+    assign fwd_wb_done = (wb_active_q & bank_gnt_i) | spec_wb_fire;
+
+    // Expose write hit for upstream hazard relaxation.
+    assign fwd_wr_hit_o = fwd_wr_hit;
 
     sram_forwarding_buffer #(
         .Depth          (DEPTH),
@@ -1821,19 +1884,38 @@ module insitu_cache_bank_access_controller #(
         .WordWidth      (WordWidth),
         .ByteWidth      (ByteWidth),
         .Enable         (UseForwardingBuffer),
+        .PartSplit      (PartSplit)
     ) i_fwd_buf (
         .clk_i,
         .rst_ni,
-        .rd_addr_i   (downstream_read_addr_o),
-        .rd_valid_i  (downstream_read_valid_o),
-        .rd_ready_i  (downstream_read_ready_i),
-        .wr_addr_i   (downstream_write_addr_o),
-        .wr_data_i   (downstream_write_data_o),
-        .wr_mask_i   (downstream_write_mask_o),
-        .wr_req_i    (downstream_write_req_o),
-        .sram_rdata_i(downstream_read_data_i),
-        .fwd_rdata_o (fwd_rdata),
-        .fwd_hit_o   (fwd_hit),
+        // Upstream signals (for hit checking and write merge)
+        .rd_addr_i      (upstream_read_addr_i),
+        .rd_valid_i     (upstream_read_valid_i),
+        .rd_ready_i     (upstream_read_ready_o),
+        .rd_part_idx_i  (upstream_read_part_idx_i),
+        .rd_all_parts_i (upstream_read_all_parts_i),
+        .wr_addr_i      (upstream_write_addr_i),
+        .wr_data_i      (upstream_write_data_i),
+        .wr_mask_i      (upstream_write_mask_i),
+        .wr_req_i       (upstream_write_req_i),
+        // SRAM tracking (gated downstream signals)
+        .sram_rd_issued_i(downstream_read_valid_o & downstream_read_ready_i),
+        .sram_rdata_i    (downstream_read_data_i),
+        .sram_wr_req_i   (downstream_write_req_o),
+        .sram_wr_addr_i  (downstream_write_addr_o),
+        // Combinational outputs
+        .rd_hit_comb_o  (fwd_rd_hit),
+        .wr_hit_comb_o  (fwd_wr_hit),
+        // Writeback
+        .wb_needed_o    (fwd_wb_needed),
+        .wb_addr_o      (fwd_wb_addr),
+        .wb_data_o      (fwd_wb_data),
+        .wb_mask_o      (fwd_wb_mask),
+        .wb_done_i      (fwd_wb_done),
+        // Read data
+        .fwd_rdata_o    (fwd_rdata),
+        .fwd_hit_o      (fwd_hit),
+        // Statistics
         .stat_rd_hit_o  (),
         .stat_rd_miss_o (),
         .stat_wr_merge_o(),
@@ -1841,20 +1923,40 @@ module insitu_cache_bank_access_controller #(
     );
 
     //////////////////////////////////////
-    //   Access CTRL Logics (UNCHANGED) //
+    //       Access CTRL Logics         //
     //////////////////////////////////////
+
+    // "Effective write": write that needs SRAM (not absorbed by buffer).
+    logic effective_write;
+    assign effective_write = upstream_write_req_i & !fwd_wr_hit;
+
+    // Speculative writeback trigger: buffer dirty, SRAM available, no
+    // conflicting write, and the trigger condition is met.
+    assign spec_wb_fire = fwd_wb_needed & !wb_active_q
+        & (access_status_q == ACCESS_THROUGH)
+        & !effective_write
+        & !(upstream_write_req_i & fwd_wr_hit)
+        & bank_gnt_i
+        & ( (UseSpecWbIdle      & !upstream_write_req_i)
+          | (UseSpecWbAddrTrans & upstream_read_valid_i
+             & !fwd_rd_hit
+             & (upstream_read_addr_i != fwd_wb_addr)) );
 
     always_comb begin
         access_status_d         = access_status_q;
         access_stall_data_d     = access_stall_data_q;
         access_stall_addr_d     = access_stall_addr_q;
         access_stall_mask_d     = access_stall_mask_q;
+        wb_active_d             = wb_active_q;
+        wb_has_stall_d          = wb_has_stall_q;
 
-        upstream_read_ready_o   = downstream_read_ready_i;
-        downstream_read_valid_o = upstream_read_valid_i;
-        downstream_write_req_o  = upstream_write_req_i;
+        // Defaults: buffer-aware gating.
+        // Read hit  -> serve from buffer (no SRAM read, upstream ready).
+        // Write hit -> absorb into buffer (no SRAM write).
+        upstream_read_ready_o   = fwd_rd_hit ? 1'b1 : downstream_read_ready_i;
+        downstream_read_valid_o = fwd_rd_hit ? 1'b0 : upstream_read_valid_i;
+        downstream_write_req_o  = fwd_wr_hit ? 1'b0 : upstream_write_req_i;
 
-        // Read data: buffer intercept (only change from original)
         upstream_read_data_o    = fwd_rdata;
 
         downstream_read_addr_o  = upstream_read_addr_i;
@@ -1862,48 +1964,107 @@ module insitu_cache_bank_access_controller #(
         downstream_write_data_o = upstream_write_data_i;
         downstream_write_mask_o = upstream_write_mask_i;
 
-        /*FSM -- completely unchanged*/
-        case (access_status_q)
-            ACCESS_THROUGH: begin
-                if (upstream_write_req_i == 1'b1) begin
-                    if (AllowReadDuringWrite && bank_gnt_i) begin
-                        // Safe path (meta banks): let the pseudo_dual_port
-                        // resolve the R/W conflict via WR_SAME_ADDR bypass.
-                        upstream_read_ready_o = downstream_read_ready_i;
-                    end else begin
-                        upstream_read_ready_o = '0;
+        // -- Writeback overlay: takes priority over the main FSM --
+        if (wb_active_q) begin
+            upstream_read_ready_o   = '0;
+            downstream_read_valid_o = '0;
+            downstream_write_req_o  = '0;
+            downstream_write_addr_o = fwd_wb_addr;
+            downstream_write_data_o = fwd_wb_data;
+            downstream_write_mask_o = fwd_wb_mask;
+            if (bank_gnt_i) begin
+                downstream_write_req_o = 1'b1;
+                wb_active_d = 1'b0;
+                if (wb_has_stall_q) begin
+                    // Original write saved in stall regs -- resend it.
+                    access_status_d = ACCESS_STALL;
+                    wb_has_stall_d = 1'b0;
+                end
+            end
+        end else begin
+            // -- Main FSM --
+            case (access_status_q)
+                ACCESS_THROUGH: begin
+                    if (effective_write) begin
+                        // Write needs SRAM. Block reads (unless AllowReadDuringWrite).
+                        if (fwd_wb_needed) begin
+                            // Dirty eviction before SRAM write: save the original
+                            // write in stall regs and start writeback.
+                            wb_active_d = 1'b1;
+                            wb_has_stall_d = 1'b1;
+                            access_stall_data_d = upstream_write_data_i;
+                            access_stall_addr_d = upstream_write_addr_i;
+                            access_stall_mask_d = upstream_write_mask_i;
+                            upstream_read_ready_o   = '0;
+                            downstream_read_valid_o = '0;
+                            downstream_write_req_o  = '0;
+                        end else begin
+                            if (AllowReadDuringWrite && bank_gnt_i) begin
+                                upstream_read_ready_o = downstream_read_ready_i;
+                            end else begin
+                                upstream_read_ready_o   = '0;
+                                downstream_read_valid_o = '0;
+                            end
+                            if (bank_gnt_i == '0) begin
+                                downstream_write_req_o = '0;
+                                access_status_d = ACCESS_STALL;
+                                access_stall_data_d = upstream_write_data_i;
+                                access_stall_addr_d = upstream_write_addr_i;
+                                access_stall_mask_d = upstream_write_mask_i;
+                            end
+                        end
+                    end else if (upstream_write_req_i && fwd_wr_hit) begin
+                        // Write absorbed by buffer -- SRAM port is free.
+                        // BUT: block reads to a different address that
+                        // would trigger an SRAM read and evict the
+                        // just-dirtied buffer without writeback.
+                        // Next cycle buf_dirty_q=1 triggers writeback.
+                        if (upstream_read_valid_i && !fwd_rd_hit) begin
+                            upstream_read_ready_o   = '0;
+                            downstream_read_valid_o = '0;
+                        end
+                    end else if (spec_wb_fire) begin
+                        // Speculative writeback: issue downstream write
+                        // alongside the read.  pseudo_dual_port resolves
+                        // the R/W conflict (WR_DIFF_BANK = hidden,
+                        // WR_CONFLICT = read retries next cycle).
+                        // No ACCESS_STALL: fire-and-forget.
+                        downstream_write_req_o  = 1'b1;
+                        downstream_write_addr_o = fwd_wb_addr;
+                        downstream_write_data_o = fwd_wb_data;
+                        downstream_write_mask_o = fwd_wb_mask;
+                    end else if (fwd_wb_needed && upstream_read_valid_i
+                                 && !fwd_rd_hit) begin
+                        // Read miss with dirty buffer: writeback first.
+                        // The read will retry after writeback completes.
+                        wb_active_d = 1'b1;
+                        wb_has_stall_d = 1'b0;
+                        upstream_read_ready_o   = '0;
                         downstream_read_valid_o = '0;
+                    end else if (bank_gnt_i == '0 && !fwd_rd_hit) begin
+                        upstream_read_ready_o   = '0;
+                        downstream_read_valid_o = '0;
+                        downstream_write_req_o  = '0;
                     end
-                    if (bank_gnt_i == '0) begin
-                        downstream_write_req_o = '0;
-                        access_status_d = ACCESS_STALL;
-                        access_stall_data_d = upstream_write_data_i;
-                        access_stall_addr_d = upstream_write_addr_i;
-                        access_stall_mask_d = upstream_write_mask_i;
-                    end
-                end else if (bank_gnt_i == '0) begin
-                    upstream_read_ready_o = '0;
+                end
+
+                ACCESS_STALL: begin
+                    upstream_read_ready_o   = '0;
                     downstream_read_valid_o = '0;
-                    downstream_write_req_o = '0;
+                    downstream_write_req_o  = '0;
+
+                    downstream_write_addr_o = access_stall_addr_q;
+                    downstream_write_data_o = access_stall_data_q;
+                    downstream_write_mask_o = access_stall_mask_q;
+                    if (bank_gnt_i) begin
+                        downstream_write_req_o = 1'b1;
+                        access_status_d = ACCESS_THROUGH;
+                    end
                 end
-            end
 
-            ACCESS_STALL: begin
-                upstream_read_ready_o = '0;
-                downstream_read_valid_o = '0;
-                downstream_write_req_o = '0;
-
-                downstream_write_addr_o = access_stall_addr_q;
-                downstream_write_data_o = access_stall_data_q;
-                downstream_write_mask_o = access_stall_mask_q;
-                if (bank_gnt_i) begin
-                    downstream_write_req_o = 1'b1;
-                    access_status_d = ACCESS_THROUGH;
-                end
-            end
-
-            default : access_status_d = ACCESS_THROUGH;
-        endcase
+                default : access_status_d = ACCESS_THROUGH;
+            endcase
+        end
     end
 
 endmodule : insitu_cache_bank_access_controller
