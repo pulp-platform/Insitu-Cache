@@ -87,7 +87,11 @@ module sram_forwarding_buffer #(
     output logic [31:0] stat_rd_hit_o,
     output logic [31:0] stat_rd_miss_o,
     output logic [31:0] stat_wr_merge_o,
-    output logic [31:0] stat_wr_inval_o
+    output logic [31:0] stat_wr_inval_o,
+    output logic [31:0] stat_rd_total_o,   // total read acceptances
+    output logic [31:0] stat_wr_total_o,   // total write requests with data
+    output logic [31:0] stat_sram_rd_o,    // SRAM reads issued
+    output logic [31:0] stat_wb_o          // writeback completions
 );
 
     // -- Buffer state --
@@ -115,11 +119,19 @@ module sram_forwarding_buffer #(
     logic [31:0] stat_rd_miss;
     logic [31:0] stat_wr_merge;
     logic [31:0] stat_wr_inval;
+    logic [31:0] stat_rd_total;
+    logic [31:0] stat_wr_total;
+    logic [31:0] stat_sram_rd;
+    logic [31:0] stat_wb;
 
     assign stat_rd_hit_o   = stat_rd_hit;
     assign stat_rd_miss_o  = stat_rd_miss;
     assign stat_wr_merge_o = stat_wr_merge;
     assign stat_wr_inval_o = stat_wr_inval;
+    assign stat_rd_total_o = stat_rd_total;
+    assign stat_wr_total_o = stat_wr_total;
+    assign stat_sram_rd_o  = stat_sram_rd;
+    assign stat_wb_o       = stat_wb;
 
     // -- Read part match --
     // Hit only when the requested part is actually cached.
@@ -216,7 +228,19 @@ module sram_forwarding_buffer #(
             stat_rd_miss        <= '0;
             stat_wr_merge       <= '0;
             stat_wr_inval       <= '0;
+            stat_rd_total       <= '0;
+            stat_wr_total       <= '0;
+            stat_sram_rd        <= '0;
+            stat_wb             <= '0;
         end else begin
+            // -- Aggregate counters --
+            if (sram_rd_issued_i)
+                stat_sram_rd <= stat_sram_rd + 1;
+            if (wr_req_i && has_wr_data)
+                stat_wr_total <= stat_wr_total + 1;
+            if (wb_done_i)
+                stat_wb <= stat_wb + 1;
+
             // -- Track SRAM reads in flight --
             sram_rd_pend_q <= sram_rd_issued_i;
             if (sram_rd_issued_i) begin
@@ -299,6 +323,7 @@ module sram_forwarding_buffer #(
 
             // -- Read hit detection (registered for 1-cycle latency) --
             if (rd_valid_i & rd_ready_i) begin
+                stat_rd_total <= stat_rd_total + 1;
                 if (buf_valid_q && (buf_addr_q == rd_addr_i)
                     && rd_part_match && !sram_rd_pend_q) begin
                     buf_rd_hit_q  <= 1'b1;
@@ -317,5 +342,19 @@ module sram_forwarding_buffer #(
     // -- Output mux --
     assign fwd_rdata_o = (Enable && buf_rd_hit_q) ? buf_rd_data_q : sram_rdata_i;
     assign fwd_hit_o   = Enable & buf_rd_hit_q;
+
+`ifndef TARGET_SYNTHESIS
+    final begin
+        if (stat_rd_total > 0 || stat_wr_total > 0) begin
+            $display("[FWD_BUF %m] Enable=%0d PartSplit=%0d | RD: total=%0d hit=%0d miss=%0d (hit_rate=%0.1f%%) | WR: total=%0d merge=%0d inval=%0d (absorb_rate=%0.1f%%) | sram_rd=%0d wb=%0d",
+                Enable, PartSplit,
+                stat_rd_total, stat_rd_hit, stat_rd_miss,
+                (stat_rd_total > 0) ? 100.0 * real'(stat_rd_hit) / real'(stat_rd_total) : 0.0,
+                stat_wr_total, stat_wr_merge, stat_wr_inval,
+                (stat_wr_total > 0) ? 100.0 * real'(stat_wr_merge) / real'(stat_wr_total) : 0.0,
+                stat_sram_rd, stat_wb);
+        end
+    end
+`endif
 
 endmodule : sram_forwarding_buffer

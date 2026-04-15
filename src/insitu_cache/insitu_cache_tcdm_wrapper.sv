@@ -1919,7 +1919,11 @@ module insitu_cache_bank_access_controller #(
         .stat_rd_hit_o  (),
         .stat_rd_miss_o (),
         .stat_wr_merge_o(),
-        .stat_wr_inval_o()
+        .stat_wr_inval_o(),
+        .stat_rd_total_o(),
+        .stat_wr_total_o(),
+        .stat_sram_rd_o (),
+        .stat_wb_o      ()
     );
 
     //////////////////////////////////////
