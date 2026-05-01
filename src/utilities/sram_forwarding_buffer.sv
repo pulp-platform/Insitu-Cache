@@ -206,12 +206,8 @@ module sram_forwarding_buffer #(
     assign wr_buf_hit = buf_valid_q & (buf_addr_q == wr_addr_i)
                       & wr_parts_covered & has_wr_data & !sram_rd_pend_q;
     logic wr_concurrent_hit;
-    // ROLLBACK to HEAD baseline: concurrent-merge path disabled.
-    // Re-enable (along with the access-controller's spec-WB params) once
-    // the data-side meta/MSHR-subarray race is root-caused.
-    assign wr_concurrent_hit = 1'b0;
-    // Original: sram_rd_pend_q & (sram_rd_addr_q == wr_addr_i)
-    //         & wr_parts_covered_concurrent & has_wr_data;
+    assign wr_concurrent_hit = sram_rd_pend_q & (sram_rd_addr_q == wr_addr_i)
+                             & wr_parts_covered_concurrent & has_wr_data;
     // Full-line write can absorb directly when buffer can be safely replaced:
     //   - invalid OR clean (no writeback needed), OR
     //   - valid+dirty but same address (full write overrides dirty data).

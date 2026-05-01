@@ -1292,20 +1292,20 @@ module insitu_cache_tcdm_wrapper
             .NumWordsPerLine    (CacheLineWidth/WordWidth),
             .WordWidth          (WordWidth),
             .ByteWidth          (ByteWidth),
-            // ROLLBACK to HEAD baseline: data forwarding buffer DISABLED.
-            // The buffer-on configurations (with or without spec-WB) caused
-            // MSHR-subarray loss / read-refill protocol violations on the
-            // RLC kernel; until those are root-caused, keep the data path
-            // on the SRAM-direct route to preserve correctness.  The
-            // surrounding plumbing (full_cov, bank_write_buf_safe_bypass,
-            // SVAs) remains in place but is gated by UseForwardingBuffer
-            // and is a no-op when the buffer is off.
-            .AllowReadDuringWrite(1'b0),
-            .UseForwardingBuffer(1'b0),
+            // PERF mode: data forwarding buffer + spec-WB + AllowReadDuringWrite.
+            // Vector load: ~1 elem/cycle on warm hits (full bandwidth).
+            // Vector store: partial-coverage stores absorbed into buffer.
+            // KNOWN bug: RLC kernel hits a meta-side MSHR-subarray race
+            // (read refill did not reread / Response without outstanding)
+            // around 44.85 us; root-cause traced to meta spec-WB and is
+            // pending a real fix.  Use the rollback (UseForwardingBuffer=0)
+            // for RLC correctness; this config is for vector-rw perf runs.
+            .AllowReadDuringWrite(1'b1),
+            .UseForwardingBuffer(1'b1),
             .FwdBufEntries      (1),
             .PartSplit          (PartSplit),
-            .UseSpecWbIdle      (1'b0),
-            .UseSpecWbAddrTrans (1'b0)
+            .UseSpecWbIdle      (1'b1),
+            .UseSpecWbAddrTrans (1'b1)
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
