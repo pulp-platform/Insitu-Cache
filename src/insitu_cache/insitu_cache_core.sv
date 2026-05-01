@@ -183,7 +183,18 @@ module insitu_cache_core
     /// the written way's data bank access controller).  When high, the
     /// write-read hazard can be relaxed because the buffer guarantees
     /// the merged data is immediately available for subsequent reads.
-    input  logic                                            bank_write_data_buf_hit_i
+    input  logic                                            bank_write_data_buf_hit_i,
+
+    /// Forwarding-buffer FULL-COVERAGE hint, paired with bank_write_data_buf_hit_i.
+    /// 1 iff the absorbing entry will hold the WHOLE line after this write
+    /// (i.e. buf_all_parts==1 OR wr_full_hit OR wr_concurrent_hit with
+    /// sram_rd_all_parts==1).  Only when this bit is 1 is it safe to bypass
+    /// the bank-write/upstream-read same-line hazard: a partial-coverage
+    /// absorption leaves OTHER parts in SRAM, where a same-line read for a
+    /// different part would silently get stale data.  Pin to 1'b0 in
+    /// configurations without a forwarding buffer to fall back to the
+    /// conservative (always-stall) behaviour.
+    input  logic                                            bank_write_data_buf_full_cov_i
 
 );
 
@@ -792,14 +803,23 @@ module insitu_cache_core
     // The meta/data banks are read with latency, so a request to the same cache line
     // must not issue in the same cycle that line is being written back. This needs
     // to cover refill writes to VALID as well, not only pending-line updates.
-    // No hazard when the forwarding buffer absorbed the data write:
-    // the buffer guarantees merged data is available for the next read.
+    //
+    // No hazard when the forwarding buffer absorbed the data write AND the
+    // absorbing entry holds the WHOLE line: any subsequent same-line read,
+    // for any part, will hit the buffer and get the merged data.
+    //
+    // PARTIAL-COVERAGE ABSORPTION (`buf_hit & ~buf_full_cov`) is NOT safe
+    // to bypass: the buffer holds only one part; reads to OTHER parts of
+    // the same line miss the buffer and fall through to SRAM, which has
+    // stale data for those parts.  Treat it like an SRAM write -- stall.
+    logic                                                   bank_write_buf_safe_bypass;
+    assign bank_write_buf_safe_bypass = bank_write_data_buf_hit_i & bank_write_data_buf_full_cov_i;
     assign upstream_req_issue_hazard_now = upstream_req_valid_i & bank_write_req_o &
-                                           ~bank_write_data_buf_hit_i &
+                                           ~bank_write_buf_safe_bypass &
                                            (bank_write_addr_o == upstream_req_depth_tmp) &
                                            (bank_write_cache_tag_o[bank_write_way_o] == upstream_req_tag_tmp);
     assign req_buf_issue_hazard_now = req_buf_valid_q & bank_write_req_o &
-                                      ~bank_write_data_buf_hit_i &
+                                      ~bank_write_buf_safe_bypass &
                                       (bank_write_addr_o == req_buf_depth_tmp) &
                                       (bank_write_cache_tag_o[bank_write_way_o] == req_buf_tag_tmp);
     assign req_buf_push = upstream_req_valid_i & upstream_req_ready_o;
@@ -2740,7 +2760,12 @@ module insitu_cache_core
         // and WR_SAME_ADDR handling, same-cycle and next-cycle reads after
         // a bank write always get correct data.  The countdown hazard is
         // only needed when the wrapper lacks forwarding (PrereadReqHazardCycles > 0).
-        if (bank_write_req_o && !bank_write_data_buf_hit_i && PrereadReqHazardCycles > 0) begin
+        //
+        // Use `bank_write_buf_safe_bypass` instead of plain `buf_hit_i`:
+        // a partial-coverage buffer absorption still leaves stale data in
+        // SRAM for the OTHER parts of the line, so the countdown must arm
+        // exactly like a real SRAM write.
+        if (bank_write_req_o && !bank_write_buf_safe_bypass && PrereadReqHazardCycles > 0) begin
             preread_req_hazard_valid_d = 1'b1;
             preread_req_hazard_cnt_d = PrereadReqHazardCntWidth'(PrereadReqHazardCycles);
             preread_req_hazard_depth_d = bank_write_addr_o;
@@ -2835,6 +2860,54 @@ if (LogLifeCycle) begin
         $display("*********************************************************************");
     end
 end
+
+// ---------------------------------------------------------------------------
+// Cache-core diagnostic SVAs (CC-*) -- DISABLED
+//
+// These checked the cache's miss / preread / refill addresses against the DRAM
+// region (>= 0x8000_0000).  Re-enable by defining ENABLE_CC_DRAM_ASSERTS at
+// compile time.  They are noisy when the upstream core dereferences a bad
+// pointer (the cache faithfully relays the bad address) and only repeat what
+// the cluster crossbar's IllegalMemAccess assertion already reports.
+// ---------------------------------------------------------------------------
+`ifdef ENABLE_CC_DRAM_ASSERTS
+localparam logic [ReqAddrWidth-1:0] DiagDramBase = 32'h8000_0000;
+
+property p_CC1_miss_addr_in_dram;
+    @(posedge clk_i) disable iff (!rst_ni)
+    downstream_req_miss_valid_o |->
+        (downstream_req_miss_addr_o >= DiagDramBase);
+endproperty
+CC1_MissAddrInDram: assert property (p_CC1_miss_addr_in_dram)
+    else $error("CC-1 violated @%0t %m: downstream miss addr=0x%08h is outside DRAM",
+                $time, downstream_req_miss_addr_o);
+
+property p_CC2_miss_fifo_in_addr_in_dram;
+    @(posedge clk_i) disable iff (!rst_ni)
+    miss_fifo_push |-> (miss_fifo_in.addr >= DiagDramBase);
+endproperty
+CC2_MissFifoInAddr: assert property (p_CC2_miss_fifo_in_addr_in_dram)
+    else $error("CC-2 violated @%0t %m: miss_fifo push addr=0x%08h",
+                $time, miss_fifo_in.addr);
+
+property p_CC3_preread_req_addr_in_dram;
+    @(posedge clk_i) disable iff (!rst_ni)
+    (preread_task_q.valid && !preread_task_q.is_refill) |->
+        (preread_task_q.task_pay.request.addr >= DiagDramBase);
+endproperty
+CC3_PrereadReqAddr: assert property (p_CC3_preread_req_addr_in_dram)
+    else $error("CC-3 violated @%0t %m: preread_task addr=0x%08h",
+                $time, preread_task_q.task_pay.request.addr);
+
+property p_CC4_refill_stall_addr_in_dram;
+    @(posedge clk_i) disable iff (!rst_ni)
+    (preread_task_q.valid && preread_task_q.is_refill) |->
+        (fsm_refill_stall_q.addr >= DiagDramBase);
+endproperty
+CC4_RefillStallAddr: assert property (p_CC4_refill_stall_addr_in_dram)
+    else $error("CC-4 violated @%0t %m: refill_stall addr=0x%08h",
+                $time, fsm_refill_stall_q.addr);
+`endif // ENABLE_CC_DRAM_ASSERTS
 
 `endif
 

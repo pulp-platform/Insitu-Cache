@@ -509,7 +509,10 @@ module insitu_cache_top #(
         .bank_write_cache_data_o        (bank_write_cache_data),
         .bank_write_data_mask_o         (bank_write_data_mask),
         .bank_write_LRU_req_o           (bank_write_LRU_req),
-        .bank_write_cache_LRU_o         (bank_write_cache_LRU)
+        .bank_write_cache_LRU_o         (bank_write_cache_LRU),
+        // No data forwarding buffer in this top-level wrapper variant.
+        .bank_write_data_buf_hit_i      (1'b0),
+        .bank_write_data_buf_full_cov_i (1'b0)
     );
 
     /***************************/

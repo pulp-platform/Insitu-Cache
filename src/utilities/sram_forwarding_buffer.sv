@@ -72,6 +72,14 @@ module sram_forwarding_buffer #(
     output logic   rd_hit_comb_o,  // buffer can serve this read (suppress SRAM read)
     output logic   wr_hit_comb_o,  // buffer can absorb this write (suppress SRAM write)
 
+    // -- Coverage hint for hazard bypass --
+    // 1 iff this absorption will leave the buffer holding the WHOLE line.
+    // Cache core uses this -- not wr_hit_comb_o -- to safely bypass the
+    // bank-write/upstream-read same-line hazard, because partial-coverage
+    // absorptions leave OTHER parts in SRAM, where a subsequent same-line
+    // read for a different part would silently get stale data.
+    output logic   wr_full_coverage_o,
+
     // -- Writeback interface --
     output logic   wb_needed_o,    // buffer dirty, may need writeback before miss
     output addr_t  wb_addr_o,      // writeback address
@@ -180,12 +188,51 @@ module sram_forwarding_buffer #(
     assign rd_hit_comb_o = Enable & buf_valid_q & (buf_addr_q == rd_addr_i)
                          & rd_part_match & !sram_rd_pend_q;
 
-    // Write hit: buffer has the address, write has actual data to merge,
-    // and not during SRAM populate.
+    // Write hit: three paths --
+    //   Normal:     buffer has the address (not during SRAM populate).
+    //   Concurrent: SRAM read arriving for the SAME address -- the
+    //               sequential merge captures write+SRAM data together.
+    //   Full-line:  write mask covers all bytes -- we don't need the
+    //               pre-existing SRAM data; write directly into buffer.
+    //               Safe when buffer is clean or already at same address.
     logic has_wr_data;
     assign has_wr_data = |wr_mask_i;
-    assign wr_hit_comb_o = Enable & buf_valid_q & (buf_addr_q == wr_addr_i)
-                         & wr_parts_covered & has_wr_data & !sram_rd_pend_q;
+
+    // Full-line write detection: all bytes being written.
+    logic wr_full_line;
+    assign wr_full_line = &wr_mask_i;
+
+    logic wr_buf_hit;
+    assign wr_buf_hit = buf_valid_q & (buf_addr_q == wr_addr_i)
+                      & wr_parts_covered & has_wr_data & !sram_rd_pend_q;
+    logic wr_concurrent_hit;
+    // ROLLBACK to HEAD baseline: concurrent-merge path disabled.
+    // Re-enable (along with the access-controller's spec-WB params) once
+    // the data-side meta/MSHR-subarray race is root-caused.
+    assign wr_concurrent_hit = 1'b0;
+    // Original: sram_rd_pend_q & (sram_rd_addr_q == wr_addr_i)
+    //         & wr_parts_covered_concurrent & has_wr_data;
+    // Full-line write can absorb directly when buffer can be safely replaced:
+    //   - invalid OR clean (no writeback needed), OR
+    //   - valid+dirty but same address (full write overrides dirty data).
+    logic wr_full_hit;
+    assign wr_full_hit = wr_full_line & has_wr_data & !sram_rd_pend_q
+                       & (!buf_valid_q | !buf_dirty_q
+                          | (buf_addr_q == wr_addr_i));
+
+    assign wr_hit_comb_o = Enable & (wr_buf_hit | wr_concurrent_hit | wr_full_hit);
+
+    // wr_full_coverage_o: AFTER this absorption, buffer holds the FULL line.
+    //   - wr_full_hit always sets buf_all_parts_q=1 next cycle.
+    //   - wr_buf_hit on an already-all-parts buffer keeps all_parts=1.
+    //   - wr_concurrent_hit when the in-flight SRAM read covers all parts
+    //     populates the buffer with all parts next cycle.
+    // Anything else is a partial-coverage absorption -- unsafe for the
+    // cache core's bank-write/upstream-read hazard bypass.
+    assign wr_full_coverage_o = Enable
+        & ( wr_full_hit
+          | (wr_buf_hit        & buf_all_parts_q)
+          | (wr_concurrent_hit & sram_rd_all_parts_q));
 
     // -- Writeback outputs --
     assign wb_needed_o = Enable & buf_dirty_q;
@@ -255,10 +302,11 @@ module sram_forwarding_buffer #(
                 buf_addr_q      <= sram_rd_addr_q;
                 buf_part_idx_q  <= sram_rd_part_idx_q;
                 buf_all_parts_q <= sram_rd_all_parts_q;
-                // Concurrent write merge: safe when the SRAM read covers
-                // all parts or PartSplit==1 (no zero-fill issue).
-                if (wr_req_i && (wr_addr_i == sram_rd_addr_q)
-                    && (PartSplit <= 1 || sram_rd_all_parts_q)) begin
+                // Concurrent write merge: safe when all written parts are
+                // in the SRAM-read part(s). wr_parts_covered_concurrent
+                // checks against sram_rd_part_idx_q.
+                if (wr_req_i && has_wr_data && (wr_addr_i == sram_rd_addr_q)
+                    && wr_parts_covered_concurrent) begin
                     for (int b = 0; b < MaskBits; b++) begin
                         if (wr_mask_i[b])
                             buf_data_q[b*ByteWidth +: ByteWidth] <=
@@ -283,8 +331,19 @@ module sram_forwarding_buffer #(
                     buf_dirty_q <= 1'b0;
                 end
             end else begin
+                // -- Full-line write: populate buffer directly, no SRAM --
+                // Takes priority over merge (provides all bytes).
+                if (wr_req_i && wr_full_hit) begin
+                    buf_data_q      <= wr_data_i;
+                    buf_addr_q      <= wr_addr_i;
+                    buf_valid_q     <= 1'b1;
+                    buf_all_parts_q <= 1'b1;
+                    buf_part_idx_q  <= '0;
+                    if (Enable) buf_dirty_q <= 1'b1;
+                    stat_wr_merge <= stat_wr_merge + 1;
+                end
                 // -- Write merge: same address, parts covered --
-                if (wr_req_i && can_merge) begin
+                else if (wr_req_i && can_merge) begin
                     for (int b = 0; b < MaskBits; b++)
                         if (wr_mask_i[b])
                             buf_data_q[b*ByteWidth +: ByteWidth] <=
@@ -294,15 +353,18 @@ module sram_forwarding_buffer #(
                 end
 
                 // -- Write to different address, buffer clean: invalidate --
-                if (wr_req_i && buf_valid_q && (wr_addr_i != buf_addr_q)
-                    && !buf_dirty_q) begin
+                // (Skipped for wr_full_hit since we're replacing the buffer.)
+                if (wr_req_i && !wr_full_hit && buf_valid_q
+                    && (wr_addr_i != buf_addr_q) && !buf_dirty_q) begin
                     buf_valid_q <= 1'b0;
                     stat_wr_inval <= stat_wr_inval + 1;
                 end
 
                 // -- Write to same address, parts NOT covered, clean:
                 //    invalidate (SRAM will have newer data) --
-                if (wr_req_i && buf_valid_q && (wr_addr_i == buf_addr_q)
+                // (Skipped for wr_full_hit since full-line write covers all.)
+                if (wr_req_i && !wr_full_hit && buf_valid_q
+                    && (wr_addr_i == buf_addr_q)
                     && !wr_parts_covered && !buf_dirty_q) begin
                     buf_valid_q <= 1'b0;
                     stat_wr_inval <= stat_wr_inval + 1;
@@ -356,5 +418,68 @@ module sram_forwarding_buffer #(
         end
     end
 `endif
+
+`ifndef TARGET_SYNTHESIS
+    // ---------------------------------------------------------------
+    // Contract assertions -- enforce the buffer<->cache-core contract.
+    // (Pulled inline because `bind sram_forwarding_buffer ...` was not
+    // taking effect in the integrated cachepool build, even though the
+    // bind file compiled cleanly.  Inlining guarantees elaboration.)
+    //
+    // Each property fires `$error` at the cycle of divergence so a
+    // contract violation is pinpointed instead of surfacing 80us later
+    // at the cluster xbar as `Visited illegal address`.
+    // ---------------------------------------------------------------
+
+    // C1 / C4: full-coverage absorption propagates correctly.
+    //   At cycle T: wr_full_coverage_o=1 AND wr_req_i=1.
+    //   At cycle T+1: buf_valid_q & (buf_addr_q == wr_addr_T) & buf_all_parts_q.
+    property p_C1_full_coverage_propagates;
+        addr_t saved_addr;
+        @(posedge clk_i) disable iff (!rst_ni)
+        (wr_full_coverage_o && wr_req_i, saved_addr = wr_addr_i)
+        |=> (buf_valid_q && (buf_addr_q == saved_addr) && buf_all_parts_q);
+    endproperty
+    a_C1_full_coverage_propagates: assert property (p_C1_full_coverage_propagates)
+        else $error("[fwd_buf C1 %m] wr_full_coverage_o asserted but next-cycle buffer is not full-line at written addr");
+
+    // C3: never overwrite dirty data on a SRAM-read populate when the
+    // pending read is for a DIFFERENT address than the dirty line.
+    property p_C3_no_clobber_dirty;
+        @(posedge clk_i) disable iff (!rst_ni)
+        Enable -> !(sram_rd_pend_q && buf_valid_q && buf_dirty_q
+                    && (sram_rd_addr_q != buf_addr_q));
+    endproperty
+    a_C3_no_clobber_dirty: assert property (p_C3_no_clobber_dirty)
+        else $error("[fwd_buf C3 %m] SRAM-read populate would clobber dirty buffer at different addr: dirty=0x%0h pending=0x%0h",
+                    buf_addr_q, sram_rd_addr_q);
+
+    // C5: wb_done while wb_needed clears dirty next cycle (unless a
+    // same-cycle write merge re-dirties, which is the only legal way
+    // for buf_dirty_q to stay 1).
+    property p_C5_wb_done_clears_dirty;
+        @(posedge clk_i) disable iff (!rst_ni)
+        (wb_needed_o && wb_done_i && !(wr_req_i && wr_hit_comb_o))
+        |=> !buf_dirty_q;
+    endproperty
+    a_C5_wb_done_clears_dirty: assert property (p_C5_wb_done_clears_dirty)
+        else $error("[fwd_buf C5 %m] wb_done_i asserted but buf_dirty_q didn't clear next cycle");
+
+    // Sanity: wr_full_coverage_o is a strict subset of wr_hit_comb_o.
+    property p_full_cov_implies_hit;
+        @(posedge clk_i) disable iff (!rst_ni)
+        wr_full_coverage_o |-> wr_hit_comb_o;
+    endproperty
+    a_full_cov_implies_hit: assert property (p_full_cov_implies_hit)
+        else $error("[fwd_buf SANITY %m] wr_full_coverage_o=1 but wr_hit_comb_o=0");
+
+    // Sanity: wb_needed_o equals (buf_valid_q & buf_dirty_q) when Enable.
+    property p_wb_needed_definition;
+        @(posedge clk_i) disable iff (!rst_ni)
+        (wb_needed_o == (Enable & buf_valid_q & buf_dirty_q));
+    endproperty
+    a_wb_needed_definition: assert property (p_wb_needed_definition)
+        else $error("[fwd_buf SANITY %m] wb_needed_o disagrees with buf_valid_q & buf_dirty_q");
+`endif // !TARGET_SYNTHESIS
 
 endmodule : sram_forwarding_buffer

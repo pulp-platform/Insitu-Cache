@@ -20,7 +20,10 @@ sources:
     files:
     #level1
     - src/insitu_cache/insitu_cache_pkg.sv
+    # sram_forwarding_buffer.sv now embeds its contract SVAs inline,
+    # guarded by `ifndef TARGET_SYNTHESIS`.  Synthesis is unaffected.
     - src/utilities/sram_forwarding_buffer.sv
+    - src/utilities/sram_forwarding_buffer_multi.sv
     - src/utilities/pseudo_dual_port_bank.sv
     - src/utilities/pseudo_dual_port_way.sv
     - src/utilities/pseudo_dual_port_fifo.sv
@@ -61,3 +64,13 @@ sources:
       - test/tb_insitu_cache.sv
       - test/test_flamingo/tb_insitu_cache_tcdm_wrapper.sv
       - test/test_flamingo/tb_flamingo_spatz_cache_ctrl.sv
+
+  # Unit-level testbench for the 1-entry forwarding buffer.
+  # Stand-alone: depends only on the rtl target's `sram_forwarding_buffer`.
+  # Note: fwd_buf_assertions.sv is part of `target: rtl` so it's bound
+  # everywhere the buffer is used -- both in this unit TB and in the
+  # full cachepool integrated build.
+  - target: test_fwd_buf
+    files:
+      - test/test_fwd_buf/sram_model.sv
+      - test/test_fwd_buf/tb_sram_forwarding_buffer.sv
