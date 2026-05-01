@@ -13,8 +13,12 @@
 //   - Dirty buffer data is written back on address change (eviction).
 //   - Combinational hit outputs allow the access controller to gate
 //     downstream SRAM operations in the same cycle.
-//   - Part-aware: with PartSplit > 1, the buffer tracks which part
-//     of the cache line was cached and only reports hits for that part.
+//   - Part-aware: with PartSplit > 1, the buffer tracks WHICH parts
+//     of the cache line are cached (bitmap), and reports hits only
+//     when ALL requested parts are present.  SRAM populates are
+//     ADDITIVE: a same-line populate ORs the new parts into the
+//     bitmap and updates only the byte lanes for the newly-arrived
+//     parts, preserving previously-cached parts.
 //
 // When Enable==0 (passthrough mode):
 //   - All combinational outputs are tied low (no hits, no writeback).
@@ -34,8 +38,8 @@ module sram_forwarding_buffer #(
     /// Enable active forwarding (1=active write-back, 0=passthrough)
     parameter bit          Enable         = 1'b1,
     /// Number of parts per cache line (1 = no part gating).
-    /// When > 1, the buffer tracks which part is cached and only
-    /// reports hits for that part.
+    /// When > 1, the buffer tracks per-part validity as a bitmap
+    /// and supports incremental same-line accumulation.
     parameter int unsigned PartSplit      = 1,
     // -- Derived parameters (do not override) --
     localparam int unsigned DataWidth     = WordWidth * NumWordsPerLine,
@@ -108,15 +112,18 @@ module sram_forwarding_buffer #(
     logic   buf_valid_q;
     logic   buf_dirty_q;
 
-    // -- Part tracking --
-    logic [PartIdxWidth-1:0] buf_part_idx_q;   // which part is cached
-    logic                    buf_all_parts_q;   // all parts cached
+    // -- Part tracking (BITMAP) --
+    // Bit p == 1 means part p of the line is currently cached in buf_data_q.
+    // PartSplit==1 collapses to a single bit (always meaning "the only part").
+    logic [PartSplit-1:0]    buf_parts_valid_q;
+    // Derived: convenience wire used by SVAs and external observers.
+    logic                    buf_all_parts_q;
+    assign buf_all_parts_q = &buf_parts_valid_q;
 
-    // -- In-flight SRAM read tracking --
+    // -- In-flight SRAM read tracking (BITMAP) --
     logic   sram_rd_pend_q;
     addr_t  sram_rd_addr_q;
-    logic [PartIdxWidth-1:0] sram_rd_part_idx_q;
-    logic                    sram_rd_all_parts_q;
+    logic [PartSplit-1:0] sram_rd_parts_q;     // which parts the in-flight SRAM read fetches
 
     // -- Registered hit output (1-cycle latency to match SRAM) --
     logic   buf_rd_hit_q;
@@ -141,46 +148,39 @@ module sram_forwarding_buffer #(
     assign stat_sram_rd_o  = stat_sram_rd;
     assign stat_wb_o       = stat_wb;
 
-    // -- Read part match --
-    // Hit only when the requested part is actually cached.
+    // -- Helpers: input encoding -> bitmap --
+    // Convert the access-controller's (rd_part_idx_i, rd_all_parts_i)
+    // and (wr_mask_i) into per-part bitmaps so the rest of the buffer
+    // logic operates uniformly on PartSplit-bit vectors.
+    logic [PartSplit-1:0] rd_parts_bm;
+    logic [PartSplit-1:0] wr_parts_bm;
+    always_comb begin
+        if (PartSplit <= 1) begin
+            rd_parts_bm = '1;
+        end else if (rd_all_parts_i) begin
+            rd_parts_bm = '1;
+        end else begin
+            rd_parts_bm = '0;
+            rd_parts_bm[rd_part_idx_i] = 1'b1;
+        end
+        for (int p = 0; p < PartSplit; p++)
+            wr_parts_bm[p] = |wr_mask_i[p*PartMaskBits +: PartMaskBits];
+    end
+
+    // -- Read part match: every requested part is in the buffer --
     logic rd_part_match;
-    always_comb begin
-        if (PartSplit <= 1)
-            rd_part_match = 1'b1;
-        else if (buf_all_parts_q)
-            rd_part_match = 1'b1;
-        else if (rd_all_parts_i)
-            rd_part_match = 1'b0;  // full read but buffer has 1 part
-        else
-            rd_part_match = (buf_part_idx_q == rd_part_idx_i);
-    end
+    assign rd_part_match = ((rd_parts_bm & buf_parts_valid_q) == rd_parts_bm);
 
-    // -- Write parts coverage (normal: buffer state) --
+    // -- Write parts coverage (normal: vs. buffer state) --
     logic wr_parts_covered;
-    always_comb begin
-        wr_parts_covered = 1'b1;
-        if (PartSplit > 1 && !buf_all_parts_q) begin
-            for (int p = 0; p < PartSplit; p++) begin
-                if (|wr_mask_i[p*PartMaskBits +: PartMaskBits] &&
-                    (p[PartIdxWidth-1:0] != buf_part_idx_q))
-                    wr_parts_covered = 1'b0;
-            end
-        end
-    end
+    assign wr_parts_covered =
+        ((wr_parts_bm & buf_parts_valid_q) == wr_parts_bm);
 
-    // -- Write parts coverage (concurrent: SRAM read arriving) --
-    // Used when sram_rd_pend_q=1 and the SRAM read is for the write address.
+    // -- Write parts coverage (concurrent: vs. in-flight SRAM read parts) --
+    // Used when sram_rd_pend_q=1 and the write is for the SRAM-read address.
     logic wr_parts_covered_concurrent;
-    always_comb begin
-        wr_parts_covered_concurrent = 1'b1;
-        if (PartSplit > 1 && !sram_rd_all_parts_q) begin
-            for (int p = 0; p < PartSplit; p++) begin
-                if (|wr_mask_i[p*PartMaskBits +: PartMaskBits] &&
-                    (p[PartIdxWidth-1:0] != sram_rd_part_idx_q))
-                    wr_parts_covered_concurrent = 1'b0;
-            end
-        end
-    end
+    assign wr_parts_covered_concurrent =
+        ((wr_parts_bm & sram_rd_parts_q) == wr_parts_bm);
 
     // -- Combinational hit checks --
     // Read hit: suppress while SRAM read pending and the pending read
@@ -202,9 +202,31 @@ module sram_forwarding_buffer #(
     logic wr_full_line;
     assign wr_full_line = &wr_mask_i;
 
+    // -- Write hit classification --
+    // wr_buf_hit fires in two cases:
+    //   IDLE: no SRAM read pending; original semantics.
+    //   PEND_DISJOINT: a same-line populate is in flight AND the write
+    //     touches buffer-cached parts that are DISJOINT from the parts
+    //     the SRAM read is fetching this cycle.  The populate updates
+    //     newly-arrived parts while the absorb updates already-buffered
+    //     parts -- on disjoint byte lanes -- so they coexist without
+    //     conflict.  Gated to clean buffer to avoid multi-part dirty.
+    logic wr_buf_hit_idle;
+    logic wr_buf_hit_pend_disjoint;
     logic wr_buf_hit;
-    assign wr_buf_hit = buf_valid_q & (buf_addr_q == wr_addr_i)
-                      & wr_parts_covered & has_wr_data & !sram_rd_pend_q;
+    assign wr_buf_hit_idle =
+           buf_valid_q & (buf_addr_q == wr_addr_i)
+         & wr_parts_covered & has_wr_data
+         & !sram_rd_pend_q;
+    assign wr_buf_hit_pend_disjoint =
+           buf_valid_q & (buf_addr_q == wr_addr_i)
+         & (buf_addr_q == sram_rd_addr_q)
+         & wr_parts_covered & has_wr_data
+         & sram_rd_pend_q
+         & !buf_dirty_q
+         & ((wr_parts_bm & sram_rd_parts_q) == '0);
+    assign wr_buf_hit = wr_buf_hit_idle | wr_buf_hit_pend_disjoint;
+
     logic wr_concurrent_hit;
     assign wr_concurrent_hit = sram_rd_pend_q & (sram_rd_addr_q == wr_addr_i)
                              & wr_parts_covered_concurrent & has_wr_data;
@@ -218,32 +240,36 @@ module sram_forwarding_buffer #(
 
     assign wr_hit_comb_o = Enable & (wr_buf_hit | wr_concurrent_hit | wr_full_hit);
 
-    // wr_full_coverage_o: AFTER this absorption, buffer holds the FULL line.
-    //   - wr_full_hit always sets buf_all_parts_q=1 next cycle.
-    //   - wr_buf_hit on an already-all-parts buffer keeps all_parts=1.
-    //   - wr_concurrent_hit when the in-flight SRAM read covers all parts
-    //     populates the buffer with all parts next cycle.
-    // Anything else is a partial-coverage absorption -- unsafe for the
-    // cache core's bank-write/upstream-read hazard bypass.
+    // wr_full_coverage_o: AFTER this absorption, will the buffer hold
+    // the FULL line?  With the bitmap encoding this is a generalized
+    // check -- a partial-coverage absorption that COMPLETES the line
+    // qualifies, in addition to the original "all parts at once" cases.
+    logic [PartSplit-1:0] post_absorb_parts_buf;
+    logic [PartSplit-1:0] post_absorb_parts_pd;
+    logic [PartSplit-1:0] post_absorb_parts_cc;
+    assign post_absorb_parts_buf = buf_parts_valid_q | wr_parts_bm;
+    assign post_absorb_parts_pd  = buf_parts_valid_q | sram_rd_parts_q | wr_parts_bm;
+    assign post_absorb_parts_cc  = sram_rd_parts_q   | wr_parts_bm;
     assign wr_full_coverage_o = Enable
         & ( wr_full_hit
-          | (wr_buf_hit        & buf_all_parts_q)
-          | (wr_concurrent_hit & sram_rd_all_parts_q));
+          | (wr_buf_hit_idle          & (&post_absorb_parts_buf))
+          | (wr_buf_hit_pend_disjoint & (&post_absorb_parts_pd))
+          | (wr_concurrent_hit        & (&post_absorb_parts_cc)));
 
     // -- Writeback outputs --
     assign wb_needed_o = Enable & buf_dirty_q;
     assign wb_addr_o   = buf_addr_q;
     assign wb_data_o   = buf_data_q;
 
-    // Writeback mask: only write back the cached part's bytes.
+    // Writeback mask: only write back the cached parts' bytes.
     always_comb begin
-        wb_mask_o = '1;
-        if (PartSplit > 1 && !buf_all_parts_q) begin
+        if (PartSplit <= 1) begin
+            wb_mask_o = '1;
+        end else begin
             wb_mask_o = '0;
-            for (int p = 0; p < PartSplit; p++) begin
-                if (p[PartIdxWidth-1:0] == buf_part_idx_q)
+            for (int p = 0; p < PartSplit; p++)
+                if (buf_parts_valid_q[p])
                     wb_mask_o[p*PartMaskBits +: PartMaskBits] = '1;
-            end
         end
     end
 
@@ -251,7 +277,8 @@ module sram_forwarding_buffer #(
     // Buffer only merges when the write is actually absorbed (address match,
     // all written parts are cached, and write mask is non-zero).
     logic can_merge;
-    assign can_merge = buf_valid_q & (wr_addr_i == buf_addr_q) & wr_parts_covered & has_wr_data;
+    assign can_merge = buf_valid_q & (wr_addr_i == buf_addr_q)
+                     & wr_parts_covered & has_wr_data;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -259,12 +286,10 @@ module sram_forwarding_buffer #(
             buf_data_q          <= '0;
             buf_addr_q          <= '0;
             buf_dirty_q         <= 1'b0;
-            buf_part_idx_q      <= '0;
-            buf_all_parts_q     <= 1'b0;
+            buf_parts_valid_q   <= '0;
             sram_rd_pend_q      <= 1'b0;
             sram_rd_addr_q      <= '0;
-            sram_rd_part_idx_q  <= '0;
-            sram_rd_all_parts_q <= 1'b0;
+            sram_rd_parts_q     <= '0;
             buf_rd_hit_q        <= 1'b0;
             buf_rd_data_q       <= '0;
             stat_rd_hit         <= '0;
@@ -287,59 +312,109 @@ module sram_forwarding_buffer #(
             // -- Track SRAM reads in flight --
             sram_rd_pend_q <= sram_rd_issued_i;
             if (sram_rd_issued_i) begin
-                sram_rd_addr_q      <= rd_addr_i;
-                sram_rd_part_idx_q  <= rd_part_idx_i;
-                sram_rd_all_parts_q <= rd_all_parts_i;
+                sram_rd_addr_q  <= rd_addr_i;
+                // Snapshot the parts bitmap (rd_parts_bm is already the
+                // combinational mapping of rd_part_idx_i / rd_all_parts_i).
+                sram_rd_parts_q <= rd_parts_bm;
             end
 
             // -- SRAM populate has priority over write merge --
+            // Three populate paths:
+            //   (A) ACCUMULATE-CLEAN: same-addr populate, buffer clean,
+            //       no concurrent write -> OR in new parts; hold bytes
+            //       for already-cached parts; stay clean.
+            //   (B) ACCUMULATE-PEND-DISJOINT: same-addr populate AND a
+            //       concurrent write hits buffer parts disjoint from
+            //       the in-flight SRAM read.  Populate updates newly-
+            //       arrived parts; absorb updates the buffer parts the
+            //       write targets; both happen on disjoint byte lanes.
+            //   (C) REPLACE: any other case.  Original semantics.
             if (sram_rd_pend_q) begin
-                buf_valid_q     <= 1'b1;
-                buf_addr_q      <= sram_rd_addr_q;
-                buf_part_idx_q  <= sram_rd_part_idx_q;
-                buf_all_parts_q <= sram_rd_all_parts_q;
-                // Concurrent write merge: safe when all written parts are
-                // in the SRAM-read part(s). wr_parts_covered_concurrent
-                // checks against sram_rd_part_idx_q.
-                if (wr_req_i && has_wr_data && (wr_addr_i == sram_rd_addr_q)
-                    && wr_parts_covered_concurrent) begin
+                if (buf_valid_q && (buf_addr_q == sram_rd_addr_q)
+                    && !buf_dirty_q
+                    && !(wr_req_i && has_wr_data
+                         && (wr_addr_i == sram_rd_addr_q))) begin
+                    // ===== (A) ACCUMULATE-CLEAN (no write) =====
+                    buf_parts_valid_q <= buf_parts_valid_q | sram_rd_parts_q;
                     for (int b = 0; b < MaskBits; b++) begin
-                        if (wr_mask_i[b])
-                            buf_data_q[b*ByteWidth +: ByteWidth] <=
-                                wr_data_i[b*ByteWidth +: ByteWidth];
-                        else
+                        automatic int p = b / PartMaskBits;
+                        if (sram_rd_parts_q[p])
                             buf_data_q[b*ByteWidth +: ByteWidth] <=
                                 sram_rdata_i[b*ByteWidth +: ByteWidth];
                     end
+                    // buf_valid_q, buf_addr_q, buf_dirty_q held.
+                end else if (wr_buf_hit_pend_disjoint) begin
+                    // ===== (B) ACCUMULATE-PEND-DISJOINT =====
+                    buf_parts_valid_q <=
+                        buf_parts_valid_q | sram_rd_parts_q;
+                    for (int b = 0; b < MaskBits; b++) begin
+                        automatic int p = b / PartMaskBits;
+                        if (sram_rd_parts_q[p]) begin
+                            // Newly-populated part: take SRAM data.
+                            buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                sram_rdata_i[b*ByteWidth +: ByteWidth];
+                        end else if (wr_parts_bm[p] && wr_mask_i[b]) begin
+                            // Absorbed write byte (already-buffered part,
+                            // disjoint from current SRAM read).
+                            buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                wr_data_i[b*ByteWidth +: ByteWidth];
+                        end
+                        // else: hold (already-cached part, not written).
+                    end
                     if (Enable) buf_dirty_q <= 1'b1;
                     stat_wr_merge <= stat_wr_merge + 1;
-                end else if (wr_req_i && has_wr_data
-                             && (wr_addr_i == sram_rd_addr_q)) begin
-                    // Write to same address but merge unsafe (partial
-                    // parts).  The write goes to SRAM, making the buffer
-                    // stale.  Populate then invalidate.
-                    buf_data_q  <= sram_rdata_i;
-                    buf_dirty_q <= 1'b0;
-                    buf_valid_q <= 1'b0;
-                    stat_wr_inval <= stat_wr_inval + 1;
                 end else begin
-                    buf_data_q  <= sram_rdata_i;
-                    buf_dirty_q <= 1'b0;
+                    // ===== REPLACE (original semantics) =====
+                    buf_valid_q       <= 1'b1;
+                    buf_addr_q        <= sram_rd_addr_q;
+                    buf_parts_valid_q <= sram_rd_parts_q;
+                    // Concurrent write merge: safe when all written parts
+                    // are covered by the SRAM-read parts.
+                    if (wr_req_i && has_wr_data
+                        && (wr_addr_i == sram_rd_addr_q)
+                        && wr_parts_covered_concurrent) begin
+                        for (int b = 0; b < MaskBits; b++) begin
+                            if (wr_mask_i[b])
+                                buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                    wr_data_i[b*ByteWidth +: ByteWidth];
+                            else
+                                buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                    sram_rdata_i[b*ByteWidth +: ByteWidth];
+                        end
+                        if (Enable) buf_dirty_q <= 1'b1;
+                        stat_wr_merge <= stat_wr_merge + 1;
+                    end else if (wr_req_i && has_wr_data
+                                 && (wr_addr_i == sram_rd_addr_q)) begin
+                        // Write to same address but merge unsafe (partial
+                        // parts).  The write goes to SRAM, making the buffer
+                        // stale.  Populate then invalidate.
+                        buf_data_q        <= sram_rdata_i;
+                        buf_dirty_q       <= 1'b0;
+                        buf_valid_q       <= 1'b0;
+                        buf_parts_valid_q <= '0;
+                        stat_wr_inval     <= stat_wr_inval + 1;
+                    end else begin
+                        buf_data_q  <= sram_rdata_i;
+                        buf_dirty_q <= 1'b0;
+                    end
                 end
             end else begin
                 // -- Full-line write: populate buffer directly, no SRAM --
                 // Takes priority over merge (provides all bytes).
                 if (wr_req_i && wr_full_hit) begin
-                    buf_data_q      <= wr_data_i;
-                    buf_addr_q      <= wr_addr_i;
-                    buf_valid_q     <= 1'b1;
-                    buf_all_parts_q <= 1'b1;
-                    buf_part_idx_q  <= '0;
+                    buf_data_q        <= wr_data_i;
+                    buf_addr_q        <= wr_addr_i;
+                    buf_valid_q       <= 1'b1;
+                    buf_parts_valid_q <= '1;
                     if (Enable) buf_dirty_q <= 1'b1;
                     stat_wr_merge <= stat_wr_merge + 1;
                 end
                 // -- Write merge: same address, parts covered --
                 else if (wr_req_i && can_merge) begin
+                    // Subset OR: no change to buf_parts_valid_q because
+                    // wr_parts_bm is already a subset.  Kept explicit
+                    // here for clarity.
+                    buf_parts_valid_q <= buf_parts_valid_q | wr_parts_bm;
                     for (int b = 0; b < MaskBits; b++)
                         if (wr_mask_i[b])
                             buf_data_q[b*ByteWidth +: ByteWidth] <=
@@ -352,8 +427,9 @@ module sram_forwarding_buffer #(
                 // (Skipped for wr_full_hit since we're replacing the buffer.)
                 if (wr_req_i && !wr_full_hit && buf_valid_q
                     && (wr_addr_i != buf_addr_q) && !buf_dirty_q) begin
-                    buf_valid_q <= 1'b0;
-                    stat_wr_inval <= stat_wr_inval + 1;
+                    buf_valid_q       <= 1'b0;
+                    buf_parts_valid_q <= '0;
+                    stat_wr_inval     <= stat_wr_inval + 1;
                 end
 
                 // -- Write to same address, parts NOT covered, clean:
@@ -362,8 +438,9 @@ module sram_forwarding_buffer #(
                 if (wr_req_i && !wr_full_hit && buf_valid_q
                     && (wr_addr_i == buf_addr_q)
                     && !wr_parts_covered && !buf_dirty_q) begin
-                    buf_valid_q <= 1'b0;
-                    stat_wr_inval <= stat_wr_inval + 1;
+                    buf_valid_q       <= 1'b0;
+                    buf_parts_valid_q <= '0;
+                    stat_wr_inval     <= stat_wr_inval + 1;
                 end
 
                 // -- SRAM write to buffer address: invalidate --
@@ -371,7 +448,8 @@ module sram_forwarding_buffer #(
                 // as upstream write pulses.
                 if (sram_wr_req_i && buf_valid_q
                     && (sram_wr_addr_i == buf_addr_q) && !buf_dirty_q) begin
-                    buf_valid_q <= 1'b0;
+                    buf_valid_q       <= 1'b0;
+                    buf_parts_valid_q <= '0;
                 end
 
                 // -- Writeback done: clear dirty --
@@ -430,6 +508,8 @@ module sram_forwarding_buffer #(
     // C1 / C4: full-coverage absorption propagates correctly.
     //   At cycle T: wr_full_coverage_o=1 AND wr_req_i=1.
     //   At cycle T+1: buf_valid_q & (buf_addr_q == wr_addr_T) & buf_all_parts_q.
+    // (buf_all_parts_q is the &-reduction of buf_parts_valid_q, so this
+    // continues to assert "buffer holds the WHOLE line".)
     property p_C1_full_coverage_propagates;
         addr_t saved_addr;
         @(posedge clk_i) disable iff (!rst_ni)
@@ -476,6 +556,22 @@ module sram_forwarding_buffer #(
     endproperty
     a_wb_needed_definition: assert property (p_wb_needed_definition)
         else $error("[fwd_buf SANITY %m] wb_needed_o disagrees with buf_valid_q & buf_dirty_q");
+
+    // BITMAP-NEW: when buffer is invalid, parts bitmap must be zero.
+    property p_invalid_implies_no_parts;
+        @(posedge clk_i) disable iff (!rst_ni)
+        (!buf_valid_q) |-> (buf_parts_valid_q == '0);
+    endproperty
+    a_invalid_implies_no_parts: assert property (p_invalid_implies_no_parts)
+        else $error("[fwd_buf SANITY %m] buf_valid_q=0 but buf_parts_valid_q=0x%0h", buf_parts_valid_q);
+
+    // BITMAP-NEW: when buffer is valid, parts bitmap must be non-zero.
+    property p_valid_implies_some_parts;
+        @(posedge clk_i) disable iff (!rst_ni)
+        (buf_valid_q) |-> (buf_parts_valid_q != '0);
+    endproperty
+    a_valid_implies_some_parts: assert property (p_valid_implies_some_parts)
+        else $error("[fwd_buf SANITY %m] buf_valid_q=1 but buf_parts_valid_q=0");
 `endif // !TARGET_SYNTHESIS
 
 endmodule : sram_forwarding_buffer
