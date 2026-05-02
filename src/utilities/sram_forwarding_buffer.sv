@@ -223,8 +223,11 @@ module sram_forwarding_buffer #(
          & (buf_addr_q == sram_rd_addr_q)
          & wr_parts_covered & has_wr_data
          & sram_rd_pend_q
-         & !buf_dirty_q
          & ((wr_parts_bm & sram_rd_parts_q) == '0);
+    // (Note: `!buf_dirty_q` gate dropped -- absorbing a write into already-
+    // buffered parts that are disjoint from the in-flight SRAM read is
+    // safe regardless of dirty state.  The tile-level write-priority
+    // arbiter and byte-level wb_mask_o handle multi-part dirty writeback.)
     assign wr_buf_hit = wr_buf_hit_idle | wr_buf_hit_pend_disjoint;
 
     logic wr_concurrent_hit;
@@ -320,9 +323,12 @@ module sram_forwarding_buffer #(
 
             // -- SRAM populate has priority over write merge --
             // Three populate paths:
-            //   (A) ACCUMULATE-CLEAN: same-addr populate, buffer clean,
-            //       no concurrent write -> OR in new parts; hold bytes
-            //       for already-cached parts; stay clean.
+            //   (A) ACCUMULATE: same-addr populate, no concurrent write
+            //       to the SRAM-read address -> OR in new parts; hold
+            //       bytes for already-cached parts; PRESERVE dirty
+            //       state.  Works for both clean and dirty buffers --
+            //       the tile arbiter handles multi-part dirty writeback
+            //       in a single cycle when eviction eventually fires.
             //   (B) ACCUMULATE-PEND-DISJOINT: same-addr populate AND a
             //       concurrent write hits buffer parts disjoint from
             //       the in-flight SRAM read.  Populate updates newly-
@@ -331,10 +337,12 @@ module sram_forwarding_buffer #(
             //   (C) REPLACE: any other case.  Original semantics.
             if (sram_rd_pend_q) begin
                 if (buf_valid_q && (buf_addr_q == sram_rd_addr_q)
-                    && !buf_dirty_q
                     && !(wr_req_i && has_wr_data
                          && (wr_addr_i == sram_rd_addr_q))) begin
-                    // ===== (A) ACCUMULATE-CLEAN (no write) =====
+                    // ===== (A) ACCUMULATE (no write to sram_rd_addr) =====
+                    // Works for clean OR dirty buffer.  Dirty bytes
+                    // (in already-cached parts) are HELD; only newly-
+                    // arrived parts get written from SRAM.
                     buf_parts_valid_q <= buf_parts_valid_q | sram_rd_parts_q;
                     for (int b = 0; b < MaskBits; b++) begin
                         automatic int p = b / PartMaskBits;
@@ -342,7 +350,8 @@ module sram_forwarding_buffer #(
                             buf_data_q[b*ByteWidth +: ByteWidth] <=
                                 sram_rdata_i[b*ByteWidth +: ByteWidth];
                     end
-                    // buf_valid_q, buf_addr_q, buf_dirty_q held.
+                    // buf_valid_q, buf_addr_q held; buf_dirty_q PRESERVED
+                    // (no clear -- dirty bytes are not overwritten).
                 end else if (wr_buf_hit_pend_disjoint) begin
                     // ===== (B) ACCUMULATE-PEND-DISJOINT =====
                     buf_parts_valid_q <=

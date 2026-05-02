@@ -2161,9 +2161,20 @@ module insitu_cache_bank_access_controller #(
                         downstream_write_mask_o = fwd_wb_mask;
                     end else if (fwd_wb_needed && upstream_read_valid_i
                                  && !fwd_rd_hit
+                                 && (upstream_read_addr_i != fwd_wb_addr)
                                  && !buf_has_free_clean) begin
-                        // Read miss with dirty buffer AND no free-clean
-                        // entry available: writeback first, then retry.
+                        // Read miss with dirty buffer at a DIFFERENT line:
+                        // writeback first to preserve dirty data before the
+                        // populate replaces the buffer entry.
+                        //
+                        // Same-line read miss (addr == fwd_wb_addr) skips
+                        // this writeback: the populate ACCUMULATEs into the
+                        // existing buffer entry, merging the missing parts
+                        // with the dirty parts already present.  Forcing a
+                        // writeback in that case is wasted bandwidth -- the
+                        // dirty parts would be re-dirtied by the very next
+                        // store hit.
+                        //
                         // For multi-entry with a free-clean slot, the read
                         // can populate into the free slot without evicting
                         // dirty data -- skip the blocking writeback.
