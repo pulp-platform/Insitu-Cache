@@ -432,14 +432,15 @@ module sram_forwarding_buffer #(
                     stat_wr_merge <= stat_wr_merge + 1;
                 end
 
-                // -- Write to different address, buffer clean: invalidate --
-                // (Skipped for wr_full_hit since we're replacing the buffer.)
-                if (wr_req_i && !wr_full_hit && buf_valid_q
-                    && (wr_addr_i != buf_addr_q) && !buf_dirty_q) begin
-                    buf_valid_q       <= 1'b0;
-                    buf_parts_valid_q <= '0;
-                    stat_wr_inval     <= stat_wr_inval + 1;
-                end
+                // -- Write to different address, buffer clean: KEEP --
+                // The buffer holds (clean) data for a DIFFERENT line than
+                // the write.  The buffer's data is still consistent with
+                // SRAM (clean), and the new write goes to SRAM at its own
+                // address without touching this buffer.  Holding the
+                // entry as a "victim" lets subsequent reads/writes to the
+                // OLD line still hit the buffer (re-dirty if write).
+                // Eviction happens only when an actual REPLACE is forced
+                // (different-line populate).
 
                 // -- Write to same address, parts NOT covered, clean:
                 //    invalidate (SRAM will have newer data) --

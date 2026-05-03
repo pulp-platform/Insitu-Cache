@@ -371,6 +371,9 @@ module insitu_cache_tcdm_wrapper
 
     logic                   [SetAssociativity - 1 : 0]      data_bank_read_ready;
     logic                   [SetAssociativity - 1 : 0]      meta_bank_read_ready;
+    // Per-way upstream_write_ready_o (Phase 1 handshake; always-1 in Phase 1).
+    logic                   [SetAssociativity - 1 : 0]      data_bank_write_ready;
+    logic                   [SetAssociativity - 1 : 0]      meta_bank_write_ready;
     logic                   [SetAssociativity - 1 : 0]      data_bank_write_hit;
     logic                   [SetAssociativity - 1 : 0]      data_bank_write_full_cov;
 
@@ -443,6 +446,12 @@ module insitu_cache_tcdm_wrapper
     logic                                                   proc_read_data_skip;
 
     logic                                                   proc_write_select;
+
+    // Phase 1 handshake: aggregate per-way write_ready into bank_write_cache_ready,
+    // and route up to cache_core as bank_write_ready_i.  Phase 1 is always-1
+    // (no behavioral change); Phase 2 lowers it for transient buffer states.
+    logic                                                   bank_write_cache_ready;
+    logic                                                   proc_write_cache_ready;
 
     /*****************/
     /*  Cache Flush  */
@@ -955,6 +964,7 @@ module insitu_cache_tcdm_wrapper
         .bank_read_cache_LRU_i          (proc_read_cache_LRU),
 
         .bank_write_req_o               (proc_write_cache_req),
+        .bank_write_ready_i             (proc_write_cache_ready),
         .bank_write_addr_o              (proc_write_cache_addr),
         .bank_write_way_o               (proc_write_cache_way),
         .bank_write_cache_status_o      (proc_write_cache_status),
@@ -1129,6 +1139,13 @@ module insitu_cache_tcdm_wrapper
     assign proc_read_cache_ready       = bank_read_cache_ready;
     assign flush_read_cache_ready      = bank_read_sel_flush? bank_read_cache_ready : '0;
     assign bank_read_way_mask_sel      = bank_read_sel_flush? flush_read_way_mask : bank_read_way_mask;
+
+    // Phase 1 handshake: write-side ready aggregation.  Only the targeted
+    // way's ready matters; other ways are independent.  In Phase 1 the
+    // access-ctrls always assert ready=1, so this is always 1.
+    assign bank_write_cache_ready  = data_bank_write_ready[proc_write_cache_way]
+                                   & meta_bank_write_ready[proc_write_cache_way];
+    assign proc_write_cache_ready  = bank_write_cache_ready;
     assign bank_read_part_idx_sel      = bank_read_sel_flush? flush_read_part_idx : bank_read_part_idx;
     assign bank_read_all_parts_sel     = bank_read_sel_flush? flush_read_all_parts : bank_read_all_parts;
 
@@ -1322,6 +1339,7 @@ module insitu_cache_tcdm_wrapper
                                           bank_write_cache_req),
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
+            .upstream_write_ready_o      (data_bank_write_ready[i]),
 
             .downstream_read_addr_o      (gnt_data_bank_read_addr[i]),
             .downstream_read_valid_o     (gnt_data_bank_read_valid[i]),
@@ -1418,6 +1436,7 @@ module insitu_cache_tcdm_wrapper
                                           flush_write_cache_req_valid),
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
+            .upstream_write_ready_o      (meta_bank_write_ready[i]),
 
             .downstream_read_addr_o      (gnt_meta_bank_read_addr[i]),
             .downstream_read_valid_o     (gnt_meta_bank_read_valid[i]),
@@ -1843,6 +1862,13 @@ module insitu_cache_bank_access_controller #(
     input  logic                                    upstream_write_req_i,
     input  data_t                                   upstream_write_data_i,
     input  mask_t                                   upstream_write_mask_i,
+    /// Backpressure: when low, the upstream write must NOT be consumed this
+    /// cycle (i.e., the cache controller must hold the request and replay
+    /// it next cycle).  Phase 1: always 1 (always-ready, behavior identical
+    /// to pre-handshake).  Phase 2 will lower it for transient buffer states
+    /// (wb_active, populate-with-conflict, etc.) so that ACCUMULATE-CONCURRENT-
+    /// MERGE-class optimizations can be added safely in later phases.
+    output logic                                    upstream_write_ready_o,
 
     /// Downstream Read port
     output addr_t                                   downstream_read_addr_o,
@@ -1937,6 +1963,22 @@ module insitu_cache_bank_access_controller #(
     // Expose write hit for upstream hazard relaxation.
     assign fwd_wr_hit_o = fwd_wr_hit;
     assign fwd_wr_full_coverage_o = fwd_wr_full_cov;
+
+    // Phase 2 of the handshake: deassert ready when the access ctrl is in
+    // a transient state where it cannot safely accept a new upstream write
+    // without losing data.  Three deassertion conditions:
+    //   (i)   wb_active_q=1: the writeback overlay is firing this cycle;
+    //         the FSM logic doesn't run, so a new write would be lost.
+    //   (ii)  ACCESS_STALL: the saved write from a prior Path A is being
+    //         replayed; same FSM-overlay reasoning.
+    //   (iii) Path A is about to fire combinationally this cycle: the
+    //         current write IS captured (into stall regs), but a SECOND
+    //         concurrent write would be lost.  In practice the cache
+    //         controller drives at most one write per cycle, so this
+    //         condition currently never matters; included for safety.
+    // Phase 3 will add a (D)-related condition gated on cache-status info.
+    assign upstream_write_ready_o = !wb_active_q
+                                  & (access_status_q != ACCESS_STALL);
 
     generate
     if (FwdBufEntries <= 1) begin : gen_fwd_buf_single

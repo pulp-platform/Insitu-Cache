@@ -161,6 +161,12 @@ module insitu_cache_core
     input  way_ptr_t                [SetAssociativity-1:0]  bank_read_cache_LRU_i,
 
     output logic                                            bank_write_req_o,
+    /// Phase 1 handshake: when low, the bank cannot accept this write this
+    /// cycle.  The cache controller must hold its `bank_write_req_o` and
+    /// related FSM transitions until ready returns to 1.  Phase 1 always-1
+    /// (no behavioral change vs. pre-handshake); Phase 2+ lowers it for
+    /// transient buffer states.
+    input  logic                                            bank_write_ready_i,
     output cache_bank_depth_ptr_t                           bank_write_addr_o,
     output way_ptr_t                                        bank_write_way_o,
     output cache_status_t           [SetAssociativity-1:0]  bank_write_cache_status_o,
@@ -2909,6 +2915,24 @@ CC4_RefillStallAddr: assert property (p_CC4_refill_stall_addr_in_dram)
                 $time, fsm_refill_stall_q.addr);
 `endif // ENABLE_CC_DRAM_ASSERTS
 
+`endif
+
+`ifndef TARGET_SYNTHESIS
+// ---------------------------------------------------------------------------
+// Phase-1 handshake contract assertion (HK-*).
+//
+// HK-1: bank_write_req_o must NOT assert when bank_write_ready_i is low.
+//       This is the contract the access ctrl relies on to safely backpressure
+//       writes.  In Phase 1 the ready signal is tied to 1 in the access ctrl
+//       so this assertion never fires.  In Phase 2+ when the access ctrl
+//       lowers ready, the cache controller's gating must be in place.
+// ---------------------------------------------------------------------------
+property p_HK1_write_respects_ready;
+    @(posedge clk_i) disable iff (!rst_ni)
+    bank_write_req_o |-> bank_write_ready_i;
+endproperty
+HK1_WriteRespectsReady: assert property (p_HK1_write_respects_ready)
+    else $error("[HK-1 %m] bank_write_req_o asserted while bank_write_ready_i=0 -- handshake violation");
 `endif
 
 endmodule
