@@ -167,6 +167,12 @@ module insitu_cache_core
     /// (no behavioral change vs. pre-handshake); Phase 2+ lowers it for
     /// transient buffer states.
     input  logic                                            bank_write_ready_i,
+    /// Phase 3 advisory: the OLD status of the line being written, BEFORE
+    /// this cycle's update.  Used by the access ctrl / forwarding buffer to
+    /// gate optimizations that depend on the line being already cached
+    /// (status == VALID) vs in flight (PEND).  Specifically, the buffer's
+    /// ACCUMULATE-CONCURRENT-MERGE branch will only fire when this is 1.
+    output logic                                            bank_write_target_valid_o,
     output cache_bank_depth_ptr_t                           bank_write_addr_o,
     output way_ptr_t                                        bank_write_way_o,
     output cache_status_t           [SetAssociativity-1:0]  bank_write_cache_status_o,
@@ -965,6 +971,15 @@ module insitu_cache_core
                                       refill_read_way_mask :
                                   {SetAssociativity{1'b1}};
     assign bank_read_data_skip_o = 1'b0;
+
+    // Phase 3 advisory: tell the access ctrl whether the line being written
+    // is currently in VALID state (already cached and refill complete).
+    // The buffer's ACCUMULATE-CONCURRENT-MERGE branch needs this to gate
+    // its parts-preserving behavior away from PEND lines (where the cache
+    // controller's status array is mid-protocol and (D) absorption could
+    // make the controller miss a needed refill match).
+    assign bank_write_target_valid_o =
+        (bank_read_cache_status_i[bank_write_way_o] == VALID);
 
 
 

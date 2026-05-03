@@ -74,6 +74,10 @@ module sram_forwarding_buffer_multi #(
     output mask_t  wb_mask_o,
     input  logic   wb_done_i,
 
+    // Phase 3 advisory (single-entry (D) only; accepted-but-unused here
+    // to keep port lists aligned across the two buffer flavours).
+    input  logic   wr_target_valid_i,
+
     output data_t  fwd_rdata_o,
     output logic   fwd_hit_o,
 

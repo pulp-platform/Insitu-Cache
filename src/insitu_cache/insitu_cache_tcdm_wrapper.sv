@@ -453,6 +453,12 @@ module insitu_cache_tcdm_wrapper
     logic                                                   bank_write_cache_ready;
     logic                                                   proc_write_cache_ready;
 
+    // Phase 3: advisory bit from cache_core indicating the line being
+    // written is currently in VALID state.  Distributed to the data-side
+    // access ctrls so the buffer's ACCUMULATE-CONCURRENT-MERGE branch can
+    // gate its parts-preserving behavior on it.
+    logic                                                   proc_write_target_valid;
+
     /*****************/
     /*  Cache Flush  */
     /*****************/
@@ -965,6 +971,7 @@ module insitu_cache_tcdm_wrapper
 
         .bank_write_req_o               (proc_write_cache_req),
         .bank_write_ready_i             (proc_write_cache_ready),
+        .bank_write_target_valid_o      (proc_write_target_valid),
         .bank_write_addr_o              (proc_write_cache_addr),
         .bank_write_way_o               (proc_write_cache_way),
         .bank_write_cache_status_o      (proc_write_cache_status),
@@ -1340,6 +1347,7 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
             .upstream_write_ready_o      (data_bank_write_ready[i]),
+            .upstream_write_target_valid_i (proc_write_target_valid),
 
             .downstream_read_addr_o      (gnt_data_bank_read_addr[i]),
             .downstream_read_valid_o     (gnt_data_bank_read_valid[i]),
@@ -1437,6 +1445,9 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
             .upstream_write_ready_o      (meta_bank_write_ready[i]),
+            // Meta side does not have (D) gating today; tie to 1 (no-op
+            // for the existing buffer code paths).
+            .upstream_write_target_valid_i (1'b1),
 
             .downstream_read_addr_o      (gnt_meta_bank_read_addr[i]),
             .downstream_read_valid_o     (gnt_meta_bank_read_valid[i]),
@@ -1869,6 +1880,12 @@ module insitu_cache_bank_access_controller #(
     /// (wb_active, populate-with-conflict, etc.) so that ACCUMULATE-CONCURRENT-
     /// MERGE-class optimizations can be added safely in later phases.
     output logic                                    upstream_write_ready_o,
+    /// Phase 3 advisory: the line being written is currently in VALID state
+    /// (already cached).  When 1, the buffer's ACCUMULATE-CONCURRENT-MERGE
+    /// branch may safely fire (preserving old parts).  When 0 (line is
+    /// INVALID/PEND), the buffer falls back to REPLACE-merge to avoid
+    /// confusing the cache controller's status-array protocol.
+    input  logic                                    upstream_write_target_valid_i,
 
     /// Downstream Read port
     output addr_t                                   downstream_read_addr_o,
@@ -2018,6 +2035,7 @@ module insitu_cache_bank_access_controller #(
             .wb_data_o      (fwd_wb_data),
             .wb_mask_o      (fwd_wb_mask),
             .wb_done_i      (fwd_wb_done),
+            .wr_target_valid_i (upstream_write_target_valid_i),
             .fwd_rdata_o    (fwd_rdata),
             .fwd_hit_o      (fwd_hit),
             .stat_rd_hit_o  (),
@@ -2066,6 +2084,7 @@ module insitu_cache_bank_access_controller #(
             .wb_data_o      (fwd_wb_data),
             .wb_mask_o      (fwd_wb_mask),
             .wb_done_i      (fwd_wb_done),
+            .wr_target_valid_i (upstream_write_target_valid_i),
             .fwd_rdata_o    (fwd_rdata),
             .fwd_hit_o      (fwd_hit),
             .buf_has_free_clean_o (buf_has_free_clean),

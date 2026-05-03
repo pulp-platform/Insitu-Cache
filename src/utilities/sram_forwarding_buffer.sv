@@ -91,6 +91,13 @@ module sram_forwarding_buffer #(
     output mask_t  wb_mask_o,      // writeback byte mask (only cached parts)
     input  logic   wb_done_i,      // writeback completed (clear dirty)
 
+    // -- Phase 3 advisory: target line is currently in VALID state at the
+    //    cache controller.  Used to gate the ACCUMULATE-CONCURRENT-MERGE
+    //    branch so it doesn't fire when the cache controller's status array
+    //    is mid-protocol (PEND).  Tied to 1 in modules that don't supply
+    //    the signal -- behavior reverts to baseline ACCUMULATE-anywhere.
+    input  logic   wr_target_valid_i,
+
     // -- Forwarded read data output --
     output data_t  fwd_rdata_o,    // replaces upstream read data on hit
     output logic   fwd_hit_o,      // 1 = data came from buffer (debug)
@@ -369,6 +376,47 @@ module sram_forwarding_buffer #(
                                 wr_data_i[b*ByteWidth +: ByteWidth];
                         end
                         // else: hold (already-cached part, not written).
+                    end
+                    if (Enable) buf_dirty_q <= 1'b1;
+                    stat_wr_merge <= stat_wr_merge + 1;
+                end else if (buf_valid_q && (buf_addr_q == sram_rd_addr_q)
+                             && wr_req_i && has_wr_data
+                             && (wr_addr_i == sram_rd_addr_q)
+                             && wr_parts_covered_concurrent
+                             && wr_target_valid_i) begin
+                    // ===== (D) ACCUMULATE-CONCURRENT-MERGE =====
+                    // Same-line populate AND concurrent write covered AND
+                    // the line is currently in VALID state at the cache
+                    // controller.  Preserve old parts (OR in new); only
+                    // update bytes for newly-arriving parts, hold bytes
+                    // for already-cached parts (whose data is the live,
+                    // possibly-dirty buffer state).  Wr_data merges into
+                    // newly-arriving parts on wr_mask bytes.
+                    //
+                    // The wr_target_valid_i gate (Phase 3 handshake)
+                    // ensures (D) doesn't fire when the cache controller's
+                    // status array is mid-protocol (PEND).  In PEND, the
+                    // cache controller expects a refill to land on this
+                    // way; (D)'s buffer-side absorption can leave that
+                    // refill un-issued or un-matched, leading to
+                    // WR_CONFLICT_STALL hangs.
+                    buf_parts_valid_q <= buf_parts_valid_q | sram_rd_parts_q;
+                    for (int b = 0; b < MaskBits; b++) begin
+                        automatic int p = b / PartMaskBits;
+                        if (sram_rd_parts_q[p] && !buf_parts_valid_q[p]) begin
+                            // NEW part: take wr_data on wr_mask, sram_rdata otherwise.
+                            if (wr_mask_i[b])
+                                buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                    wr_data_i[b*ByteWidth +: ByteWidth];
+                            else
+                                buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                    sram_rdata_i[b*ByteWidth +: ByteWidth];
+                        end else if (wr_parts_bm[p] && wr_mask_i[b]) begin
+                            // already-cached part with write hit: take wr_data
+                            buf_data_q[b*ByteWidth +: ByteWidth] <=
+                                wr_data_i[b*ByteWidth +: ByteWidth];
+                        end
+                        // else: hold (already-cached, no write).
                     end
                     if (Enable) buf_dirty_q <= 1'b1;
                     stat_wr_merge <= stat_wr_merge + 1;
