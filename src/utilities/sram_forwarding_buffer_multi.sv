@@ -34,6 +34,10 @@ module sram_forwarding_buffer_multi #(
     parameter bit          Enable          = 1'b1,
     parameter int unsigned PartSplit       = 1,
     parameter int unsigned NumEntries      = 2,
+    /// Parameter accepted for port-list parity with single-entry module.
+    /// Multi-entry buffer does NOT yet implement RAW forwarding -- value
+    /// is stored but unused.
+    parameter bit          EnableRawForwarding = 1'b0,
     // -- Derived (do not override) --
     localparam int unsigned DataWidth      = WordWidth * NumWordsPerLine,
     localparam int unsigned MaskBits       = DataWidth / ByteWidth,

@@ -75,6 +75,16 @@ module insitu_cache_tcdm_wrapper
     /// Whether the cache is in Write-Through mode
     /// Otherwise the cache is defualtly in Write-Back mode
     parameter bit          WriteThroughMode         = 0,
+    /// Forwarding-buffer RAW-forward.  When 1, a same-cycle read on the
+    /// data-side fwd-buffer that coincides with a buffer-absorbing write
+    /// to the same line returns the post-write merged data instead of
+    /// the pre-write value.  Adds a wide byte-mask mux from wr_data into
+    /// the buffer's response register.  Default 0 keeps the original
+    /// read-before-write semantics.  Applies to data-side buffer only;
+    /// meta-side has PartSplit=1 and rarely sees same-cycle R+W to the
+    /// same line, so we leave it tied off.
+    parameter bit          DataFwdBufEnableRawForwarding = 1'b1,
+    parameter bit          MetaFwdBufEnableRawForwarding = 1'b1,
 `ifndef TARGET_SYNTHESIS
     /// Name the cache
     parameter string       ModeleName               = "none",
@@ -1329,7 +1339,8 @@ module insitu_cache_tcdm_wrapper
             .FwdBufEntries      (1),
             .PartSplit          (PartSplit),
             .UseSpecWbIdle      (1'b1),
-            .UseSpecWbAddrTrans (1'b1)
+            .UseSpecWbAddrTrans (1'b1),
+            .EnableRawForwarding(DataFwdBufEnableRawForwarding)
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
@@ -1427,7 +1438,8 @@ module insitu_cache_tcdm_wrapper
             .UseForwardingBuffer(1'b1),
             .PartSplit          (1),
             .UseSpecWbIdle      (1'b1),
-            .UseSpecWbAddrTrans (1'b1)
+            .UseSpecWbAddrTrans (1'b1),
+            .EnableRawForwarding(MetaFwdBufEnableRawForwarding)
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1844,6 +1856,11 @@ module insitu_cache_bank_access_controller #(
     /// Option C: writeback when incoming read address differs from buffer
     /// address (predict eviction, overlap writeback with miss fetch).
     parameter bit           UseSpecWbAddrTrans      = 1'b0,
+    /// Read-after-write forwarding within the forwarding buffer.
+    /// 0: same-cycle read on a same-line write hit returns pre-write data.
+    /// 1: same-cycle read returns post-write merged data (adds a wide
+    ///    byte-mask mux from wr_data into buf_rd_data_q).
+    parameter bit           EnableRawForwarding     = 1'b0,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. Byte mask type.
@@ -2010,7 +2027,8 @@ module insitu_cache_bank_access_controller #(
             .WordWidth      (WordWidth),
             .ByteWidth      (ByteWidth),
             .Enable         (UseForwardingBuffer),
-            .PartSplit      (PartSplit)
+            .PartSplit      (PartSplit),
+            .EnableRawForwarding(EnableRawForwarding)
         ) i_fwd_buf (
             .clk_i,
             .rst_ni,
@@ -2059,7 +2077,8 @@ module insitu_cache_bank_access_controller #(
             .ByteWidth      (ByteWidth),
             .Enable         (UseForwardingBuffer),
             .PartSplit      (PartSplit),
-            .NumEntries     (FwdBufEntries)
+            .NumEntries     (FwdBufEntries),
+            .EnableRawForwarding(EnableRawForwarding)
         ) i_fwd_buf (
             .clk_i,
             .rst_ni,

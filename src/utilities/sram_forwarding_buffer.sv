@@ -41,6 +41,18 @@ module sram_forwarding_buffer #(
     /// When > 1, the buffer tracks per-part validity as a bitmap
     /// and supports incremental same-line accumulation.
     parameter int unsigned PartSplit      = 1,
+    /// Read-after-write forwarding within the buffer.
+    ///   0 (default): when a read AND write to the same line both hit the
+    ///                buffer in the same cycle, the read sees the
+    ///                **pre-write** value of buf_data_q (read-before-write
+    ///                semantics, the standard for non-blocking flop
+    ///                updates).
+    ///   1: the read response is computed from the **post-write** merged
+    ///      value -- the bytes the write touched are visible in the same
+    ///      cycle's read response.  Adds a wr_data->buf_rd_data_q
+    ///      combinational mux (byte-mask wide) before the response register;
+    ///      mildly increases the cycle's critical path.
+    parameter bit          EnableRawForwarding = 1'b0,
     // -- Derived parameters (do not override) --
     localparam int unsigned DataWidth     = WordWidth * NumWordsPerLine,
     localparam int unsigned MaskBits      = DataWidth / ByteWidth,
@@ -290,6 +302,37 @@ module sram_forwarding_buffer #(
     assign can_merge = buf_valid_q & (wr_addr_i == buf_addr_q)
                      & wr_parts_covered & has_wr_data;
 
+    // -- Post-write buf_data_q (combinational) for RAW forwarding --
+    // When EnableRawForwarding=1 AND the read+write hit the buffer in the
+    // same cycle on the SAME line, the read response should reflect the
+    // write's bytes.  buf_data_post_write is the value buf_data_q WILL hold
+    // at the next posedge for the absorption paths (wr_buf_hit_idle,
+    // wr_buf_hit_pend_disjoint, wr_full_hit -- i.e., wr_hit_comb_o cases).
+    //
+    // We feed this into the registered read response (buf_rd_data_q) so that
+    // the read sees post-write data the same cycle the read returns it.
+    //
+    // Only forward when:
+    //   * RAW forwarding is enabled,
+    //   * the buffer is going to absorb the write this cycle (wr_hit_comb_o),
+    //   * the read addr matches the write addr (same line) -- guaranteed in
+    //     practice when both hit, but explicit for safety.
+    //
+    // For non-absorbing writes (effective_write -> SRAM), the buffer is not
+    // updated by this write, so buf_data_post_write reduces to buf_data_q.
+    data_t buf_data_post_write;
+    always_comb begin
+        buf_data_post_write = buf_data_q;
+        if (EnableRawForwarding && wr_req_i && has_wr_data
+            && wr_hit_comb_o && (wr_addr_i == rd_addr_i)) begin
+            for (int b = 0; b < MaskBits; b++) begin
+                if (wr_mask_i[b])
+                    buf_data_post_write[b*ByteWidth +: ByteWidth] =
+                        wr_data_i[b*ByteWidth +: ByteWidth];
+            end
+        end
+    end
+
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
             buf_valid_q         <= 1'b0;
@@ -521,7 +564,12 @@ module sram_forwarding_buffer #(
                 if (buf_valid_q && (buf_addr_q == rd_addr_i)
                     && rd_part_match && !sram_rd_pend_q) begin
                     buf_rd_hit_q  <= 1'b1;
-                    buf_rd_data_q <= buf_data_q;
+                    // RAW forwarding: when EnableRawForwarding=1 and a
+                    // concurrent write hits the buffer for the same line,
+                    // buf_data_post_write reflects the merged value the
+                    // buffer WILL hold next cycle.  Otherwise it equals
+                    // buf_data_q (pre-write, the standard semantics).
+                    buf_rd_data_q <= buf_data_post_write;
                     stat_rd_hit <= stat_rd_hit + 1;
                 end else begin
                     buf_rd_hit_q <= 1'b0;

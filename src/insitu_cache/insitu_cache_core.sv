@@ -936,7 +936,7 @@ module insitu_cache_core
     assign bank_read_part_idx_o = (evict_full_read_req || refill_full_read_req) ? '0 : preread_part_idx;
     assign bank_read_addr_o = evict_full_read_req ? evict_full_read_addr : bank_read_addr_arb;
     assign bank_read_valid_o = evict_full_read_req ? 1'b1 : preread_bank_valid;
-    assign bank_read_all_parts_o = evict_full_read_req | refill_full_read_req;
+    assign bank_read_all_parts_o = evict_full_read_req | refill_full_read_req | preread_bank_valid;
 
     // Hash-based way selection: deterministic way from address.
     // XOR low tag bits with low set-index bits for good distribution
