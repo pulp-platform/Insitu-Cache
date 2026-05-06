@@ -281,16 +281,49 @@ module sram_forwarding_buffer #(
     // -- Writeback outputs --
     assign wb_needed_o = Enable & buf_dirty_q;
     assign wb_addr_o   = buf_addr_q;
-    assign wb_data_o   = buf_data_q;
 
-    // Writeback mask: only write back the cached parts' bytes.
+    // -- WB data + mask with concurrent-absorb merge --
+    // When a write absorbs into the dirty buffer in the SAME cycle that
+    // a spec_wb fires, the wb data must capture the absorb's bytes so
+    // SRAM stays consistent after wb_done clears dirty next cycle.
+    // When buf_dirty_q AND wr_hit_comb_o, wr_addr_i == buf_addr_q is
+    // guaranteed (C3 + wr_full_hit's clean-buffer gate together imply
+    // every wr_hit case fires only against the buffer's own line when
+    // it is dirty).  This keeps the wb path simple: we always merge
+    // absorb bytes when both signals are high, knowing the addresses
+    // match.
+    logic                  absorb_into_dirty_buf;
+    data_t                 buf_data_for_wb;
+    logic [PartSplit-1:0]  wb_parts_post_absorb;
+
+    assign absorb_into_dirty_buf = Enable & wr_req_i & wr_hit_comb_o
+                                 & buf_dirty_q & (|wr_mask_i);
+
+    always_comb begin
+        buf_data_for_wb      = buf_data_q;
+        wb_parts_post_absorb = buf_parts_valid_q;
+        if (absorb_into_dirty_buf) begin
+            for (int b = 0; b < MaskBits; b++) begin
+                if (wr_mask_i[b])
+                    buf_data_for_wb[b*ByteWidth +: ByteWidth] =
+                        wr_data_i[b*ByteWidth +: ByteWidth];
+            end
+            wb_parts_post_absorb = buf_parts_valid_q | wr_parts_bm;
+        end
+    end
+
+    assign wb_data_o = buf_data_for_wb;
+
+    // Writeback mask: cached parts' bytes (extended with the absorb's
+    // parts when a concurrent absorb merges into wb_data_o, so wr_full_hit
+    // and wr_buf_hit_pend_disjoint that add new parts are committed too).
     always_comb begin
         if (PartSplit <= 1) begin
             wb_mask_o = '1;
         end else begin
             wb_mask_o = '0;
             for (int p = 0; p < PartSplit; p++)
-                if (buf_parts_valid_q[p])
+                if (wb_parts_post_absorb[p])
                     wb_mask_o[p*PartMaskBits +: PartMaskBits] = '1;
         end
     end

@@ -2141,10 +2141,19 @@ module insitu_cache_bank_access_controller #(
     //                -> bank_gnt[other_way] -> spec_wb_fire[other_way]
     //                -> ... -> back to our spec_wb_fire.
     // The loop converges but tools flag it and synthesis breaks.
+    //
+    // The previous gate `& !(upstream_write_req_i & fwd_wr_hit)` blocked
+    // spec_wb during a concurrent absorb.  That was overly conservative:
+    // when the absorb is to the SAME line as fwd_wb_addr (true whenever
+    // buf_dirty_q AND fwd_wr_hit, by buffer's C3 + the wr_full_hit
+    // clean-buffer gate), the buffer's wb_data_o now combinationally
+    // merges the absorb's bytes/parts into the wb so SRAM stays
+    // consistent after wb_done clears dirty.  This recovers ~1 cycle per
+    // line transition in vector-store workloads (preread for next line +
+    // store for current line in the same pipeline cycle).
     assign spec_wb_fire = fwd_wb_needed & !wb_active_q
         & (access_status_q == ACCESS_THROUGH)
         & !effective_write
-        & !(upstream_write_req_i & fwd_wr_hit)
         & ( (UseSpecWbIdle      & !upstream_write_req_i)
           | (UseSpecWbAddrTrans & upstream_read_valid_i
              & !fwd_rd_hit
@@ -2221,11 +2230,33 @@ module insitu_cache_bank_access_controller #(
                         end
                     end else if (upstream_write_req_i && fwd_wr_hit) begin
                         // Write absorbed by buffer -- SRAM port is free.
-                        // BUT: block reads to a different address that
-                        // would trigger an SRAM read and evict the
-                        // just-dirtied buffer without writeback.
-                        // Next cycle buf_dirty_q=1 triggers writeback.
-                        if (upstream_read_valid_i && !fwd_rd_hit) begin
+                        // Three sub-cases for a concurrent read:
+                        //   (a) spec_wb_fire (read miss to a DIFFERENT
+                        //       line than fwd_wb_addr): drive a concurrent
+                        //       writeback so the buffer's dirty data is
+                        //       committed to SRAM before populate, AND
+                        //       let the read proceed -- pseudo_dual_port
+                        //       handles the same-cycle R+W on the SRAM
+                        //       bank.  buf_data_for_wb in the buffer
+                        //       merges the absorb's bytes into the wb.
+                        //   (b) read miss to the SAME line as fwd_wb_addr
+                        //       (or buf clean): block the read so it
+                        //       doesn't clobber the just-dirtied buffer
+                        //       on populate.  Next cycle buf_dirty_q=1
+                        //       triggers a normal eviction.
+                        //   (c) no concurrent read: nothing to do.
+                        if (spec_wb_fire) begin
+                            // (a) Concurrent spec_wb during absorb.
+                            // Read defaults pass through unchanged so
+                            // upstream_read_ready/downstream_read_valid
+                            // continue to handshake the read alongside
+                            // this writeback.
+                            downstream_write_req_o  = 1'b1;
+                            downstream_write_addr_o = fwd_wb_addr;
+                            downstream_write_data_o = fwd_wb_data;
+                            downstream_write_mask_o = fwd_wb_mask;
+                        end else if (upstream_read_valid_i && !fwd_rd_hit) begin
+                            // (b) Block read to avoid clobbering dirty buffer.
                             upstream_read_ready_o   = '0;
                             downstream_read_valid_o = '0;
                         end
