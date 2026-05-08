@@ -202,10 +202,37 @@ module sram_forwarding_buffer #(
         ((wr_parts_bm & sram_rd_parts_q) == wr_parts_bm);
 
     // -- Combinational hit checks --
-    // Read hit: suppress while SRAM read pending and the pending read
-    // is for a different address (buffer about to be overwritten).
-    assign rd_hit_comb_o = Enable & buf_valid_q & (buf_addr_q == rd_addr_i)
-                         & rd_part_match & !sram_rd_pend_q;
+    // Standard buffer hit: buf has the line, parts covered, and the
+    // pending SRAM read (if any) is NOT for a different address that
+    // would overwrite the buffer.
+    logic rd_buf_hit;
+    assign rd_buf_hit = buf_valid_q & (buf_addr_q == rd_addr_i)
+                      & rd_part_match & !sram_rd_pend_q;
+
+    // -- In-flight populate match (data on sram_rdata_i this cycle) --
+    // When the read addr equals the in-flight SRAM read addr and the
+    // populate parts cover the requested parts, the data the read
+    // wants is ALREADY combinationally on sram_rdata_i (response of
+    // the previous-cycle SRAM read).  We can serve the read directly
+    // from sram_rdata_i instead of issuing a redundant new SRAM read.
+    //
+    // Gate against a concurrent same-addr write: in that case the
+    // sram_rdata_i value reflects pre-write state, and we want
+    // pseudo_dual_port's WR_SAME_ADDR forwarding (used by the
+    // SRAM-miss path) to provide post-write data.  Falling back to
+    // the SRAM-miss path keeps RAW semantics intact without adding
+    // a separate RAW merge here.
+    logic rd_inflight_parts_covered;
+    assign rd_inflight_parts_covered =
+        ((rd_parts_bm & sram_rd_parts_q) == rd_parts_bm);
+    logic rd_inflight_hit;
+    assign rd_inflight_hit = sram_rd_pend_q
+                           & (sram_rd_addr_q == rd_addr_i)
+                           & rd_inflight_parts_covered
+                           & !(wr_req_i & (|wr_mask_i)
+                               & (wr_addr_i == sram_rd_addr_q));
+
+    assign rd_hit_comb_o = Enable & (rd_buf_hit | rd_inflight_hit);
 
     // Write hit: three paths --
     //   Normal:     buffer has the address (not during SRAM populate).
@@ -604,6 +631,17 @@ module sram_forwarding_buffer #(
                     // buf_data_q (pre-write, the standard semantics).
                     buf_rd_data_q <= buf_data_post_write;
                     stat_rd_hit <= stat_rd_hit + 1;
+                end else if (rd_inflight_hit) begin
+                    // In-flight populate match: the data the read wants
+                    // is already on sram_rdata_i this cycle (response
+                    // of the previously-issued SRAM read).  Register it
+                    // so next-cycle fwd_rdata_o returns it via the
+                    // standard buf_rd_data_q path.  No new SRAM read is
+                    // issued this cycle (rd_hit_comb_o=1 → access ctrl
+                    // suppresses downstream_read_valid_o).
+                    buf_rd_hit_q  <= 1'b1;
+                    buf_rd_data_q <= sram_rdata_i;
+                    stat_rd_hit   <= stat_rd_hit + 1;
                 end else begin
                     buf_rd_hit_q <= 1'b0;
                     stat_rd_miss <= stat_rd_miss + 1;
