@@ -53,6 +53,22 @@ module sram_forwarding_buffer #(
     ///      combinational mux (byte-mask wide) before the response register;
     ///      mildly increases the cycle's critical path.
     parameter bit          EnableRawForwarding = 1'b0,
+    /// (b3) Inflight-populate concurrent-write merge.
+    ///   0 (default): when a read targets the in-flight SRAM read addr
+    ///                (rd_inflight_hit candidate) AND a same-cycle write
+    ///                targets that same addr, rd_inflight_hit is
+    ///                suppressed; the access ctrl issues a fresh SRAM
+    ///                read and pseudo_dual_port resolves the R+W via
+    ///                WR_SAME_ADDR forwarding (or returns pre-write
+    ///                state if the write is absorbed by the buffer).
+    ///   1: rd_inflight_hit fires even with the concurrent same-addr
+    ///                write.  The buffer captures sram_rdata_i with the
+    ///                write's bytes overlaid on wr_mask -- post-write
+    ///                semantics, byte-granular, matching the value
+    ///                buf_data_q will hold at posedge T+1 (via the (D) /
+    ///                REPLACE-with-merge populate path).  Saves the
+    ///                redundant SRAM read in this scenario.
+    parameter bit          EnableInflightWriteMerge = 1'b0,
     // -- Derived parameters (do not override) --
     localparam int unsigned DataWidth     = WordWidth * NumWordsPerLine,
     localparam int unsigned MaskBits      = DataWidth / ByteWidth,
@@ -225,12 +241,17 @@ module sram_forwarding_buffer #(
     logic rd_inflight_parts_covered;
     assign rd_inflight_parts_covered =
         ((rd_parts_bm & sram_rd_parts_q) == rd_parts_bm);
+    // (b3) In-flight populate + concurrent same-addr write detector.
+    // Used both to gate the rd_inflight_hit fallback (off-mode) and to
+    // drive the response merge (on-mode).
+    logic inflight_concurrent_wr;
+    assign inflight_concurrent_wr = wr_req_i & (|wr_mask_i)
+                                  & (wr_addr_i == sram_rd_addr_q);
     logic rd_inflight_hit;
     assign rd_inflight_hit = sram_rd_pend_q
                            & (sram_rd_addr_q == rd_addr_i)
                            & rd_inflight_parts_covered
-                           & !(wr_req_i & (|wr_mask_i)
-                               & (wr_addr_i == sram_rd_addr_q));
+                           & (EnableInflightWriteMerge | !inflight_concurrent_wr);
 
     assign rd_hit_comb_o = Enable & (rd_buf_hit | rd_inflight_hit);
 
@@ -639,8 +660,23 @@ module sram_forwarding_buffer #(
                     // standard buf_rd_data_q path.  No new SRAM read is
                     // issued this cycle (rd_hit_comb_o=1 → access ctrl
                     // suppresses downstream_read_valid_o).
+                    //
+                    // (b3) EnableInflightWriteMerge: when a same-addr write
+                    // is concurrent (inflight_concurrent_wr=1), the buffer
+                    // will absorb it via the (D)/REPLACE-with-merge populate
+                    // path at posedge T+1.  Overlay wr_data on wr_mask bytes
+                    // into the response register so the read sees post-write
+                    // semantics matching the buffer's next-cycle state.
                     buf_rd_hit_q  <= 1'b1;
-                    buf_rd_data_q <= sram_rdata_i;
+                    for (int b = 0; b < MaskBits; b++) begin
+                        if (EnableInflightWriteMerge && inflight_concurrent_wr
+                            && wr_mask_i[b])
+                            buf_rd_data_q[b*ByteWidth +: ByteWidth] <=
+                                wr_data_i[b*ByteWidth +: ByteWidth];
+                        else
+                            buf_rd_data_q[b*ByteWidth +: ByteWidth] <=
+                                sram_rdata_i[b*ByteWidth +: ByteWidth];
+                    end
                     stat_rd_hit   <= stat_rd_hit + 1;
                 end else begin
                     buf_rd_hit_q <= 1'b0;

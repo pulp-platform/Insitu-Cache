@@ -1340,7 +1340,14 @@ module insitu_cache_tcdm_wrapper
             .PartSplit          (PartSplit),
             .UseSpecWbIdle      (1'b1),
             .UseSpecWbAddrTrans (1'b1),
-            .EnableRawForwarding(DataFwdBufEnableRawForwarding)
+            .EnableRawForwarding(DataFwdBufEnableRawForwarding),
+            // (b3) Inflight-populate + concurrent same-addr write merge:
+            // when a read targets the in-flight SRAM read addr AND a
+            // same-addr write is concurrent, serve the read off the
+            // populated sram_rdata_i with wr_data overlaid on wr_mask
+            // bytes -- saves the redundant SRAM read, returns post-write
+            // semantics matching buf_data_q at posedge T+1.
+            .EnableInflightWriteMerge (1'b1)
         ) i_access_ctrl_for_data (
             .clk_i,
             .rst_ni,
@@ -1861,6 +1868,13 @@ module insitu_cache_bank_access_controller #(
     /// 1: same-cycle read returns post-write merged data (adds a wide
     ///    byte-mask mux from wr_data into buf_rd_data_q).
     parameter bit           EnableRawForwarding     = 1'b0,
+    /// (b3) Inflight-populate + concurrent same-addr write merge.
+    /// When a read targets the in-flight SRAM read addr AND a same-addr
+    /// write is concurrent, serve the read off the populated
+    /// sram_rdata_i with wr_data overlaid on wr_mask bytes -- saves the
+    /// redundant SRAM read, returns post-write semantics matching
+    /// buf_data_q at posedge T+1.
+    parameter bit           EnableInflightWriteMerge = 1'b0,
     /// Dependent parameter, do not override. data type
     localparam type         data_t                  = logic [WordWidth*NumWordsPerLine-1:0],
     /// Dependent parameter, do not override. Byte mask type.
@@ -2028,7 +2042,8 @@ module insitu_cache_bank_access_controller #(
             .ByteWidth      (ByteWidth),
             .Enable         (UseForwardingBuffer),
             .PartSplit      (PartSplit),
-            .EnableRawForwarding(EnableRawForwarding)
+            .EnableRawForwarding(EnableRawForwarding),
+            .EnableInflightWriteMerge(EnableInflightWriteMerge)
         ) i_fwd_buf (
             .clk_i,
             .rst_ni,
