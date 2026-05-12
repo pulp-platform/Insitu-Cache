@@ -187,6 +187,15 @@ module sram_forwarding_buffer #(
     // Convert the access-controller's (rd_part_idx_i, rd_all_parts_i)
     // and (wr_mask_i) into per-part bitmaps so the rest of the buffer
     // logic operates uniformly on PartSplit-bit vectors.
+    //
+    // wr_parts_bm is gated by wr_req_i so that helpers derived from it
+    // (wr_parts_covered, has_wr_data, wr_full_line, all wr_*_hit signals)
+    // cannot fire spuriously on a cycle where the upstream is not
+    // requesting a write but wr_mask_i is left at a stale non-zero value
+    // from the previous request.  Otherwise the (B) PEND_DISJOINT NBA
+    // branch -- which gates only on wr_buf_hit_pend_disjoint and not
+    // wr_req_i -- could absorb stale wr_data into buf_data_q and mark
+    // the buffer dirty on a phantom write.
     logic [PartSplit-1:0] rd_parts_bm;
     logic [PartSplit-1:0] wr_parts_bm;
     always_comb begin
@@ -199,7 +208,7 @@ module sram_forwarding_buffer #(
             rd_parts_bm[rd_part_idx_i] = 1'b1;
         end
         for (int p = 0; p < PartSplit; p++)
-            wr_parts_bm[p] = |wr_mask_i[p*PartMaskBits +: PartMaskBits];
+            wr_parts_bm[p] = wr_req_i & (|wr_mask_i[p*PartMaskBits +: PartMaskBits]);
     end
 
     // -- Read part match: every requested part is in the buffer --
@@ -262,12 +271,18 @@ module sram_forwarding_buffer #(
     //   Full-line:  write mask covers all bytes -- we don't need the
     //               pre-existing SRAM data; write directly into buffer.
     //               Safe when buffer is clean or already at same address.
+    // has_wr_data / wr_full_line are gated by wr_req_i so they only
+    // assert on cycles when upstream is actually requesting a write.
+    // wr_mask_i may hold stale non-zero values from a previous request
+    // when wr_req_i=0; treating those as a fresh write absorption would
+    // corrupt buf_data_q via the wr_*_hit signals (notably the (B)
+    // PEND_DISJOINT NBA path that doesn't redundantly check wr_req_i).
     logic has_wr_data;
-    assign has_wr_data = |wr_mask_i;
+    assign has_wr_data = wr_req_i & (|wr_mask_i);
 
     // Full-line write detection: all bytes being written.
     logic wr_full_line;
-    assign wr_full_line = &wr_mask_i;
+    assign wr_full_line = wr_req_i & (&wr_mask_i);
 
     // -- Write hit classification --
     // wr_buf_hit fires in two cases:
