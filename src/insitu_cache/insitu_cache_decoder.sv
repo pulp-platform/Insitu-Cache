@@ -217,11 +217,26 @@ always_comb begin : proc_bank_decode
 
 
 
-        //3.Determine way if miss
+        //3.Determine way if miss (LRU mode ONLY).
+        //
+        // BUG FIX (cache-coverage-min phase 06): when UseHashWaySelect=1,
+        // dec_way_o was already set to _hash_way at line 132 above and must
+        // NOT be overridden here.  Without this guard the LRU-victim loop
+        // ran on every miss in hash mode too, picking the first way whose
+        // unused-LRU bits were 0 (= typically way 0) and silently
+        // overwriting the correct hash way.  That made dec_cache_status /
+        // dec_cache_dirty / dec_cache_tag read from the wrong way, so the
+        // miss FSM in insitu_cache_core (line 1837) never observed the
+        // displaced VALID+dirty victim and skipped the writeback (the
+        // bank_write commit still went to the correct hash way via
+        // hash_way_fsm/req_way_tmp, silently dropping the dirty data).
 `ifdef ENABLE_MULTI_READ_PEND
-        if (~ dec_is_hit_o & ~(dec_is_hit_pend_o & (dec_is_write_req_o | ~dec_is_hit_pend_new_entry_o)) & ~dec_is_hit_conflit_o & ~dec_is_all_pend_o) begin : proc3_find_miss_way
+        if (!UseHashWaySelect &&
+            ~ dec_is_hit_o & ~(dec_is_hit_pend_o & (dec_is_write_req_o | ~dec_is_hit_pend_new_entry_o)) &
+            ~dec_is_hit_conflit_o & ~dec_is_all_pend_o) begin : proc3_find_miss_way
 `else
-        if (~ dec_is_hit_o & ~dec_is_hit_pend_o & ~dec_is_hit_conflit_o & ~dec_is_all_pend_o) begin : proc3_find_miss_way
+        if (!UseHashWaySelect &&
+            ~ dec_is_hit_o & ~dec_is_hit_pend_o & ~dec_is_hit_conflit_o & ~dec_is_all_pend_o) begin : proc3_find_miss_way
 `endif
 
 `ifdef USE_ORIGINAL_LRU
