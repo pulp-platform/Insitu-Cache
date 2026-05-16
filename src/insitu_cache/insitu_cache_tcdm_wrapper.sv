@@ -496,6 +496,11 @@ module insitu_cache_tcdm_wrapper
     way_ptr_t               [SetAssociativity - 1 : 0]      flush_write_cache_LRU;
 
     logic                                                   flush_read_select_q, flush_read_select_d;
+    cache_bank_depth_ptr_t                                  bank_read_cache_addr_q;
+    // Per-set dirty register file -- declared early so the
+    // gen_sync_ctrl_fsm always_comb (which iterates the bank and reads
+    // dirty_rf directly for the FRESH dirty mask) can reference it.
+    logic [CacheBankDepth-1:0][SetAssociativity-1:0]        dirty_rf;
     logic                   [SetAssociativity - 1 : 0]      bank_read_way_mask_q, bank_read_way_mask_d;
     logic                                                   bank_read_sel_flush;
     `FFARN (flush_read_select_q, flush_read_select_d,       '0, clk_i, rst_ni)
@@ -776,29 +781,84 @@ module insitu_cache_tcdm_wrapper
 
                 SYNC_CTRL_FLUSH : begin
                     //Check Dirty Line
-                    for (int i = 0; i < SetAssociativity; i++) begin
-                        if ((flush_read_cache_status[i] == VALID) && (flush_read_cache_dirty[i] == 1'b1)) begin
-                            sync_ctrl_has_dirty_line = 1'b1;
-                            sync_ctrl_dirty_line = i;
-                            break;
-                        end
+                    //
+                    // Source-of-truth: dirty_rf is a per-set flop array
+                    // updated atomically on every bank_write_cache_req
+                    // (including flush's own cleanup writes).  Reading it
+                    // directly with sync_ctrl_ptr_q always yields the
+                    // FRESH dirty state for the current pointer.
+                    //
+                    // We deliberately avoid `flush_read_cache_status[i] ==
+                    // VALID` because:
+                    //   (a) on multi-way dirty sets, the initial flush_read
+                    //       used way_mask=all-1 and read all ways' status.
+                    //       But the per-way writeback's flush_read uses a
+                    //       one-hot way_mask, so subsequent cycles return
+                    //       0 for non-selected ways' status -- has_dirty
+                    //       then drops to 0 and the FSM silently advances
+                    //       ptr, leaving multi-way dirty data behind.
+                    //   (b) a write to a line implies the line is VALID
+                    //       (proc-side writes always go to a refilled
+                    //       VALID line), so dirty=1 already implies status
+                    //       != INVALID; the status check is redundant.
+                    //
+                    // The flush_full_read for tag/mask still issues a
+                    // fresh one-hot read against the meta SRAM and
+                    // captures correct tag/mask for the writeback.
+                    // Unrolled to avoid any for-loop / break evaluation
+                    // ambiguity in always_comb iteration.
+                    if (dirty_rf[sync_ctrl_ptr_q][0]) begin
+                        sync_ctrl_has_dirty_line = 1'b1;
+                        sync_ctrl_dirty_line = 2'd0;
+                    end else if (dirty_rf[sync_ctrl_ptr_q][1]) begin
+                        sync_ctrl_has_dirty_line = 1'b1;
+                        sync_ctrl_dirty_line = 2'd1;
+                    end else if (dirty_rf[sync_ctrl_ptr_q][2]) begin
+                        sync_ctrl_has_dirty_line = 1'b1;
+                        sync_ctrl_dirty_line = 2'd2;
+                    end else if (dirty_rf[sync_ctrl_ptr_q][3]) begin
+                        sync_ctrl_has_dirty_line = 1'b1;
+                        sync_ctrl_dirty_line = 2'd3;
                     end
-
-                    if (sync_ctrl_has_dirty_line) begin
+                    // STICKY DIRTY GATE: once we've committed to a dirty-line
+                    // eviction (flush_full_wait_q or flush_full_data_valid_q
+                    // is set), we MUST stay in this branch until wb_done.
+                    // `sync_ctrl_has_dirty_line` is driven by dirty_rf
+                    // directly (a flop array indexed by sync_ctrl_ptr_q),
+                    // so it's always FRESH for the current ptr -- no meta
+                    // SRAM read alignment needed for the dirty check.  The
+                    // meta SRAM is only needed for fetching tag/mask for
+                    // the writeback, which is gated by the `~wait_q &&
+                    // ~dvalid_q` sub-state inside the dirty branch (which
+                    // also gates on read alignment via flush_full_*_q).
+                    if (sync_ctrl_has_dirty_line || flush_full_wait_q || flush_full_data_valid_q) begin
                         if (PartSplit > 1) begin
                             flush_full_read_active = 1'b1;
                             if (~flush_full_wait_q && ~flush_full_data_valid_q) begin
-                                flush_full_way_d = sync_ctrl_dirty_line;
-                                flush_full_tag_d = flush_read_cache_tag[sync_ctrl_dirty_line];
-                                flush_full_mask_d = flush_read_cache_mask[sync_ctrl_dirty_line];
-                                flush_full_addr_d = sync_ctrl_ptr_q;
-                                flush_read_cache_addr = sync_ctrl_ptr_q;
-                                flush_read_cache_valid = 1'b1;
-                                flush_read_all_parts = 1'b1;
-                                flush_read_way_mask = '0;
-                                flush_read_way_mask[sync_ctrl_dirty_line] = 1'b1;
-                                if (flush_read_cache_ready) begin
-                                    flush_full_wait_d = 1'b1;
+                                // READ-COMPLETION GUARD: we need the meta
+                                // SRAM read for sync_ctrl_ptr_q to be valid
+                                // before we can latch the tag/mask for the
+                                // writeback.  If the read isn't aligned
+                                // (proc-side contention or first cycle),
+                                // re-issue and wait.
+                                if (~(flush_read_select_q
+                                      && (bank_read_cache_addr_q == sync_ctrl_ptr_q))) begin
+                                    flush_read_cache_addr = sync_ctrl_ptr_q;
+                                    flush_read_cache_valid = 1'b1;
+                                    // Don't advance into wait state yet.
+                                end else begin
+                                    flush_full_way_d = sync_ctrl_dirty_line;
+                                    flush_full_tag_d = flush_read_cache_tag[sync_ctrl_dirty_line];
+                                    flush_full_mask_d = flush_read_cache_mask[sync_ctrl_dirty_line];
+                                    flush_full_addr_d = sync_ctrl_ptr_q;
+                                    flush_read_cache_addr = sync_ctrl_ptr_q;
+                                    flush_read_cache_valid = 1'b1;
+                                    flush_read_all_parts = 1'b1;
+                                    flush_read_way_mask = '0;
+                                    flush_read_way_mask[sync_ctrl_dirty_line] = 1'b1;
+                                    if (flush_read_cache_ready) begin
+                                        flush_full_wait_d = 1'b1;
+                                    end
                                 end
                             end else if (flush_full_wait_q) begin
                                 flush_full_data_d = bank_read_cache_data[flush_full_way_q];
@@ -1125,6 +1185,7 @@ module insitu_cache_tcdm_wrapper
         .oup_ready_i(downstream_req_ready_i)
     );
 
+
     assign downstream_req_addr_o = cache_addr_hashing(
                                         down_req_payload.addr,
                                         $clog2(DownstreamWidth/8),
@@ -1151,7 +1212,22 @@ module insitu_cache_tcdm_wrapper
     /*  Flush Proc Arbiter */
     /***********************/
 
-    assign bank_read_sel_flush         = ~proc_read_cache_valid;
+    // Flush gets bank-read priority whenever the sync-ctrl FSM is in a
+    // state that actively iterates the bank: SYNC_CTRL_READ_BANK,
+    // SYNC_CTRL_INIT, and SYNC_CTRL_FLUSH all rely on flush_read_cache_*
+    // to retire.  Without this, an in-flight proc read (e.g., a refill
+    // straggler whose post-fill load is still draining the cache_core's
+    // pipeline) keeps proc_read_cache_valid high and starves the
+    // flush_read handshake.  bank_read_cache_addr_q then never updates,
+    // dirty_rf[addr_q] is read for an unrelated set, and the FSM clears
+    // each set without writeback.  Software gates new proc activity
+    // through cache_sync_ready_o, so blocking residual proc reads
+    // during flush is safe -- the proc has already issued the sync and
+    // is waiting for it to complete.
+    assign bank_read_sel_flush         = (sync_ctrl_status_q != SYNC_CTRL_IDLE
+                                          && sync_ctrl_status_q != SYNC_CTRL_FINISH)
+                                         ? 1'b1
+                                         : ~proc_read_cache_valid;
     assign bank_read_cache_valid       = bank_read_sel_flush? flush_read_cache_valid : proc_read_cache_valid;
     assign proc_read_cache_ready       = bank_read_cache_ready;
     assign flush_read_cache_ready      = bank_read_sel_flush? bank_read_cache_ready : '0;
@@ -1215,7 +1291,11 @@ module insitu_cache_tcdm_wrapper
     /*  Cache Banks  */
     /*****************/
 
-    cache_bank_depth_ptr_t bank_read_cache_addr_q;
+    // (declaration of bank_read_cache_addr_q hoisted above the
+    //  gen_sync_ctrl_fsm always_comb so the FSM's read-completion guard
+    //  can reference it -- vlog requires module-scope declarations before
+    //  use in functional always_comb expressions, even though $display
+    //  tolerates forward references.)
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
             bank_read_cache_addr_q <= '0;
@@ -1254,7 +1334,9 @@ module insitu_cache_tcdm_wrapper
     // Separating dirty from meta SRAM so that on write hits where
     // cache_mask is already all-1s, the meta SRAM write can be
     // skipped entirely (dirty and LRU handled by register files).
-    logic [CacheBankDepth-1:0][SetAssociativity-1:0] dirty_rf;
+    // (declaration of dirty_rf hoisted above the gen_sync_ctrl_fsm
+    //  always_comb so the FSM can index it directly for the fresh
+    //  dirty mask without going through the meta SRAM read pipeline.)
     logic [SetAssociativity-1:0] dirty_read_data;
     logic [SetAssociativity-1:0] dirty_meta_unused; // discarded dirty from meta SRAM
 
