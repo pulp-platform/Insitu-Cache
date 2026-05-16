@@ -85,6 +85,31 @@ module insitu_cache_decoder
     output cache_data_t                                     dec_cache_data_o
 );
 
+// =====================================================================
+//  Decoded address fields (combinational, debug-visible).
+//
+//  These are intermediate signals used by the decode FSM below.  They
+//  USED to be declared `automatic` inside the always_comb block, which
+//  meant the simulator allocated them on the call stack and they could
+//  not be added to the waveform.  They are now module-scope `logic`
+//  signals driven by continuous `assign` statements so they are
+//  visible in QuestaSim and any other waveform viewer.
+// =====================================================================
+cache_tag_t              _tag;       // tag bits of the request addr
+cache_bank_depth_ptr_t   _depth;     // depth bits of the request addr
+byte_offset_t            _ofst;      // byte-offset bits of the request addr
+way_ptr_t                _hash_way;  // hash-derived way (UseHashWaySelect mode)
+
+assign {_tag, _depth, _ofst} = cache_task_i.task_pay.request.addr;
+
+assign _hash_way = (SetAssociativity > 1)
+    ? way_ptr_t'(
+        cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) + $clog2(CacheBankDepth)
+                                           +: $clog2(SetAssociativity)] ^
+        cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8)
+                                           +: $clog2(SetAssociativity)])
+    : '0;
+
 assign dec_cache_status_o   = bank_read_cache_status_i[dec_way_o];
 assign dec_cache_dirty_o    = bank_read_cache_dirty_i[dec_way_o];
 assign dec_cache_miss_meta_o= bank_read_cache_miss_meta_i[dec_way_o];
@@ -110,21 +135,9 @@ always_comb begin : proc_bank_decode
     /* Cache Request Process */
     /*************************/
     //1. Process when prereader got request task
+    //   (_tag, _depth, _ofst, _hash_way are computed by continuous
+    //    assigns at module scope above so they show up in the waveform.)
     if (cache_task_i.valid & ~cache_task_i.is_refill) begin : prec_req_process
-        automatic cache_tag_t _tag;
-        automatic cache_bank_depth_ptr_t _depth;
-        automatic byte_offset_t _ofst;
-        automatic way_ptr_t _hash_way;
-
-
-        {_tag,_depth,_ofst} = cache_task_i.task_pay.request.addr;
-        _hash_way = '0;
-        if (SetAssociativity > 1) begin
-            _hash_way = way_ptr_t'(
-                cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) + $clog2(CacheBankDepth) +: $clog2(SetAssociativity)] ^
-                cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) +: $clog2(SetAssociativity)]
-            );
-        end
         dec_is_write_req_o = cache_task_i.task_pay.request.write;
 
 
