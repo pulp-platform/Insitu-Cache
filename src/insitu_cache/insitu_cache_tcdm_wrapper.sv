@@ -767,11 +767,24 @@ module insitu_cache_tcdm_wrapper
                 end
 
                 SYNC_CTRL_CHECK_PEND : begin
+                    // The four conditions below are derived from FIFO/handshake
+                    // counters and are reliable. We deliberately do NOT gate
+                    // on `sync_ctrl_still_pending` (= pendline_cnt_q != 0):
+                    // the encoder-maintained pendline counter can leak when
+                    // the meta SRAM read returns stale data on a PEND->VALID
+                    // refill write (a known timing race between the 1-cycle
+                    // synchronous meta SRAM and the encoder's transition
+                    // detection at insitu_cache_encoder.sv:124-156).  A
+                    // leaked counter would otherwise wedge a pure flush in
+                    // CHECK_PEND forever even though no real work is pending.
+                    // We also assert `clear_pend_cnt` on the transition into
+                    // FLUSH so subsequent post-flush operations start from a
+                    // clean counter.
                     if ((outstanding_refill_cnt_q == '0) &&
-                        ~sync_ctrl_still_pending &&
                         ~core_miss_valid &&
                         ~core_evic_valid &&
                         ~write_through_valid) begin
+                        clear_pend_cnt = 1'b1;
                         sync_ctrl_status_d = SYNC_CTRL_FLUSH;
                         sync_ctrl_ptr_d = cache_part_base_i;
                         flush_read_cache_addr = sync_ctrl_ptr_d;
