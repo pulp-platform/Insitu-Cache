@@ -1210,6 +1210,22 @@ module insitu_cache_tcdm_wrapper
     assign downstream_req_wdata_o = down_req_payload.wdata;
     assign downstream_req_wmask_o = down_req_payload.wmask;
 
+`ifndef TARGET_SYNTHESIS
+    // WB probe — off by default; enable with `+wb_trace`.
+    bit wb_trace_en_wrap = 1'b0;
+    initial wb_trace_en_wrap = $test$plusargs("wb_trace");
+    // WRITEBACK-PROBE Stage 3: writeback (write=1) leaves the wrapper's
+    // arbiter to head out toward AXI / cachepool_cache_ctrl.
+    always @(posedge clk_i) begin
+        if (wb_trace_en_wrap && rst_ni && downstream_req_valid_o
+            && downstream_req_ready_i && downstream_req_write_o) begin
+            $display("[WB-S3-WRAP %m] t=%0t DOWNSTREAM_WRITE addr=0x%0h wmask=0x%0h wdata[31:0]=0x%0h",
+                     $time, downstream_req_addr_o, downstream_req_wmask_o,
+                     downstream_req_wdata_o[31:0]);
+        end
+    end
+`endif
+
     /*******************/
     /*  Refill logics  */
     /*******************/
@@ -1618,6 +1634,79 @@ module insitu_cache_tcdm_wrapper
     end
 
     assign bank_read_cache_ready = &bank_read_cache_ready_per_way;
+
+`ifndef TARGET_SYNTHESIS
+    // ---------------------------------------------------------------------
+    // Verification IP: per-controller scoreboard.
+    // Passive observer — drives no RTL signal.  Reports phantom hits,
+    // wrong-data-on-hit, and way mismatches via $error.  See
+    //   working_dir/insitu-cache/src/verif/insitu_cache_scoreboard.sv
+    // ---------------------------------------------------------------------
+    insitu_cache_scoreboard #(
+        .CacheBankDepth    (CacheBankDepth    ),
+        .SetAssociativity  (SetAssociativity  ),
+        .CacheLineWidth    (CacheLineWidth    ),
+        .MaskWidth         (CacheLineWidth/8  ),
+        .ReqAddrWidth      ($bits(addr_t)     ),
+        .CacheTagWidth     ($bits(cache_tag_t)),
+        .UpstreamDataWidth ($bits(upstream_data_t)),
+        .UpstreamMaskWidth ($bits(cache_mask_t)),
+        .InfoWidth         ($bits(info_t)     ),
+        .CtrlName          (ModeleName        )
+    ) i_scoreboard (
+        .clk_i               (clk_i ),
+        .rst_ni              (rst_ni),
+
+        .flush_commit_valid  (flush_write_cache_req_valid &&  bank_write_cache_ready
+                                                       && !proc_write_select),
+        .flush_commit_addr   (flush_write_cache_addr   ),
+        .flush_commit_status (flush_write_cache_status ),
+        .flush_commit_dirty  (flush_write_cache_dirty  ),
+        .flush_commit_tag    (flush_write_cache_tag    ),
+
+        .proc_commit_valid   (bank_write_cache_req && bank_write_cache_ready
+                                                  && proc_write_select),
+        .proc_commit_addr    (bank_write_cache_addr                          ),
+        .proc_commit_way     (proc_write_cache_way                           ),
+        .proc_commit_status  (bank_write_cache_status[proc_write_cache_way]  ),
+        .proc_commit_dirty   (bank_write_cache_dirty [proc_write_cache_way]  ),
+        .proc_commit_tag     (bank_write_cache_tag   [proc_write_cache_way]  ),
+        .proc_commit_data    (bank_write_cache_data  [proc_write_cache_way]  ),
+        // Use the DATA-side mask (not the meta mask).  For refills the cache
+        // core sets data_mask = all-1s (writing the whole line); for write
+        // hits it sets the per-byte mask.
+        .proc_commit_mask    (bank_write_data_mask   [proc_write_cache_way]  ),
+
+        .dec_valid           ( i_insitu_cache_core.preread_task_q.valid
+                            && !i_insitu_cache_core.preread_task_q.is_refill
+                            && !i_insitu_cache_core.preread_task_q.task_pay.request.write ),
+        .dec_addr            ( i_insitu_cache_core.preread_task_q.task_pay.request.addr  ),
+        .dec_is_hit          ( i_insitu_cache_core.dec_is_hit                            ),
+        .dec_way             ( i_insitu_cache_core.dec_way                               ),
+        .dec_data            ( i_insitu_cache_core.dec_cache_data                        ),
+
+        // Upstream request snoop -- the addr fed to the cache core (already
+        // hashed by cache_addr_hashing()) and its accept handshake.  Captures
+        // each scalar/vector request as it enters the cache.
+        .upreq_valid         (upstream_req_to_cache_valid                                ),
+        .upreq_ready         (upstream_req_to_cache_ready                                ),
+        .upreq_addr          (upstream_req_to_cache_payload.addr                         ),
+        .upreq_write         (upstream_req_to_cache_payload.write                        ),
+        .upreq_wdata         (upstream_req_to_cache_payload.wdata                        ),
+        .upreq_wmask         (upstream_req_to_cache_payload.wmask                        ),
+        .upreq_info          (upstream_req_to_cache_payload.info                         ),
+
+        // Upstream response snoop -- the wrapper's actual output back to
+        // the cache_ctrl.  Lets the SB perform an end-to-end RAW check:
+        // each fired response is matched (by info) to a pending request and
+        // its data is cross-checked against the SB-tracked line.
+        .upresp_valid        (upstream_resp_valid_o                                       ),
+        .upresp_ready        (upstream_resp_ready_i                                       ),
+        .upresp_write        (upstream_resp_write_o                                       ),
+        .upresp_data         (upstream_resp_data_o                                        ),
+        .upresp_info         (upstream_resp_info_o                                        )
+    );
+`endif
 
 endmodule
 

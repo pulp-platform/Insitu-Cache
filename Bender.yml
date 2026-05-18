@@ -53,7 +53,9 @@ sources:
     #level4
     - src/flamingo/flamingo_spatz_cache_ctrl.sv
     - src/cachepool/cachepool_cache_ctrl.sv
-  
+    #verif (passive scoreboard, guarded by `ifndef TARGET_SYNTHESIS)
+    - src/verif/insitu_cache_scoreboard.sv
+
   - target: insitu_test
     files:
       #dramsys

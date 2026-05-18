@@ -406,6 +406,119 @@ module par_coalescer_equal_window #(
         );
     end
 
-       
+
+    // ====================================================================
+    // Coalescer / splitter scoreboard  (passive observer)
+    // ====================================================================
+    // Verifies the end-to-end per-port data path of the rsp_spliter +
+    // per-port spill FIFO.  For every cycle the splitter writes to a
+    // per-port spill FIFO (= upstream_resp_valid[p] & upstream_resp_ready[p]
+    // internal handshake), we enqueue the expected data slice in a model
+    // queue.  When the per-port output to upstream fires
+    // (= upstream_resp_valid_o[p] & upstream_resp_ready_i[p]), we pop the
+    // queue head and compare against the actual data delivered.
+    //
+    // Catches: splitter mis-routing (wrong ofst), per-port FIFO data
+    // corruption, write/read direction mismatch on the per-port output.
+    // ====================================================================
+`ifndef TARGET_SYNTHESIS
+    // Per-port queue of expected response data (one entry per push to the
+    // per-port spill FIFO).  Bounded by the FIFO's depth (4) at steady state.
+    upstream_data_t              sb_exp_data [NumPorts][$];
+    logic                        sb_exp_write[NumPorts][$];
+
+    longint unsigned n_pp_pushes   [NumPorts];
+    longint unsigned n_pp_pops     [NumPorts];
+    longint unsigned n_pp_data_mm  [NumPorts];
+    longint unsigned n_pp_write_mm [NumPorts];
+    longint unsigned n_pp_underflow[NumPorts];
+
+    initial begin
+        for (int p = 0; p < NumPorts; p++) begin
+            n_pp_pushes[p]    = 0;
+            n_pp_pops[p]      = 0;
+            n_pp_data_mm[p]   = 0;
+            n_pp_write_mm[p]  = 0;
+            n_pp_underflow[p] = 0;
+        end
+    end
+
+    for (genvar p = 0; p < NumPorts; p++) begin : gen_coal_sb_per_port
+        always @(posedge clk_i) begin
+            if (!rst_ni) begin
+                while (sb_exp_data[p].size() > 0) begin
+                    void'(sb_exp_data[p].pop_front());
+                    void'(sb_exp_write[p].pop_front());
+                end
+            end else begin
+                // -- PUSH: splitter wrote to per-port spill FIFO --
+                if (upstream_resp_valid[p] && upstream_resp_ready[p]) begin
+                    automatic int unsigned ofst;
+                    automatic upstream_data_t expected;
+                    ofst = downstream_resp_bundle.info.ofsts[p];
+                    expected = downstream_resp_bundle.data[ofst*UpstreamDataWidth +: UpstreamDataWidth];
+                    sb_exp_data[p].push_back(expected);
+                    sb_exp_write[p].push_back(downstream_resp_bundle.write);
+                    n_pp_pushes[p] = n_pp_pushes[p] + 1;
+                end
+                // -- POP + CHECK: per-port external rsp fired --
+                if (upstream_resp_valid_o[p] && upstream_resp_ready_i[p]) begin
+                    n_pp_pops[p] = n_pp_pops[p] + 1;
+                    if (sb_exp_data[p].size() == 0) begin
+                        n_pp_underflow[p] = n_pp_underflow[p] + 1;
+                        $error("[COAL-SB %m] port[%0d] UNDERFLOW t=%0t  external rsp fired (write=%0b data=0x%0h) but no expected entry pending in SB queue",
+                               $time, p, upstream_resp_write_o[p], upstream_resp_data_o[p]);
+                    end else begin
+                        automatic upstream_data_t expected = sb_exp_data[p].pop_front();
+                        automatic logic           expected_write = sb_exp_write[p].pop_front();
+                        // Write/read direction sanity
+                        if (upstream_resp_write_o[p] !== expected_write) begin
+                            n_pp_write_mm[p] = n_pp_write_mm[p] + 1;
+                            $error("[COAL-SB %m] port[%0d] WRITE/READ MISMATCH t=%0t  expected_write=%0b  actual_write=%0b",
+                                   $time, p, expected_write, upstream_resp_write_o[p]);
+                        end
+                        // Data check (READ only)
+                        if (!expected_write && (upstream_resp_data_o[p] !== expected)) begin
+                            n_pp_data_mm[p] = n_pp_data_mm[p] + 1;
+                            $error("[COAL-SB %m] port[%0d] SPLIT/FIFO DATA MISMATCH t=%0t  expected=0x%0h  actual=0x%0h",
+                                   $time, p, expected, upstream_resp_data_o[p]);
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    final begin
+        automatic longint unsigned total_data_mm   = 0;
+        automatic longint unsigned total_write_mm  = 0;
+        automatic longint unsigned total_underflow = 0;
+        automatic longint unsigned total_viol;
+        automatic bit              coal_sb_verbose = $test$plusargs("sb_verbose");
+        for (int p = 0; p < NumPorts; p++) begin
+            total_data_mm   += n_pp_data_mm[p];
+            total_write_mm  += n_pp_write_mm[p];
+            total_underflow += n_pp_underflow[p];
+        end
+        total_viol = total_data_mm + total_write_mm + total_underflow;
+        // -- Verbose summary: only on FAIL or +sb_verbose --
+        if (total_viol != 0 || coal_sb_verbose) begin
+            $display("[COAL-SB %m] ============================= Coalescer Scoreboard =============================");
+            for (int p = 0; p < NumPorts; p++) begin
+                $display("[COAL-SB %m]   port[%0d]: pushes=%0d  pops=%0d  data_mismatch=%0d  write_mismatch=%0d  underflow=%0d  pending_in_sb_q=%0d",
+                         p, n_pp_pushes[p], n_pp_pops[p],
+                         n_pp_data_mm[p], n_pp_write_mm[p], n_pp_underflow[p],
+                         sb_exp_data[p].size());
+            end
+            $display("[COAL-SB %m] ================================================================================");
+        end
+        // -- Always print a brief one-line STATUS --
+        if (total_viol == 0)
+            $display("[COAL-SB %m] STATUS: PASS");
+        else
+            $display("[COAL-SB %m] STATUS: FAIL (data_mm=%0d  write_mm=%0d  underflow=%0d)",
+                     total_data_mm, total_write_mm, total_underflow);
+    end
+`endif
 
 endmodule : par_coalescer_equal_window

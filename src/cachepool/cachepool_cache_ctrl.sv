@@ -926,4 +926,29 @@ module cachepool_cache_ctrl #(
 `endif
 
 
+`ifndef TARGET_SYNTHESIS
+  // WB probes (Stages 4+5) — off by default; enable with `+wb_trace`.
+  bit wb_trace_en_ctrl = 1'b0;
+  initial wb_trace_en_ctrl = $test$plusargs("wb_trace");
+  // WRITEBACK-PROBE Stage 4: writeback enters the cachepool_cache_ctrl
+  // refill-request FSM (cache_req_*) from the wrapper's downstream port.
+  always @(posedge clk_i) begin
+    if (wb_trace_en_ctrl && rst_ni && cache_req_valid && cache_req_ready && cache_req_write) begin
+      $display("[WB-S4-CTRL %m] t=%0t CACHE_REQ_WRITE addr=0x%0h strb_low=0x%0h wdata[31:0]=0x%0h",
+               $time, cache_req_addr, cache_req_strb[15:0],
+               cache_req_wdata[31:0]);
+    end
+  end
+  // WRITEBACK-PROBE Stage 5: writeback beat actually leaves the cache
+  // controller toward AXI / DRAM via the unified refill_req_o port.
+  always @(posedge clk_i) begin
+    if (wb_trace_en_ctrl && rst_ni && refill_req_valid_o && refill_req_ready_i && refill_req_o.write) begin
+      $display("[WB-S5-AXI %m] t=%0t REFILL_REQ_WRITE addr=0x%0h wstrb=0x%0h wdata[31:0]=0x%0h is_burst=%0b burst_len=%0d",
+               $time, refill_req_o.addr, refill_req_o.wstrb,
+               refill_req_o.wdata[31:0], refill_burst_o.is_burst,
+               refill_burst_o.burst_len);
+    end
+  end
+`endif
+
 endmodule : cachepool_cache_ctrl

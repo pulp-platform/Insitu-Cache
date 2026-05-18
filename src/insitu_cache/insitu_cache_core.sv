@@ -1169,6 +1169,27 @@ module insitu_cache_core
     assign downstream_req_evic_data_o = evic_fifo_out.wdata;
     assign downstream_req_evic_mask_o = evic_fifo_out.wmask;
 
+`ifndef TARGET_SYNTHESIS
+    // WB probes (Stages 1+2) — off by default; enable with `+wb_trace`.
+    bit wb_trace_en_core = 1'b0;
+    initial wb_trace_en_core = $test$plusargs("wb_trace");
+    // WRITEBACK-PROBE Stage 1: eviction queued into FIFO.
+    always @(posedge clk_i) begin
+        if (wb_trace_en_core && rst_ni && evic_fifo_push) begin
+            $display("[WB-S1-PUSH %m] t=%0t EVIC_FIFO_PUSH addr=0x%0h wmask=0x%0h wdata[31:0]=0x%0h",
+                     $time, evic_fifo_in.addr, evic_fifo_in.wmask, evic_fifo_in.wdata[31:0]);
+        end
+    end
+    // WRITEBACK-PROBE Stage 2: eviction handshake out of cache_core.
+    always @(posedge clk_i) begin
+        if (wb_trace_en_core && rst_ni && downstream_req_evic_valid_o && downstream_req_evic_ready_i) begin
+            $display("[WB-S2-EVIC %m] t=%0t EVIC_HANDSHAKE addr=0x%0h wmask=0x%0h wdata[31:0]=0x%0h",
+                     $time, downstream_req_evic_addr_o,
+                     downstream_req_evic_mask_o, downstream_req_evic_data_o[31:0]);
+        end
+    end
+`endif
+
 `ifdef ENABLE_MULTI_READ_PEND
     /**************************************/
     /*         pesudo refill fifo         */
