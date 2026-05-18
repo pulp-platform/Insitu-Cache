@@ -225,7 +225,15 @@ module insitu_cache_core
     localparam int unsigned InfoWidth                       = $bits(info_t);
     localparam int unsigned InfoStoreWidth                  = ((InfoWidth + ByteWidth - 1) / ByteWidth) * ByteWidth;
     localparam int unsigned SubarrayCounterWidth            = CacheLineWidth/WordWidth;
-    localparam int unsigned MaxNumSubarray                  = CacheLineWidth/InfoStoreWidth;
+    localparam int unsigned MaxNumSubarrayRaw               = CacheLineWidth/InfoStoreWidth;
+    // When InfoStoreWidth perfectly divides CacheLineWidth, MSHRPadWidth would
+    // collapse to 0 and `logic [MSHRPadWidth-1:0]` becomes the illegal range
+    // `logic [-1:0]`.  Reserve one MSHR slot in that case so the pad field is
+    // always at least InfoStoreWidth bits wide.
+    localparam int unsigned MaxNumSubarray                  =
+        (MaxNumSubarrayRaw > 0 && (CacheLineWidth % InfoStoreWidth) == 0)
+            ? (MaxNumSubarrayRaw - 1)
+            : MaxNumSubarrayRaw;
     localparam int unsigned NumSubarray                     = MaxNumSubarray > (2**SubarrayCounterWidth)-2? (2**SubarrayCounterWidth)-2 : MaxNumSubarray;
     localparam int unsigned SubarrayCntWidth                = (NumSubarray > 0) ? $clog2(NumSubarray + 1) : 1;
     localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoStoreWidth;
