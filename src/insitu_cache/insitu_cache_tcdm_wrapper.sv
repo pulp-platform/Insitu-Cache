@@ -522,6 +522,16 @@ module insitu_cache_tcdm_wrapper
     logic [OutstandingRefillCntWidth-1:0]                   outstanding_refill_cnt_q, outstanding_refill_cnt_d;
     logic                                                   consumed_refill_resp;
     logic                                                   issued_refill_req;
+    // CHECK_PEND additional drain delay: only advance to FLUSH after the
+    // existing drain conditions have been STABLE for N consecutive cycles,
+    // giving any in-flight install pipeline stage (preread -> bank-read ->
+    // encoder -> bank-write) time to commit before sync starts writing
+    // the meta SRAM.  The cache_core latches refill data internally
+    // before issuing the bank-write, so without this delay an install
+    // can fire DURING flush meta-writes and corrupt the tag.
+    localparam int unsigned CheckPendDrainCycles = 20;
+    logic [4:0] check_pend_drain_cnt_q, check_pend_drain_cnt_d;
+    `FFARN (check_pend_drain_cnt_q, check_pend_drain_cnt_d, '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_status_q, sync_ctrl_status_d,         SYNC_CTRL_IDLE, clk_i, rst_ni)
     `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
@@ -702,6 +712,7 @@ module insitu_cache_tcdm_wrapper
             sync_ctrl_ptr_d             = sync_ctrl_ptr_q;
             sync_ctrl_payload_d         = sync_ctrl_payload_q;
             outstanding_refill_cnt_d    = outstanding_refill_cnt_q;
+            check_pend_drain_cnt_d      = '0;  // default: reset drain counter outside CHECK_PEND
             flush_full_data_d           = flush_full_data_q;
             flush_full_mask_d           = flush_full_mask_q;
             flush_full_tag_d            = flush_full_tag_q;
@@ -793,15 +804,61 @@ module insitu_cache_tcdm_wrapper
                     // We also assert `clear_pend_cnt` on the transition into
                     // FLUSH so subsequent post-flush operations start from a
                     // clean counter.
-                    if ((outstanding_refill_cnt_q == '0) &&
-                        ~core_miss_valid &&
-                        ~core_evic_valid &&
-                        ~write_through_valid) begin
-                        clear_pend_cnt = 1'b1;
-                        sync_ctrl_status_d = SYNC_CTRL_FLUSH;
-                        sync_ctrl_ptr_d = cache_part_base_i;
-                        flush_read_cache_addr = sync_ctrl_ptr_d;
-                        flush_read_cache_valid = 1'b1;
+                    // Also wait for the cache_core's preread pipeline to be
+                    // empty.  A request can be accepted upstream, latch
+                    // into preread_task_q, complete its bank-read, then
+                    // issue a PEND meta-write and (later) an install
+                    // VALID -- all AFTER the four signals below have
+                    // already gone low.  If we advance to FLUSH/INVAL
+                    // with a preread task still in flight, the install
+                    // VALID will fire during FLUSH and race with the
+                    // sync invalidate, leaving the line VALID with a
+                    // tag wiped to 0 -- which then trips
+                    // proc_assert_read_refill_reread when its refill
+                    // response arrives.  preread_task_q is accessed via
+                    // hierarchical reference (matches the scoreboard
+                    // binding's existing pattern).
+                    // Also wait for the cache_core's refill retrieval pipeline
+                    // to be empty.  retr_fifo holds subarray refill commits
+                    // that haven't been installed yet; retr_entry tracks the
+                    // currently-installing entry.  Even after preread_task_q
+                    // goes idle, an in-flight refill that completed at the
+                    // downstream interface may still be queued in retr_fifo
+                    // waiting for the bank-write commit.  If we advance to
+                    // FLUSH/INVAL with that data still queued, the install
+                    // fires DURING the flush meta-write window and trips
+                    // proc_assert_read_refill_reread (tag wiped to 0 by
+                    // concurrent flush meta-writes).
+                    // Wait for the existing drain conditions to be stable for
+                    // CheckPendDrainCycles consecutive cycles before advancing
+                    // to FLUSH.  The cache_core's refill-install pipeline can
+                    // be 2-3 cycles deep from preread_task_q to the bank-write
+                    // commit; even after preread.valid goes low, an install
+                    // can still fire a meta-write this cycle or the next.
+                    // The extra delay lets that drain.
+                    begin
+                      automatic logic drain_now;
+                      drain_now = (outstanding_refill_cnt_q == '0) &&
+                                  ~core_miss_valid &&
+                                  ~core_evic_valid &&
+                                  ~write_through_valid &&
+                                  ~i_insitu_cache_core.preread_task_q.valid &&
+                                  i_insitu_cache_core.retr_fifo_empty;
+                      if (drain_now) begin
+                          if (check_pend_drain_cnt_q < CheckPendDrainCycles[4:0]) begin
+                              check_pend_drain_cnt_d = check_pend_drain_cnt_q + 1'b1;
+                          end else begin
+                              clear_pend_cnt = 1'b1;
+                              check_pend_drain_cnt_d = '0;
+                              sync_ctrl_status_d = SYNC_CTRL_FLUSH;
+                              sync_ctrl_ptr_d = cache_part_base_i;
+                              flush_read_cache_addr = sync_ctrl_ptr_d;
+                              flush_read_cache_valid = 1'b1;
+                              $display("[CHECK_PEND->FLUSH %m] t=%0t  drained, advancing", $time);
+                          end
+                      end else begin
+                          check_pend_drain_cnt_d = '0;
+                      end
                     end
                 end
 
@@ -1245,8 +1302,28 @@ module insitu_cache_tcdm_wrapper
 
     assign core_refill_data = downstream_resp_data_i;
     assign core_refill_info = downstream_resp_info_i;
-    assign core_refill_valid = downstream_resp_valid_i & ~downstream_resp_write_i;
-    assign downstream_resp_ready_o = downstream_resp_write_i ? 1'b1 : core_refill_ready;
+    // Defer refill-install during the sync FSM's bank-writing phases
+    // (INIT, FLUSH, INVALID).  The cache_core's install path drives
+    // the data and meta SRAMs; if it fires concurrent with the sync
+    // FSM's own bank writes the install's data lands in a partially-
+    // cleared line, which the scoreboard catches as DATA MISMATCH on
+    // the next proc read.  INIT must be included because the init-all
+    // path (insn=2'b11) skips CHECK_PEND -- it transitions
+    // READ_BANK -> INIT directly, so a refill in flight when sync
+    // starts can install during INIT writes.  We intentionally do NOT
+    // block during CHECK_PEND: the CHECK_PEND drain (see
+    // SYNC_CTRL_CHECK_PEND above) already waits for the install
+    // pipeline to empty before advancing, so there is nothing to
+    // block there and gating CHECK_PEND would stall arriving refills
+    // for the full drain window.
+    logic sync_block_install;
+    assign sync_block_install = (sync_ctrl_status_q == SYNC_CTRL_CHECK_PEND
+                              || sync_ctrl_status_q == SYNC_CTRL_INIT
+                              || sync_ctrl_status_q == SYNC_CTRL_FLUSH
+                              || sync_ctrl_status_q == SYNC_CTRL_INVALID);
+    assign core_refill_valid = downstream_resp_valid_i & ~downstream_resp_write_i & ~sync_block_install;
+    assign downstream_resp_ready_o = downstream_resp_write_i ? 1'b1
+                                  : (~sync_block_install & core_refill_ready);
     assign consumed_refill_resp = downstream_resp_valid_i & ~downstream_resp_write_i & downstream_resp_ready_o;
     assign issued_refill_req = core_miss_valid & core_miss_ready;
 
@@ -1328,6 +1405,37 @@ module insitu_cache_tcdm_wrapper
     assign bank_write_meta_skip        = proc_write_select? proc_write_meta_skip : 1'b0;
     assign bank_read_data_skip         = bank_read_sel_flush? 1'b0 : proc_read_data_skip;
 
+`ifndef TARGET_SYNTHESIS
+    // META-TRACE: log every committed meta-bank write that targets the
+    // watched depth.  Used to reconstruct the lifetime of a specific
+    // cache line (status transitions, who wrote it, sync state at the
+    // time) so we can pin down refill<->flush races that wipe the
+    // READ_PEND marker before its refill response arrives.
+    //
+    // Change META_TRACE_DEPTH to target a specific depth from the
+    // proc_assert_read_refill_reread error message.
+    localparam int unsigned META_TRACE_DEPTH = 217;
+    always_ff @(posedge clk_i) begin
+      if (rst_ni && bank_write_cache_req && bank_write_cache_ready) begin
+        if (int'(bank_write_cache_addr) == META_TRACE_DEPTH) begin
+          $display("[META-TRACE %m] t=%0t  depth=%0d  src=%s  meta_skip=%0b  sync=%0d  way_focus=%0d  status[0]=%0d  status[1]=%0d  status[2]=%0d  status[3]=%0d  tag[0]=0x%0h  tag[1]=0x%0h  tag[2]=0x%0h  tag[3]=0x%0h",
+                   $time, bank_write_cache_addr,
+                   proc_write_select ? "PROC" : "FLSH",
+                   bank_write_meta_skip,
+                   sync_ctrl_status_q,
+                   proc_write_select ? proc_write_cache_way : 4'hF,
+                   bank_write_cache_status[0],
+                   bank_write_cache_status[1],
+                   bank_write_cache_status[2],
+                   bank_write_cache_status[3],
+                   bank_write_cache_tag[0],
+                   bank_write_cache_tag[1],
+                   bank_write_cache_tag[2],
+                   bank_write_cache_tag[3]);
+        end
+      end
+    end
+`endif
 
     /*****************/
     /*  Cache Banks  */
