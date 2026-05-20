@@ -656,9 +656,22 @@ module insitu_cache_tcdm_wrapper
         assign winfo_fifo_push =        ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
 
     end else begin
-        assign upstream_req_to_cache_valid =    upstream_req_write_i?
+        // Block new upstream requests from entering the cache_core pipeline
+        // while the sync FSM is anywhere other than IDLE / FINISH.  Without
+        // this gate, a request accepted during sync can issue its PEND
+        // meta-write during the FLUSH phase; that write races with the
+        // sync invalidate, the line ends up INVALID, and the subsequent
+        // refill response trips proc_assert_read_refill_reread
+        // (insitu_cache_core.sv:1071, 1080) -- losing the proc response
+        // and hanging the sim before EOC.  Bypass-cached peripheral
+        // accesses go through a separate path and are unaffected.
+        logic sync_block_upstream;
+        assign sync_block_upstream = (sync_ctrl_status_q != SYNC_CTRL_IDLE
+                                    && sync_ctrl_status_q != SYNC_CTRL_FINISH);
+        assign upstream_req_to_cache_valid = ~sync_block_upstream &&
+                                            (upstream_req_write_i?
                                                 ~winfo_fifo_full & upstream_req_valid_i:
-                                                upstream_req_valid_i;
+                                                upstream_req_valid_i);
         assign upstream_req_ready_o        =    upstream_req_to_cache_valid & upstream_req_to_cache_ready;
 
         assign winfo_fifo_push             =    ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
