@@ -770,11 +770,19 @@ module insitu_cache_tcdm_wrapper
                     flush_read_cache_addr = sync_ctrl_ptr_q;
                     flush_read_cache_valid = 1'b1;
                     if (flush_read_cache_ready) begin
-                        if (sync_ctrl_insn_q == 2'b11) begin
-                            sync_ctrl_status_d = SYNC_CTRL_INIT;
-                        end else begin : proc_sync_ctrl_init
-                            sync_ctrl_status_d = SYNC_CTRL_CHECK_PEND;
-                        end
+                        // Always route through CHECK_PEND so the install
+                        // pipeline is drained before sync starts its own
+                        // bank writes -- both the flush path (-> FLUSH)
+                        // and the init-all path (-> INIT) must wait for
+                        // any pre-existing refill install to commit,
+                        // otherwise an in-flight install's bank-read can
+                        // sample meta DURING the sync writes and an
+                        // install bank-write can commit DURING those
+                        // sync writes, corrupting tag/status of the
+                        // line and tripping
+                        // proc_assert_read_refill_reread on the next
+                        // refill response.
+                        sync_ctrl_status_d = SYNC_CTRL_CHECK_PEND;
                     end
                 end
 
@@ -850,20 +858,28 @@ module insitu_cache_tcdm_wrapper
                                   ~core_evic_valid &&
                                   ~write_through_valid &&
                                   ~i_insitu_cache_core.preread_task_q.valid &&
-                                  i_insitu_cache_core.retr_fifo_empty;
+                                  i_insitu_cache_core.retr_fifo_empty &&
+                                  ~proc_write_cache_req;
                       if (drain_now) begin
                           if (check_pend_drain_cnt_q < CheckPendDrainCycles[4:0]) begin
                               check_pend_drain_cnt_d = check_pend_drain_cnt_q + 1'b1;
                           end else begin
                               clear_pend_cnt = 1'b1;
                               check_pend_drain_cnt_d = '0;
-                              sync_ctrl_status_d = SYNC_CTRL_FLUSH;
-                              sync_ctrl_ptr_d = cache_part_base_i;
-                              flush_read_cache_addr = sync_ctrl_ptr_d;
-                              flush_read_cache_valid = 1'b1;
+                              if (sync_ctrl_insn_q == 2'b11) begin
+                                  // init-all: ptr was set to 0 in IDLE,
+                                  // jump straight into the INIT writer.
+                                  sync_ctrl_status_d = SYNC_CTRL_INIT;
+                              end else begin
+                                  sync_ctrl_status_d = SYNC_CTRL_FLUSH;
+                                  sync_ctrl_ptr_d = cache_part_base_i;
+                                  flush_read_cache_addr = sync_ctrl_ptr_d;
+                                  flush_read_cache_valid = 1'b1;
+                              end
 `ifndef TARGET_SYNTHESIS
                               if (insitu_trace_en) begin
-                                  $display("[CHECK_PEND->FLUSH %m] t=%0t  drained, advancing", $time);
+                                  $display("[CHECK_PEND->%s %m] t=%0t  drained, advancing",
+                                           (sync_ctrl_insn_q == 2'b11) ? "INIT" : "FLUSH", $time);
                               end
 `endif
                           end
@@ -1327,9 +1343,17 @@ module insitu_cache_tcdm_wrapper
     // pipeline to empty before advancing, so there is nothing to
     // block there and gating CHECK_PEND would stall arriving refills
     // for the full drain window.
+    // CHECK_PEND is intentionally NOT blocked here.  The CHECK_PEND
+    // drain logic (see SYNC_CTRL_CHECK_PEND above) waits for
+    // outstanding_refill_cnt and preread_task_q to drain BEFORE
+    // advancing to FLUSH; if we also gate refills during CHECK_PEND
+    // the drain can never complete (the very refill we are waiting
+    // for is held at the wrapper boundary), the sync FSM wedges in
+    // CHECK_PEND, cache_sync_ready_o is never asserted, the tile's
+    // l1d_insn_ready_o never pulses, and the peripheral's
+    // l1d_lock_q[t] is stuck at 1 forever.
     logic sync_block_install;
-    assign sync_block_install = (sync_ctrl_status_q == SYNC_CTRL_CHECK_PEND
-                              || sync_ctrl_status_q == SYNC_CTRL_INIT
+    assign sync_block_install = (sync_ctrl_status_q == SYNC_CTRL_INIT
                               || sync_ctrl_status_q == SYNC_CTRL_FLUSH
                               || sync_ctrl_status_q == SYNC_CTRL_INVALID);
     assign core_refill_valid = downstream_resp_valid_i & ~downstream_resp_write_i & ~sync_block_install;
@@ -1354,12 +1378,38 @@ module insitu_cache_tcdm_wrapper
     // through cache_sync_ready_o, so blocking residual proc reads
     // during flush is safe -- the proc has already issued the sync and
     // is waiting for it to complete.
-    assign bank_read_sel_flush         = (sync_ctrl_status_q != SYNC_CTRL_IDLE
-                                          && sync_ctrl_status_q != SYNC_CTRL_FINISH)
+    // Bank-read priority:
+    //   - During the sync FSM's WRITING phases (INIT/FLUSH/INVAL) the flush
+    //     side gets the bank-read port unconditionally.  These are the
+    //     states in which sync writes the meta SRAM; if we let an install's
+    //     bank-read fire here it samples the wiped meta (status=0/tag=0)
+    //     and the install bank-write later commits with that stale data,
+    //     tripping proc_assert_read_refill_reread.
+    //   - During CHECK_PEND we intentionally DO NOT block proc reads.  The
+    //     CHECK_PEND drain (see SYNC_CTRL_CHECK_PEND above) is waiting for
+    //     the install pipeline to empty -- including any in-flight
+    //     bank-read.  Blocking proc reads here would deadlock the drain
+    //     (preread_task_q.valid would stay 1 forever, CHECK_PEND would
+    //     never advance, cache_sync_ready_o never asserts, peripheral
+    //     l1d_lock_q[t] stuck at 1).
+    //   - During IDLE/FINISH/READ_BANK, fall back to the original
+    //     priority: flush only when proc has nothing pending.
+    assign bank_read_sel_flush         = (sync_ctrl_status_q == SYNC_CTRL_INIT
+                                          || sync_ctrl_status_q == SYNC_CTRL_FLUSH
+                                          || sync_ctrl_status_q == SYNC_CTRL_INVALID)
                                          ? 1'b1
-                                         : ~proc_read_cache_valid;
+                                         : ((sync_ctrl_status_q == SYNC_CTRL_READ_BANK)
+                                              ? ~proc_read_cache_valid
+                                              : ~proc_read_cache_valid);
     assign bank_read_cache_valid       = bank_read_sel_flush? flush_read_cache_valid : proc_read_cache_valid;
-    assign proc_read_cache_ready       = bank_read_cache_ready;
+    // Fix: proc must only see ready when the arbiter is actually serving
+    // proc.  Previously this was unconditionally bank_read_cache_ready,
+    // which spuriously completed a proc handshake whenever the bank
+    // accepted a flush read -- cache_core then advanced its pipeline as
+    // if its bank-read had been accepted, but the bank had read the
+    // flush address (not the proc's), corrupting the install's view of
+    // meta and tripping proc_assert_read_refill_reread.
+    assign proc_read_cache_ready       = ~bank_read_sel_flush & bank_read_cache_ready;
     assign flush_read_cache_ready      = bank_read_sel_flush? bank_read_cache_ready : '0;
     assign bank_read_way_mask_sel      = bank_read_sel_flush? flush_read_way_mask : bank_read_way_mask;
 
