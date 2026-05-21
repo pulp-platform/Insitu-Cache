@@ -532,6 +532,13 @@ module insitu_cache_tcdm_wrapper
     localparam int unsigned CheckPendDrainCycles = 20;
     logic [4:0] check_pend_drain_cnt_q, check_pend_drain_cnt_d;
     `FFARN (check_pend_drain_cnt_q, check_pend_drain_cnt_d, '0, clk_i, rst_ni)
+`ifndef TARGET_SYNTHESIS
+    // Verbose sync-FSM and meta-bank tracing — off by default; enable
+    // with `+insitu_trace`.  Used to debug sync<->install races; assertions
+    // and scoreboard errors fire independently.
+    bit insitu_trace_en = 1'b0;
+    initial insitu_trace_en = $test$plusargs("insitu_trace");
+`endif
     `FFARN (sync_ctrl_status_q, sync_ctrl_status_d,         SYNC_CTRL_IDLE, clk_i, rst_ni)
     `FFARN (sync_ctrl_insn_q, sync_ctrl_insn_d,             '0, clk_i, rst_ni)
     `FFARN (sync_ctrl_ptr_q,sync_ctrl_ptr_d,                '0, clk_i, rst_ni)
@@ -854,7 +861,11 @@ module insitu_cache_tcdm_wrapper
                               sync_ctrl_ptr_d = cache_part_base_i;
                               flush_read_cache_addr = sync_ctrl_ptr_d;
                               flush_read_cache_valid = 1'b1;
-                              $display("[CHECK_PEND->FLUSH %m] t=%0t  drained, advancing", $time);
+`ifndef TARGET_SYNTHESIS
+                              if (insitu_trace_en) begin
+                                  $display("[CHECK_PEND->FLUSH %m] t=%0t  drained, advancing", $time);
+                              end
+`endif
                           end
                       end else begin
                           check_pend_drain_cnt_d = '0;
@@ -1416,7 +1427,7 @@ module insitu_cache_tcdm_wrapper
     // proc_assert_read_refill_reread error message.
     localparam int unsigned META_TRACE_DEPTH = 217;
     always_ff @(posedge clk_i) begin
-      if (rst_ni && bank_write_cache_req && bank_write_cache_ready) begin
+      if (insitu_trace_en && rst_ni && bank_write_cache_req && bank_write_cache_ready) begin
         if (int'(bank_write_cache_addr) == META_TRACE_DEPTH) begin
           $display("[META-TRACE %m] t=%0t  depth=%0d  src=%s  meta_skip=%0b  sync=%0d  way_focus=%0d  status[0]=%0d  status[1]=%0d  status[2]=%0d  status[3]=%0d  tag[0]=0x%0h  tag[1]=0x%0h  tag[2]=0x%0h  tag[3]=0x%0h",
                    $time, bank_write_cache_addr,
