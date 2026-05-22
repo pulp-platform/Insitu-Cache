@@ -1825,16 +1825,18 @@ module insitu_cache_tcdm_wrapper
     //   working_dir/insitu-cache/src/verif/insitu_cache_scoreboard.sv
     // ---------------------------------------------------------------------
     insitu_cache_scoreboard #(
-        .CacheBankDepth    (CacheBankDepth    ),
-        .SetAssociativity  (SetAssociativity  ),
-        .CacheLineWidth    (CacheLineWidth    ),
-        .MaskWidth         (CacheLineWidth/8  ),
-        .ReqAddrWidth      ($bits(addr_t)     ),
-        .CacheTagWidth     ($bits(cache_tag_t)),
-        .UpstreamDataWidth ($bits(upstream_data_t)),
-        .UpstreamMaskWidth ($bits(cache_mask_t)),
-        .InfoWidth         ($bits(info_t)     ),
-        .CtrlName          (ModeleName        )
+        .CacheBankDepth      (CacheBankDepth    ),
+        .SetAssociativity    (SetAssociativity  ),
+        .CacheLineWidth      (CacheLineWidth    ),
+        .MaskWidth           (CacheLineWidth/8  ),
+        .ReqAddrWidth        ($bits(addr_t)     ),
+        .CacheTagWidth       ($bits(cache_tag_t)),
+        .UpstreamDataWidth   ($bits(upstream_data_t)),
+        .UpstreamMaskWidth   ($bits(cache_mask_t)),
+        .InfoWidth           ($bits(info_t)     ),
+        .DownstreamDataWidth ($bits(downstream_data_t)),
+        .DownstreamInfoWidth ($bits(downstream_info_t)),
+        .CtrlName            (ModeleName        )
     ) i_scoreboard (
         .clk_i               (clk_i ),
         .rst_ni              (rst_ni),
@@ -1886,7 +1888,22 @@ module insitu_cache_tcdm_wrapper
         .upresp_ready        (upstream_resp_ready_i                                       ),
         .upresp_write        (upstream_resp_write_o                                       ),
         .upresp_data         (upstream_resp_data_o                                        ),
-        .upresp_info         (upstream_resp_info_o                                        )
+        .upresp_info         (upstream_resp_info_o                                        ),
+
+        // Downstream refill snoop (verif-only).  Match req fires to resp
+        // fires by info-id to recover the addr of each refill, then
+        // populate the SB shadow with the refill's line data the moment
+        // the response lands at the wrapper boundary.
+        .dwn_req_valid       (downstream_req_valid_o                                      ),
+        .dwn_req_ready       (downstream_req_ready_i                                      ),
+        .dwn_req_addr        (downstream_req_addr_o                                       ),
+        .dwn_req_info        (downstream_req_info_o                                       ),
+        .dwn_req_write       (downstream_req_write_o                                      ),
+        .dwn_resp_valid      (downstream_resp_valid_i                                     ),
+        .dwn_resp_ready      (downstream_resp_ready_o                                     ),
+        .dwn_resp_data       (downstream_resp_data_i                                      ),
+        .dwn_resp_info       (downstream_resp_info_i                                      ),
+        .dwn_resp_write      (downstream_resp_write_i                                     )
     );
 `endif
 

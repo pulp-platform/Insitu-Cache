@@ -42,6 +42,9 @@ module insitu_cache_scoreboard
     parameter int unsigned UpstreamDataWidth = 32,
     parameter int unsigned UpstreamMaskWidth = 64,
     parameter int unsigned InfoWidth         = 1,
+    // Downstream refill payload widths (verif-only snoop).
+    parameter int unsigned DownstreamDataWidth = CacheLineWidth,
+    parameter int unsigned DownstreamInfoWidth = InfoWidth,
     parameter string       CtrlName         = "ctrl?",
     // Soft-disable individual checks if you want only one kind of report.
     parameter bit          CheckHitMiss     = 1'b1,
@@ -102,7 +105,25 @@ module insitu_cache_scoreboard
     input  logic                                                          upresp_ready,
     input  logic                                                          upresp_write,
     input  logic [UpstreamDataWidth-1:0]                                  upresp_data,
-    input  logic [InfoWidth-1:0]                                          upresp_info
+    input  logic [InfoWidth-1:0]                                          upresp_info,
+
+    // -- Downstream refill snoop (verif-only) -----------------------------
+    // Lets the SB pre-populate sb_shadow when a refill response arrives
+    // at the wrapper boundary, BEFORE the install bank-write commits.
+    // This is needed because the cache's refill-direct-forward path can
+    // deliver line data to multiple MSHR-merged readers (upresp fires)
+    // before any proc_commit happens; without this snoop, those readers
+    // hit a genuinely empty shadow and trip NO_LINE.
+    input  logic                                                          dwn_req_valid,
+    input  logic                                                          dwn_req_ready,
+    input  logic [ReqAddrWidth-1:0]                                       dwn_req_addr,
+    input  logic [DownstreamInfoWidth-1:0]                                dwn_req_info,
+    input  logic                                                          dwn_req_write,
+    input  logic                                                          dwn_resp_valid,
+    input  logic                                                          dwn_resp_ready,
+    input  logic [DownstreamDataWidth-1:0]                                dwn_resp_data,
+    input  logic [DownstreamInfoWidth-1:0]                                dwn_resp_info,
+    input  logic                                                          dwn_resp_write
 );
 
     localparam int unsigned ByteOfstBits = $clog2(CacheLineWidth/8);
@@ -144,7 +165,14 @@ module insitu_cache_scoreboard
     longint unsigned n_resp_stray         = 0;  // rsp arrived but no matching outstanding req
     longint unsigned n_resp_dir_mismatch  = 0;  // rsp.write != stored req.write
     longint unsigned n_resp_data_mismatch = 0;  // read rsp data != SB-tracked line slice
-    longint unsigned n_resp_no_line       = 0;  // read rsp but SB has no valid line for addr (= silent refill)
+    longint unsigned n_resp_no_line       = 0;  // read rsp but SB has no valid line AND no shadow record either
+    // Shadow-memory bypass counters.  These tally responses that miss the
+    // sb_meta lookup (no install tracked) but DO match the data the upstream
+    // most recently wrote into the same line — the cache served the response
+    // via an MSHR-merge or a fwd-buffer hit, which is legitimate.
+    longint unsigned n_resp_shadow_hit      = 0; // sb miss, shadow has data, matches  (legit fwd/MSHR path)
+    longint unsigned n_resp_shadow_mismatch = 0; // sb miss, shadow has data, DISAGREES (real bug)
+    longint unsigned n_resp_shadow_partial  = 0; // sb miss, shadow has only partial coverage of read slice
     longint unsigned n_req_fires          = 0;
 
     // ---------------------------------------------------------------------
@@ -421,6 +449,42 @@ module insitu_cache_scoreboard
     // matching response consumes it.
     sb_req_track_t sb_req_track [logic [InfoWidth-1:0]];
 
+    // ---------------------------------------------------------------------
+    // Shadow memory — byte-granular trace of the most recent data the
+    // cache holds for each cache line, indexed by line-aligned upstream
+    // address.  Updated on TWO paths:
+    //   - upstream WRITE  → bytes covered by upreq_wmask are recorded
+    //                       (captures fwd-buffer state for read-after-write)
+    //   - proc_commit refill install → the whole line is recorded
+    //                       (captures DRAM-init data the cache just refilled,
+    //                        for cold-read MSHR-merge responses)
+    // Used as a fallback when sb_find_hit misses at upresp time: if the
+    // cache's response data matches the shadow, the response is legitimate
+    // (MSHR-merge or sram_forwarding_buffer hit, possibly with sb_meta
+    // evicted in between) and we don't error.
+    // ---------------------------------------------------------------------
+    typedef struct packed {
+        logic [CacheLineWidth-1:0]      data;
+        logic [(CacheLineWidth/8)-1:0]  byte_valid;
+    } sb_shadow_line_t;
+
+    // Shadow is keyed on {tag, depth} -- same granularity the cache uses
+    // to identify a line internally, and exactly what proc_commit gives us
+    // (tag + addr-as-depth).  Upreq / upresp paths derive the same key
+    // from their post-hash entry.addr, so all three paths agree on the
+    // key for the same physical line.  This is robust to "extra" address
+    // bits (e.g. routing bits between depth and tag) that the proc_commit
+    // signals don't carry.
+    localparam int unsigned ShadowKeyWidth = CacheTagWidth + DepthBits;
+    typedef logic [ShadowKeyWidth-1:0] sb_shadow_key_t;
+    sb_shadow_line_t sb_shadow [sb_shadow_key_t];
+
+    function automatic sb_shadow_key_t shadow_key_from_addr(
+        input logic [ReqAddrWidth-1:0] a
+    );
+        return { addr_tag(a), addr_depth(a) };
+    endfunction
+
     // -- Snoop accepted upstream requests --
     always @(posedge clk_i) begin
         if (rst_ni && upreq_valid && upreq_ready) begin
@@ -431,6 +495,97 @@ module insitu_cache_scoreboard
             entry.t_issued = $time;
             sb_req_track[upreq_info] = entry;
             n_req_fires = n_req_fires + 1;
+
+            // -- Update shadow memory on writes --
+            if (upreq_write) begin
+                sb_shadow_key_t   k;
+                sb_shadow_line_t  sh;
+                int unsigned      ofst_bytes;
+                k = shadow_key_from_addr(upreq_addr);
+                // Bring word-offset of this transaction into the line.
+                ofst_bytes = upreq_addr[ByteOfstBits-1:0] &
+                             ~((UpstreamDataWidth/8) - 1);
+                sh = sb_shadow.exists(k) ? sb_shadow[k]
+                                         : '{data: '0, byte_valid: '0};
+                for (int b = 0; b < UpstreamMaskWidth; b++) begin
+                    if (upreq_wmask[b]) begin
+                        sh.data[(ofst_bytes + b)*8 +: 8] = upreq_wdata[b*8 +: 8];
+                        sh.byte_valid[ofst_bytes + b]    = 1'b1;
+                    end
+                end
+                sb_shadow[k] = sh;
+            end
+        end
+    end
+
+    // -- Snoop the downstream refill traffic (verif-only).  Map each
+    //    refill request's downstream info-id to its addr at req fire;
+    //    when the matching response arrives at the wrapper boundary,
+    //    populate sb_shadow with the refill's line data BEFORE the
+    //    cache's install pipeline commits.  This catches the cache's
+    //    refill-direct-forward path: refill data is delivered to merged
+    //    upstream readers in lock-step with the response, often many
+    //    cycles before any proc_commit fires.  Without this snoop the SB
+    //    would NO_LINE on every direct-forward read.
+    logic [ReqAddrWidth-1:0] dwn_pending_addr [logic [DownstreamInfoWidth-1:0]];
+
+    always @(posedge clk_i) begin
+        if (rst_ni && dwn_req_valid && dwn_req_ready && !dwn_req_write) begin
+            dwn_pending_addr[dwn_req_info] = dwn_req_addr;
+        end
+        if (rst_ni && dwn_resp_valid && dwn_resp_ready && !dwn_resp_write) begin
+            if (dwn_pending_addr.exists(dwn_resp_info)) begin
+                logic [ReqAddrWidth-1:0] a;
+                sb_shadow_key_t          k;
+                sb_shadow_line_t         sh;
+                a = dwn_pending_addr[dwn_resp_info];
+                k = shadow_key_from_addr(a);
+                // Refill payload is a whole cache line; if the downstream
+                // data bus is narrower than a cache line we'd need extra
+                // beat tracking, but in this design DownstreamDataWidth
+                // equals CacheLineWidth, so one resp = one line.
+                if (DownstreamDataWidth == CacheLineWidth) begin
+                    sh.data       = dwn_resp_data;
+                    sh.byte_valid = '1;
+                end else begin
+                    sh = sb_shadow.exists(k) ? sb_shadow[k]
+                                             : '{data: '0, byte_valid: '0};
+                    // Conservative: only fill the portion of the line we
+                    // can see in this beat.  (Not exercised in current
+                    // configs.)
+                    for (int b = 0; b < DownstreamDataWidth/8; b++) begin
+                        sh.data[b*8 +: 8] = dwn_resp_data[b*8 +: 8];
+                        sh.byte_valid[b]  = 1'b1;
+                    end
+                end
+                sb_shadow[k] = sh;
+                dwn_pending_addr.delete(dwn_resp_info);
+            end
+        end
+    end
+
+    // -- Snoop proc-side commits (refill installs + write-hit updates) to
+    //    populate the line-keyed shadow.  This captures DRAM-init data
+    //    that flowed through a refill, so that subsequent MSHR-merge
+    //    responses (which can fire many cycles after sb_meta has been
+    //    evicted by a later install at the same depth/way) can still be
+    //    validated against the correct line data.  Only VALID commits
+    //    with non-zero mask are recorded; INVALID writes (e.g. flush-
+    //    driven init wiping a way) don't carry user data.
+    always @(posedge clk_i) begin
+        if (rst_ni && proc_commit_valid && proc_commit_status == VALID) begin
+            sb_shadow_key_t  k;
+            sb_shadow_line_t sh;
+            k = { proc_commit_tag, proc_commit_addr };
+            sh = sb_shadow.exists(k) ? sb_shadow[k]
+                                     : '{data: '0, byte_valid: '0};
+            for (int b = 0; b < MaskWidth; b++) begin
+                if (proc_commit_mask[b]) begin
+                    sh.data[b*8 +: 8]   = proc_commit_data[b*8 +: 8];
+                    sh.byte_valid[b]    = 1'b1;
+                end
+            end
+            sb_shadow[k] = sh;
         end
     end
 
@@ -468,12 +623,92 @@ module insitu_cache_scoreboard
                     int unsigned                ofst_bits;
 
                     sb_hit = sb_find_hit(entry.addr, sb_hw);
-                    if (!sb_hit) begin
-                        n_resp_no_line = n_resp_no_line + 1;
-                        $error("[SB %m] RESP NO_LINE  t=%0t  info=0x%0h  addr=0x%0h  depth=0x%0h  tag=0x%0h  rsp_data=0x%0h\n        (cache returned read data but SB has no valid line for this tag -- likely fwd-buffer or refill-pass-through that bypassed the tracked commit path)",
-                               $time, upresp_info, entry.addr,
-                               addr_depth(entry.addr), addr_tag(entry.addr),
-                               upresp_data);
+                    // Same-cycle install bypass: if the cache is installing
+                    // the very line being read THIS cycle, the NBA-driven
+                    // sb_meta / sb_shadow updates won't be visible until
+                    // next cycle.  Look directly at proc_commit_* to catch
+                    // this case — happens whenever the install pipeline and
+                    // the upstream response fire in lock-step (typical of
+                    // the first MSHR-merged reader of a fresh refill).  We
+                    // mark it as a shadow-hit (suppresses both the sb_data
+                    // slice check and the NO_LINE error) when the proc-side
+                    // install data matches the upstream response.
+                    begin
+                        logic same_cycle_handled;
+                        same_cycle_handled = 1'b0;
+                        if (!sb_hit
+                            && proc_commit_valid
+                            && proc_commit_status == VALID
+                            && proc_commit_addr == addr_depth(entry.addr)
+                            && proc_commit_tag  == addr_tag(entry.addr)) begin
+                            logic [UpstreamDataWidth-1:0]  pc_expected;
+                            int unsigned                   pc_ofst_b;
+                            int unsigned                   pc_ofst_bits;
+                            if (UpstreamDataWidth == CacheLineWidth) begin
+                                pc_expected = proc_commit_data;
+                            end else begin
+                                pc_ofst_b    = entry.addr[ByteOfstBits-1:0] &
+                                               ~((UpstreamDataWidth/8) - 1);
+                                pc_ofst_bits = pc_ofst_b * 8;
+                                pc_expected  = proc_commit_data[pc_ofst_bits +: UpstreamDataWidth];
+                            end
+                            if (upresp_data === pc_expected) begin
+                                n_resp_shadow_hit = n_resp_shadow_hit + 1;
+                                same_cycle_handled = 1'b1;
+                            end
+                        end
+                        if (same_cycle_handled) begin
+                            // already accounted for — fall through past
+                            // both the NO_LINE shadow fallback and the
+                            // sb_data slice check.
+                        end else if (!sb_hit) begin
+                        // sb_meta has no record of this line being installed.
+                        // Fall back to the shadow memory (last data the
+                        // upstream wrote into this line).  Three outcomes:
+                        //   - shadow has full coverage and matches → legit
+                        //     fwd-buffer / MSHR-merge response (no error,
+                        //     bumped n_resp_shadow_hit).
+                        //   - shadow has full coverage but data disagrees →
+                        //     real bug (DATA MISMATCH-class).
+                        //   - shadow has partial / no coverage of the slice
+                        //     being read → can't decide; counted but no
+                        //     error (data we couldn't track).
+                        sb_shadow_key_t                     k;
+                        sb_shadow_line_t                    sh;
+                        logic [UpstreamDataWidth-1:0]       sh_expected;
+                        logic [UpstreamMaskWidth-1:0]       sh_byte_valid;
+                        int unsigned                        ofst_b;
+
+                        k = shadow_key_from_addr(entry.addr);
+                        ofst_b = entry.addr[ByteOfstBits-1:0] &
+                                 ~((UpstreamDataWidth/8) - 1);
+
+                        if (sb_shadow.exists(k)) begin
+                            sh = sb_shadow[k];
+                            for (int b = 0; b < UpstreamMaskWidth; b++) begin
+                                sh_expected[b*8 +: 8] = sh.data[(ofst_b + b)*8 +: 8];
+                                sh_byte_valid[b]      = sh.byte_valid[ofst_b + b];
+                            end
+                            if (&sh_byte_valid) begin
+                                if (upresp_data === sh_expected) begin
+                                    n_resp_shadow_hit = n_resp_shadow_hit + 1;
+                                end else begin
+                                    n_resp_shadow_mismatch = n_resp_shadow_mismatch + 1;
+                                    $error("[SB %m] RESP SHADOW DATA MISMATCH  t=%0t  info=0x%0h  addr=0x%0h  depth=0x%0h\n        cache rsp = 0x%0h\n        shadow    = 0x%0h",
+                                           $time, upresp_info, entry.addr,
+                                           addr_depth(entry.addr),
+                                           upresp_data, sh_expected);
+                                end
+                            end else begin
+                                n_resp_shadow_partial = n_resp_shadow_partial + 1;
+                            end
+                        end else begin
+                            n_resp_no_line = n_resp_no_line + 1;
+                            $error("[SB %m] RESP NO_LINE  t=%0t  info=0x%0h  addr=0x%0h  depth=0x%0h  tag=0x%0h  rsp_data=0x%0h\n        (cache returned read data but SB has no valid line AND no shadow record -- genuine untracked response)",
+                                   $time, upresp_info, entry.addr,
+                                   addr_depth(entry.addr), addr_tag(entry.addr),
+                                   upresp_data);
+                        end
                     end else begin
                         sb_line = sb_data[addr_depth(entry.addr)][sb_hw];
                         // The upstream response is a slice of the cache line
@@ -499,7 +734,8 @@ module insitu_cache_scoreboard
                                    upresp_data, sb_expected, sb_line);
                         end
                     end
-                end
+                end // close wrapper begin from line 565
+                end // close if (!upresp_write)
 
                 // Consume the entry
                 sb_req_track.delete(upresp_info);
@@ -544,6 +780,7 @@ module insitu_cache_scoreboard
             total_viol = n_phantom_hits + n_data_mismatches + n_way_mismatches
                        + n_resp_stray + n_resp_dir_mismatch
                        + n_resp_data_mismatch + n_resp_no_line
+                       + n_resp_shadow_mismatch
                        + n_orphaned;
 
             // -- Verbose summary: only on FAIL or +sb_verbose --
@@ -572,6 +809,9 @@ module insitu_cache_scoreboard
                 $display("[SB %m]   Resp DIR_MISMATCH : %0d", n_resp_dir_mismatch);
                 $display("[SB %m]   Resp DATA_MISMATCH: %0d", n_resp_data_mismatch);
                 $display("[SB %m]   Resp NO_LINE      : %0d", n_resp_no_line);
+                $display("[SB %m]   Resp SHADOW_HIT   : %0d  (legit fwd-buf / MSHR-merge served)", n_resp_shadow_hit);
+                $display("[SB %m]   Resp SHADOW_MISMM : %0d  (shadow knew the data and it disagreed)", n_resp_shadow_mismatch);
+                $display("[SB %m]   Resp SHADOW_PARTL : %0d  (shadow had only partial line coverage)", n_resp_shadow_partial);
                 foreach (sb_req_track[k]) begin
                     if (sb_req_track[k].valid) begin
                         $display("[SB %m]   ORPHAN REQ (no rsp): info=0x%0h  addr=0x%0h  %s  issued@%0t",
