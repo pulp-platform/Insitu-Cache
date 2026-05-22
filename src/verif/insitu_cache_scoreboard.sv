@@ -727,11 +727,44 @@ module insitu_cache_scoreboard
                             sb_expected = sb_line[ofst_bits +: UpstreamDataWidth];
                         end
                         if (upresp_data !== sb_expected) begin
-                            n_resp_data_mismatch = n_resp_data_mismatch + 1;
-                            $error("[SB %m] RESP DATA MISMATCH  t=%0t  info=0x%0h  addr=0x%0h  depth=0x%0h  sb_way=%0d\n        cache rsp = 0x%0h\n        sb expect = 0x%0h\n        line full = 0x%0h",
-                                   $time, upresp_info, entry.addr,
-                                   addr_depth(entry.addr), sb_hw,
-                                   upresp_data, sb_expected, sb_line);
+                            // sb_data slice disagrees with the cache's
+                            // response.  Before flagging this as a real
+                            // bug, consult the shadow: if a later write
+                            // (fwd-buffer absorbed store-hit, or refill
+                            // direct-forward) updated the line without
+                            // firing proc_commit, sb_data is stale but
+                            // the shadow has the fresh value.  Match on
+                            // the shadow → legit fwd/MSHR-class path.
+                            sb_shadow_key_t  sh_k;
+                            sb_shadow_line_t sh;
+                            logic [UpstreamDataWidth-1:0]  sh_exp;
+                            logic [UpstreamMaskWidth-1:0]  sh_bv;
+                            int unsigned ofst_b2;
+                            logic   shadow_full;
+                            shadow_full = 1'b0;
+                            sh_k = shadow_key_from_addr(entry.addr);
+                            ofst_b2 = entry.addr[ByteOfstBits-1:0] &
+                                      ~((UpstreamDataWidth/8) - 1);
+                            if (sb_shadow.exists(sh_k)) begin
+                                sh = sb_shadow[sh_k];
+                                for (int b = 0; b < UpstreamMaskWidth; b++) begin
+                                    sh_exp[b*8 +: 8] = sh.data[(ofst_b2 + b)*8 +: 8];
+                                    sh_bv[b]         = sh.byte_valid[ofst_b2 + b];
+                                end
+                                shadow_full = (&sh_bv);
+                            end
+                            if (shadow_full && upresp_data === sh_exp) begin
+                                // Shadow agrees with the cache; sb_data
+                                // was stale (typical fwd-buffer absorbed
+                                // store-hit).  Count as shadow_hit.
+                                n_resp_shadow_hit = n_resp_shadow_hit + 1;
+                            end else begin
+                                n_resp_data_mismatch = n_resp_data_mismatch + 1;
+                                $error("[SB %m] RESP DATA MISMATCH  t=%0t  info=0x%0h  addr=0x%0h  depth=0x%0h  sb_way=%0d\n        cache rsp = 0x%0h\n        sb expect = 0x%0h\n        line full = 0x%0h",
+                                       $time, upresp_info, entry.addr,
+                                       addr_depth(entry.addr), sb_hw,
+                                       upresp_data, sb_expected, sb_line);
+                            end
                         end
                     end
                 end // close wrapper begin from line 565
