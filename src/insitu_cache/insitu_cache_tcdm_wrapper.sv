@@ -1868,6 +1868,7 @@ module insitu_cache_tcdm_wrapper
         .dec_is_hit          ( i_insitu_cache_core.dec_is_hit                            ),
         .dec_way             ( i_insitu_cache_core.dec_way                               ),
         .dec_data            ( i_insitu_cache_core.dec_cache_data                        ),
+        .dec_info            ( i_insitu_cache_core.preread_task_q.task_pay.request.info  ),
 
         // Upstream request snoop -- the addr fed to the cache core (already
         // hashed by cache_addr_hashing()) and its accept handshake.  Captures

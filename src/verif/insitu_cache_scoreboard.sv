@@ -82,6 +82,11 @@ module insitu_cache_scoreboard
     input  logic                                                          dec_is_hit,
     input  logic [$clog2(SetAssociativity)-1:0]                           dec_way,
     input  logic [CacheLineWidth-1:0]                                     dec_data,
+    // info of the request currently at the decoder (preread_task_q.info).
+    // Used to snapshot the read-time line data so the upresp data check
+    // can use the data as it WAS at read time, not the data after any
+    // intervening proc_commit updates the line.
+    input  logic [InfoWidth-1:0]                                          dec_info,
 
     // -- Upstream request snoop (post-hash, going into the cache_core) --
     // Logged when accepted (valid && ready) AND its addr's depth matches
@@ -190,7 +195,12 @@ module insitu_cache_scoreboard
 
     initial begin
         string tw_str;
+        // First try without "0x" prefix, then with "0x" prefix.
         trace_enable = $value$plusargs("sb_trace_depth=%h", trace_depth);
+        if (!trace_enable)
+            trace_enable = $value$plusargs("sb_trace_depth=0x%h", trace_depth);
+        if (!trace_enable)
+            trace_enable = $value$plusargs("sb_trace_depth=%d", trace_depth);
         if ($value$plusargs("sb_trace_way=%s", tw_str)) begin
             if (tw_str == "ALL" || tw_str == "all") begin
                 trace_all_ways = 1'b1;
@@ -442,6 +452,12 @@ module insitu_cache_scoreboard
         logic [ReqAddrWidth-1:0]       addr;
         logic                          write;
         time                           t_issued;
+        // Snapshot of the cache's line data at the moment the request
+        // was DECODED (cache hit, dec_valid fires).  Used by the upresp
+        // check so it compares against the data the cache actually
+        // returned, not against sb_data after any intervening write.
+        logic                          read_snap_valid;
+        logic [CacheLineWidth-1:0]     read_snap_line;
     } sb_req_track_t;
 
     // Associative array keyed by upreq_info (sparse — only used info-ids
@@ -489,10 +505,12 @@ module insitu_cache_scoreboard
     always @(posedge clk_i) begin
         if (rst_ni && upreq_valid && upreq_ready) begin
             sb_req_track_t entry;
-            entry.valid    = 1'b1;
-            entry.addr     = upreq_addr;
-            entry.write    = upreq_write;
-            entry.t_issued = $time;
+            entry.valid           = 1'b1;
+            entry.addr            = upreq_addr;
+            entry.write           = upreq_write;
+            entry.t_issued        = $time;
+            entry.read_snap_valid = 1'b0;
+            entry.read_snap_line  = '0;
             sb_req_track[upreq_info] = entry;
             n_req_fires = n_req_fires + 1;
 
@@ -586,6 +604,24 @@ module insitu_cache_scoreboard
                 end
             end
             sb_shadow[k] = sh;
+        end
+    end
+
+    // -- Snoop the decoder.  When dec_valid fires for a read request,
+    //    snapshot the line data the cache will return.  This is the
+    //    "data at READ time" — pin it on the request's info tracker so
+    //    the upresp check later can compare against this snapshot
+    //    instead of the live sb_data (which may have been updated by an
+    //    intervening proc_commit between read and upresp).
+    always @(posedge clk_i) begin
+        if (rst_ni && dec_valid && dec_is_hit) begin
+            if (sb_req_track.exists(dec_info)) begin
+                sb_req_track_t e;
+                e = sb_req_track[dec_info];
+                e.read_snap_valid = 1'b1;
+                e.read_snap_line  = dec_data;
+                sb_req_track[dec_info] = e;
+            end
         end
     end
 
@@ -710,7 +746,15 @@ module insitu_cache_scoreboard
                                    upresp_data);
                         end
                     end else begin
-                        sb_line = sb_data[addr_depth(entry.addr)][sb_hw];
+                        // Prefer the read-time snapshot if we captured one
+                        // at dec_valid (decoder hit).  This is "the data the
+                        // cache committed to return at the moment of the
+                        // read" and is immune to intervening proc_commits
+                        // that update sb_data between read and upresp.
+                        if (entry.read_snap_valid)
+                            sb_line = entry.read_snap_line;
+                        else
+                            sb_line = sb_data[addr_depth(entry.addr)][sb_hw];
                         // The upstream response is a slice of the cache line
                         // starting at the request's byte offset.  When the
                         // upstream data width == cache line width (typical
