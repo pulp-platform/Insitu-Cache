@@ -231,6 +231,12 @@ module insitu_cache_tcdm_wrapper
         cache_mask_t                                        wmask;
     } down_req_t;
 
+    // Single source of truth for whether the forwarding buffer is enabled
+    // on the data / meta access controllers below.  Both .UseForwardingBuffer
+    // ports take this localparam so the elaboration check just below stays
+    // in sync if it is ever toggled.
+    localparam bit UseForwardingBuffer = 1'b1;
+
     // Guard against truncating cache metadata in tag/meta banks.
 `ifndef SYNTHESIS
     initial begin
@@ -243,6 +249,21 @@ module insitu_cache_tcdm_wrapper
         if (((CacheLineWidth/WordWidth) % PartSplit) != 0) begin
             $fatal(1, "PartSplit (%0d) must divide NumWordsPerLine (%0d).",
                    PartSplit, (CacheLineWidth/WordWidth));
+        end
+    end
+    // When the forwarding buffer is enabled, UseHashWaySelect MUST be 1.
+    // With UseHashWaySelect=0 the cache_core sets bank_read_way_mask to
+    // all-ones (insitu_cache_core.sv "{SetAssociativity{1'b1}}" fallback),
+    // every way drives the SRAM port simultaneously, and the tile-level
+    // skewed-fold arbiter (cachepool_tile.sv: gen_folded_data_banks)
+    // collapses the requests onto a single partition slot per column.
+    // The buffer masks this initially by serving reads from buf_data_q,
+    // but at the first eviction the SRAM read returns the wrong row's
+    // data and the dirty install is lost.  See
+    // reports/MULTI_TILE_BUG_ROOT_CAUSE.md for the full trace.
+    initial begin
+        if (UseForwardingBuffer && !UseHashWaySelect) begin
+            $fatal(1, "[insitu_cache_tcdm_wrapper %m] Forwarding buffer is enabled but UseHashWaySelect=0.  This combination silently corrupts dirty buffer data on eviction in multi-way + skewed-fold builds.  Set UseHashWaySelect=1 (the cachepool_cluster.sv default -- multi-tile configs need it propagated through cachepool_group.sv) or disable the forwarding buffer.");
         end
     end
 `endif
@@ -1628,7 +1649,7 @@ module insitu_cache_tcdm_wrapper
             // pending a real fix.  Use the rollback (UseForwardingBuffer=0)
             // for RLC correctness; this config is for vector-rw perf runs.
             .AllowReadDuringWrite(1'b1),
-            .UseForwardingBuffer(1'b1),
+            .UseForwardingBuffer(UseForwardingBuffer),
             .FwdBufEntries      (1),
             .PartSplit          (PartSplit),
             .UseSpecWbIdle      (1'b1),
@@ -1735,7 +1756,7 @@ module insitu_cache_tcdm_wrapper
             // SRAM gives slight perf benefit on back-to-back meta reads
             // and was the long-standing default).
             .AllowReadDuringWrite (1'b0),
-            .UseForwardingBuffer(1'b1),
+            .UseForwardingBuffer(UseForwardingBuffer),
             .PartSplit          (1),
             .UseSpecWbIdle      (1'b1),
             .UseSpecWbAddrTrans (1'b1),
