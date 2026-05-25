@@ -45,11 +45,17 @@ module insitu_cache_scoreboard
     // Downstream refill payload widths (verif-only snoop).
     parameter int unsigned DownstreamDataWidth = CacheLineWidth,
     parameter int unsigned DownstreamInfoWidth = InfoWidth,
+    // Meta-mask width and the low-bit count used as MSHR sub-entry count.
+    // For our config: cache_mask_t = CacheLineWidth/8 = 64 b; the low
+    // SubarrayCntWidth bits (=3 for 7 sub-entries) are the count.
+    parameter int unsigned MetaMaskWidth     = 64,
+    parameter int unsigned SubarrayCntWidth  = 3,
     parameter string       CtrlName         = "ctrl?",
     // Soft-disable individual checks if you want only one kind of report.
     parameter bit          CheckHitMiss     = 1'b1,
     parameter bit          CheckHitData     = 1'b1,
-    parameter bit          CheckHitWay      = 1'b1
+    parameter bit          CheckHitWay      = 1'b1,
+    parameter bit          CheckMshrMask    = 1'b1
 ) (
     input  logic clk_i,
     input  logic rst_ni,
@@ -87,6 +93,20 @@ module insitu_cache_scoreboard
     // can use the data as it WAS at read time, not the data after any
     // intervening proc_commit updates the line.
     input  logic [InfoWidth-1:0]                                          dec_info,
+
+    // -- MSHR snoop (verif-only) ------------------------------------------
+    // dec_is_hit_pend: the decoder flagged a request as hitting a line
+    //   already in READ_PEND (secondary miss; about to merge into MSHR).
+    // dec_cache_mask: the meta SRAM-read mask value the cache will use to
+    //   pick the next sub-entry slot.  In READ_PEND lines, the low
+    //   SubarrayCntWidth bits hold the current sub-entry count.
+    // proc_commit_meta_mask: the mask field being committed to the meta
+    //   SRAM on this proc_commit pulse (separate from proc_commit_mask,
+    //   which is the DATA-side byte mask).  Used to mirror the cache's
+    //   meta mask write in the SB's independent count tracker.
+    input  logic                                                          dec_is_hit_pend,
+    input  logic [MetaMaskWidth-1:0]                                      dec_cache_mask,
+    input  logic [MetaMaskWidth-1:0]                                      proc_commit_meta_mask,
 
     // -- Upstream request snoop (post-hash, going into the cache_core) --
     // Logged when accepted (valid && ready) AND its addr's depth matches
@@ -147,6 +167,14 @@ module insitu_cache_scoreboard
     sb_meta_t                  sb_meta [CacheBankDepth][SetAssociativity];
     logic [CacheLineWidth-1:0] sb_data [CacheBankDepth][SetAssociativity];
 
+    // -- Independent MSHR sub-entry count tracker --
+    // Mirrors the meta-SRAM mask field for lines in READ_PEND.  Updated
+    // from proc_commit (the cache's writeback), then cross-checked
+    // against dec_cache_mask whenever the cache decodes a secondary
+    // miss.  A divergence means the cache READ a stale mask value
+    // (meta-side RAW hazard, e.g. spec-WB clobbering the buffer).
+    int unsigned sb_mshr_count [CacheBankDepth][SetAssociativity];
+
     // -- Coverage counters --
     // cov_commits[d][w]: number of proc-side commits (refill / write-hit /
     // LRU) at (d, w).
@@ -179,6 +207,9 @@ module insitu_cache_scoreboard
     longint unsigned n_resp_shadow_mismatch = 0; // sb miss, shadow has data, DISAGREES (real bug)
     longint unsigned n_resp_shadow_partial  = 0; // sb miss, shadow has only partial coverage of read slice
     longint unsigned n_req_fires          = 0;
+    // MSHR cross-check stats.
+    longint unsigned n_mshr_mask_checked   = 0; // dec_is_hit_pend pulses where SB had tracking
+    longint unsigned n_mshr_mask_mismatch  = 0; // SB count != dec_cache_mask low bits
 
     // ---------------------------------------------------------------------
     // Runtime trace: dump every commit and every read at a specific
@@ -272,6 +303,7 @@ module insitu_cache_scoreboard
                 for (int w = 0; w < SetAssociativity; w++) begin
                     sb_meta[d][w]    <= '{valid: 1'b0, dirty: 1'b0, tag: '0};
                     sb_data[d][w]    <= '0;
+                    sb_mshr_count[d][w] <= 0;
                     cov_commits[d][w] <= 0;
                     cov_reads[d][w]   <= 0;
                 end
@@ -289,6 +321,9 @@ module insitu_cache_scoreboard
                         dirty: flush_commit_dirty[w],
                         tag:   flush_commit_tag[w]
                     };
+                    // Flush moves the line out of READ_PEND -- clear MSHR
+                    // tracker so a later allocation starts from 0.
+                    sb_mshr_count[flush_commit_addr][w] <= 0;
                 end
                 n_flush_commits <= n_flush_commits + 1;
                 // -- Trace --
@@ -318,6 +353,16 @@ module insitu_cache_scoreboard
                         sb_data[proc_commit_addr][proc_commit_way][b*8 +: 8]
                             <= proc_commit_data[b*8 +: 8];
                 end
+                // -- Mirror the META mask write into the MSHR-count tracker.
+                // For READ_PEND lines, the cache writes mask = sub-entry
+                // count (1 on primary miss, count+1 on each secondary merge).
+                // Any other status clears the tracker (line is no longer in
+                // MSHR mode).
+                if (proc_commit_status == READ_PEND)
+                    sb_mshr_count[proc_commit_addr][proc_commit_way]
+                        <= int'(proc_commit_meta_mask[SubarrayCntWidth-1:0]);
+                else
+                    sb_mshr_count[proc_commit_addr][proc_commit_way] <= 0;
                 n_proc_commits <= n_proc_commits + 1;
                 cov_commits[proc_commit_addr][proc_commit_way] <=
                     cov_commits[proc_commit_addr][proc_commit_way] + 1;
@@ -423,6 +468,39 @@ module insitu_cache_scoreboard
                            sb_hit_way, sb_meta[addr_depth(dec_addr)][sb_hit_way].valid,
                                        sb_meta[addr_depth(dec_addr)][sb_hit_way].tag);
                 end
+            end
+        end
+    end
+
+    // ---------------------------------------------------------------------
+    // MSHR mask cross-check.
+    //
+    // Whenever the decoder flags a secondary miss (dec_is_hit_pend=1), the
+    // cache will merge the new request into the existing MSHR by writing
+    // its info into subarrays[dec_cache_mask[low]] and incrementing the
+    // mask.  The SB has been mirroring those mask writes via proc_commit,
+    // so its sb_mshr_count[d][w] is an INDEPENDENT prediction of what the
+    // cache should be reading from the meta SRAM at this moment.
+    //
+    // A mismatch means dec_cache_mask carries a stale value -- typically
+    // a meta-side RAW-hazard (e.g. spec-WB clobbering the forwarding
+    // buffer) -- which is the kind of bug that causes two secondary
+    // misses to land on the same slot and silently lose sub-entries
+    // across the refill.
+    // ---------------------------------------------------------------------
+    always @(posedge clk_i) begin
+        if (rst_ni && CheckMshrMask && dec_valid && dec_is_hit_pend) begin
+            automatic int unsigned d_idx     = addr_depth(dec_addr);
+            automatic int unsigned sb_cnt    = sb_mshr_count[d_idx][dec_way];
+            automatic int unsigned cache_cnt = int'(dec_cache_mask[SubarrayCntWidth-1:0]);
+            n_mshr_mask_checked <= n_mshr_mask_checked + 1;
+            if (sb_cnt != cache_cnt) begin
+                n_mshr_mask_mismatch <= n_mshr_mask_mismatch + 1;
+                $error("[SB %m] MSHR MASK MISMATCH  t=%0t  addr=0x%0h  depth=0x%0h  way=%0d\n        sb tracked count = %0d\n        cache dec_cache_mask = 0x%0h (low %0d bits = %0d)\n        (meta-side RAW hazard? new secondary miss will land on slot %0d, possibly overwriting an earlier entry)",
+                       $time, dec_addr, d_idx, dec_way,
+                       sb_cnt,
+                       dec_cache_mask, SubarrayCntWidth, cache_cnt,
+                       cache_cnt);
             end
         end
     end
@@ -858,6 +936,7 @@ module insitu_cache_scoreboard
                        + n_resp_stray + n_resp_dir_mismatch
                        + n_resp_data_mismatch + n_resp_no_line
                        + n_resp_shadow_mismatch
+                       + n_mshr_mask_mismatch
                        + n_orphaned;
 
             // -- Verbose summary: only on FAIL or +sb_verbose --
@@ -889,6 +968,9 @@ module insitu_cache_scoreboard
                 $display("[SB %m]   Resp SHADOW_HIT   : %0d  (legit fwd-buf / MSHR-merge served)", n_resp_shadow_hit);
                 $display("[SB %m]   Resp SHADOW_MISMM : %0d  (shadow knew the data and it disagreed)", n_resp_shadow_mismatch);
                 $display("[SB %m]   Resp SHADOW_PARTL : %0d  (shadow had only partial line coverage)", n_resp_shadow_partial);
+                $display("[SB %m]   --- MSHR meta-mask checks ---");
+                $display("[SB %m]   MSHR mask checked : %0d", n_mshr_mask_checked);
+                $display("[SB %m]   MSHR mask MISMATCH: %0d  (stale dec_cache_mask read; meta RAW hazard)", n_mshr_mask_mismatch);
                 foreach (sb_req_track[k]) begin
                     if (sb_req_track[k].valid) begin
                         $display("[SB %m]   ORPHAN REQ (no rsp): info=0x%0h  addr=0x%0h  %s  issued@%0t",

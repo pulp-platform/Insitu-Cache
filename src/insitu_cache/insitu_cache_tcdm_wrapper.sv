@@ -1752,15 +1752,20 @@ module insitu_cache_tcdm_wrapper
             .NumWordsPerLine    (1),
             .WordWidth          ($bits(cache_meta_t)),
             .ByteWidth          ($bits(cache_meta_t)),
-            // Meta path: HEAD baseline (buffer + spec-WB on for the meta
-            // SRAM gives slight perf benefit on back-to-back meta reads
-            // and was the long-standing default).
-            .AllowReadDuringWrite (1'b0),
+            // Meta path: aligned with the data-side perf knobs --
+            // AllowReadDuringWrite=1 and EnableInflightWriteMerge=1 -- so
+            // the same-cycle R+W and inflight-write-merge paths cover the
+            // secondary-miss MSHR-mask RAW hazard.  (Was AllowReadDuringWrite=0
+            // and no inflight merge previously; see the "KNOWN bug" comment
+            // in the i_access_ctrl_for_data instantiation for the original
+            // meta spec-WB race.)
+            .AllowReadDuringWrite (1'b1),
             .UseForwardingBuffer(UseForwardingBuffer),
             .PartSplit          (1),
             .UseSpecWbIdle      (1'b1),
             .UseSpecWbAddrTrans (1'b1),
-            .EnableRawForwarding(MetaFwdBufEnableRawForwarding)
+            .EnableRawForwarding(MetaFwdBufEnableRawForwarding),
+            .EnableInflightWriteMerge (1'b1)
         ) i_access_ctrl_for_meta (
             .clk_i,
             .rst_ni,
@@ -1845,6 +1850,21 @@ module insitu_cache_tcdm_wrapper
     // wrong-data-on-hit, and way mismatches via $error.  See
     //   working_dir/insitu-cache/src/verif/insitu_cache_scoreboard.sv
     // ---------------------------------------------------------------------
+    // MSHR sub-entry count = low SubarrayCntWidth bits of the meta mask.
+    // Recompute the cache_core's localparams locally so the SB doesn't have
+    // to re-derive them.  Keep these in sync with insitu_cache_core.sv.
+    localparam int unsigned SBInfoWidth         = $bits(info_t);
+    localparam int unsigned SBInfoStoreWidth    = ((SBInfoWidth + ByteWidth - 1) / ByteWidth) * ByteWidth;
+    localparam int unsigned SBSubCntCounterW    = CacheLineWidth/WordWidth;
+    localparam int unsigned SBMaxNumSubarrayRaw = CacheLineWidth/SBInfoStoreWidth;
+    localparam int unsigned SBMaxNumSubarray    =
+        (SBMaxNumSubarrayRaw > 0 && (CacheLineWidth % SBInfoStoreWidth) == 0)
+            ? (SBMaxNumSubarrayRaw - 1) : SBMaxNumSubarrayRaw;
+    localparam int unsigned SBNumSubarray       =
+        SBMaxNumSubarray > (2**SBSubCntCounterW)-2 ? (2**SBSubCntCounterW)-2 : SBMaxNumSubarray;
+    localparam int unsigned SBSubarrayCntWidth  =
+        (SBNumSubarray > 0) ? $clog2(SBNumSubarray + 1) : 1;
+
     insitu_cache_scoreboard #(
         .CacheBankDepth      (CacheBankDepth    ),
         .SetAssociativity    (SetAssociativity  ),
@@ -1857,6 +1877,8 @@ module insitu_cache_tcdm_wrapper
         .InfoWidth           ($bits(info_t)     ),
         .DownstreamDataWidth ($bits(downstream_data_t)),
         .DownstreamInfoWidth ($bits(downstream_info_t)),
+        .MetaMaskWidth       ($bits(cache_mask_t)),
+        .SubarrayCntWidth    (SBSubarrayCntWidth),
         .CtrlName            (ModeleName        )
     ) i_scoreboard (
         .clk_i               (clk_i ),
@@ -1890,6 +1912,13 @@ module insitu_cache_tcdm_wrapper
         .dec_way             ( i_insitu_cache_core.dec_way                               ),
         .dec_data            ( i_insitu_cache_core.dec_cache_data                        ),
         .dec_info            ( i_insitu_cache_core.preread_task_q.task_pay.request.info  ),
+
+        // MSHR snoop: dec_is_hit_pend + raw mask read, plus the meta mask
+        // being committed (mirrored by the SB to predict what dec_cache_mask
+        // should read on the NEXT secondary-miss decode).
+        .dec_is_hit_pend     ( i_insitu_cache_core.dec_is_hit_pend                       ),
+        .dec_cache_mask      ( i_insitu_cache_core.dec_cache_mask                        ),
+        .proc_commit_meta_mask( bank_write_cache_mask[proc_write_cache_way]              ),
 
         // Upstream request snoop -- the addr fed to the cache core (already
         // hashed by cache_addr_hashing()) and its accept handshake.  Captures

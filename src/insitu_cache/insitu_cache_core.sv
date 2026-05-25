@@ -235,7 +235,17 @@ module insitu_cache_core
             ? (MaxNumSubarrayRaw - 1)
             : MaxNumSubarrayRaw;
     localparam int unsigned NumSubarray                     = MaxNumSubarray > (2**SubarrayCounterWidth)-2? (2**SubarrayCounterWidth)-2 : MaxNumSubarray;
-    localparam int unsigned SubarrayCntWidth                = (NumSubarray > 0) ? $clog2(NumSubarray + 1) : 1;
+    // SubarrayCntWidth holds values 0..NumSubarray+1.  The +1 above the
+    // stored NumSubarray accommodates the MSHR_FULL_STALL escape path in
+    // proc_refill (see ~line 2318): the refill drain count is bumped
+    // from NumSubarray to NumSubarray+1 when an extra captured request
+    // (fsm_refill_stall_q) needs to be drained alongside the SRAM-
+    // resident sub-entries.  Without the +1 here, the bump overflows
+    // back to 0 in a SubarrayCntWidth-bit context (e.g. 3'b111 + 3'b001
+    // = 3'b000), retr_fifo_push is gated off, and ALL pending sub-entry
+    // responses are silently dropped -- the originating cores hang
+    // forever on their load.
+    localparam int unsigned SubarrayCntWidth                = (NumSubarray > 0) ? $clog2(NumSubarray + 2) : 1;
     localparam int unsigned MSHRPadWidth                    = CacheLineWidth - MaxNumSubarray*InfoStoreWidth;
     localparam int unsigned TaskPayloadPad                  = ReqAddrWidth + CacheLineWidth/ByteWidth + InfoWidth - $bits(downstream_info_t);
     localparam type subarray_cnt_t                          = logic [SubarrayCntWidth-1:0];
