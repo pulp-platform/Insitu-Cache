@@ -949,6 +949,107 @@ module cachepool_cache_ctrl #(
                refill_burst_o.burst_len);
     end
   end
+
+  // ---------------------------------------------------------------------
+  // Probe D: targeted address watcher.
+  // Off by default; enable with +ctrl_write_watch plusarg.
+  // ---------------------------------------------------------------------
+  bit ctrl_write_watch_en = 1'b0;
+  initial ctrl_write_watch_en = $test$plusargs("ctrl_write_watch");
+
+  // Loop indices hoisted out of always/final blocks (debug-only).
+  int unsigned dbg_ctrlw_p;
+  int unsigned dbg_wab_p;
+  int unsigned dbg_wab_fp;
+  int unsigned dbg_wab_fs;
+
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && ctrl_write_watch_en) begin
+      for (dbg_ctrlw_p = 0; dbg_ctrlw_p < NumPorts; dbg_ctrlw_p++) begin
+        if (core_req_valid_i[dbg_ctrlw_p] && core_req_ready_o[dbg_ctrlw_p] && core_req_write_i[dbg_ctrlw_p]) begin
+          // Original and rotated forms of the 3 target addrs for FFT
+          // l1d_xbar_config(6) = full interleave, 16-bank, N=4 rotation.
+          if (core_req_addr_i[dbg_ctrlw_p] == 32'ha0001308 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'ha0001700 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'ha0001730 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000108 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000140 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000170) begin
+            $display("[CTRL-WRITE-WATCH %0t %m port %0d] addr=0x%08h data=0x%08h strb=0x%h meta=0x%h",
+                     $time, dbg_ctrlw_p, core_req_addr_i[dbg_ctrlw_p], core_req_wdata_i[dbg_ctrlw_p],
+                     core_req_wstrb_i[dbg_ctrlw_p], core_req_meta_i[dbg_ctrlw_p]);
+          end
+        end
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------
+  // Probe A: per-port write-ack balance.
+  // Count every write request entering the cache controller and every
+  // write response leaving it, per port.  At sim end, if any port has
+  // n_write_req != n_write_rsp, dump the residue and the orphan addrs.
+  // Used to root-cause the fft-32b_M1024_N16 multi-remote-port lost
+  // write-ack bug.
+  // ---------------------------------------------------------------------
+  logic [NumPorts-1:0][63:0] wab_n_req;
+  logic [NumPorts-1:0][63:0] wab_n_rsp;
+  // For each port, keep a FIFO of outstanding writes' (addr, meta) so we
+  // can dump the orphans precisely when an imbalance is detected.
+  typedef struct packed {
+    logic         valid;
+    addr_t        addr;
+    core_meta_t   meta;
+    logic [63:0]  t_issued;
+  } wab_entry_t;
+  // 32 deep matches Spatz's max-outstanding budget per port.
+  wab_entry_t [NumPorts-1:0][31:0] wab_fifo;
+  logic [NumPorts-1:0][31:0]       wab_head;  // pop here
+  logic [NumPorts-1:0][31:0]       wab_tail;  // push here
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wab_n_req <= '0;
+      wab_n_rsp <= '0;
+      wab_head  <= '0;
+      wab_tail  <= '0;
+      wab_fifo  <= '0;
+    end else begin
+      for (dbg_wab_p = 0; dbg_wab_p < NumPorts; dbg_wab_p++) begin
+        if (core_req_valid_i[dbg_wab_p] && core_req_ready_o[dbg_wab_p] && core_req_write_i[dbg_wab_p]) begin
+          wab_n_req[dbg_wab_p] <= wab_n_req[dbg_wab_p] + 64'd1;
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].valid    <= 1'b1;
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].addr     <= core_req_addr_i[dbg_wab_p];
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].meta     <= core_req_meta_i[dbg_wab_p];
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].t_issued <= 64'($time);
+          wab_tail[dbg_wab_p] <= (wab_tail[dbg_wab_p] + 32'd1) % 32'd32;
+        end
+        if (core_resp_valid_o[dbg_wab_p] && core_resp_ready_i[dbg_wab_p] && core_resp_write_o[dbg_wab_p]) begin
+          wab_n_rsp[dbg_wab_p] <= wab_n_rsp[dbg_wab_p] + 64'd1;
+          wab_fifo[dbg_wab_p][wab_head[dbg_wab_p]].valid <= 1'b0;
+          wab_head[dbg_wab_p] <= (wab_head[dbg_wab_p] + 32'd1) % 32'd32;
+        end
+      end
+    end
+  end
+
+  final begin
+    for (dbg_wab_fp = 0; dbg_wab_fp < NumPorts; dbg_wab_fp++) begin
+      if (wab_n_req[dbg_wab_fp] != wab_n_rsp[dbg_wab_fp]) begin
+        $error("[CTRL-WR-BAL %m port %0d] IMBALANCE  reqs=%0d rsps=%0d  diff=%0d",
+               dbg_wab_fp, wab_n_req[dbg_wab_fp], wab_n_rsp[dbg_wab_fp],
+               wab_n_req[dbg_wab_fp] - wab_n_rsp[dbg_wab_fp]);
+        for (dbg_wab_fs = 0; dbg_wab_fs < 32; dbg_wab_fs++) begin
+          if (wab_fifo[dbg_wab_fp][dbg_wab_fs].valid) begin
+            $display("    orphan write: slot=%0d addr=0x%08h meta=0x%0h issued@%0t",
+                     dbg_wab_fs, wab_fifo[dbg_wab_fp][dbg_wab_fs].addr,
+                     wab_fifo[dbg_wab_fp][dbg_wab_fs].meta,
+                     wab_fifo[dbg_wab_fp][dbg_wab_fs].t_issued);
+          end
+        end
+      end
+    end
+  end
 `endif
 
 endmodule : cachepool_cache_ctrl
