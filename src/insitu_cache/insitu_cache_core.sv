@@ -206,7 +206,11 @@ module insitu_cache_core
     /// different part would silently get stale data.  Pin to 1'b0 in
     /// configurations without a forwarding buffer to fall back to the
     /// conservative (always-stall) behaviour.
-    input  logic                                            bank_write_data_buf_full_cov_i
+    input  logic                                            bank_write_data_buf_full_cov_i,
+    /// Sync-flush drain observability.  Exposed so the wrapper FSM can gate
+    /// FLUSH/INIT entry on the core's drain state without hierarchical refs.
+    output logic                                            preread_task_valid_o,
+    output logic                                            retr_fifo_empty_o
 
 );
 
@@ -554,6 +558,9 @@ module insitu_cache_core
     logic                                                   downstream_refill_valid_raw;
     logic                                                   downstream_refill_ready_raw;
     `FFARN (preread_task_q,         preread_task_d,         '0, clk_i, rst_ni)
+    // Drain-state taps for the wrapper sync-flush FSM (avoid hierarchical refs).
+    assign preread_task_valid_o = preread_task_q.valid;
+    assign retr_fifo_empty_o    = retr_fifo_empty;
     localparam int unsigned                                PrereadReqHazardCycles = 0;
     localparam int unsigned                                PrereadReqHazardCntWidth =
         (PrereadReqHazardCycles > 0) ? $clog2(PrereadReqHazardCycles + 1) : 1;

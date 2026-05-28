@@ -590,6 +590,12 @@ module insitu_cache_tcdm_wrapper
     /*  Write-through / Write-back Logics  */
     /***************************************/
 
+    // Drain-state taps from the cache core for the sync-flush FSM.  Declared
+    // at module scope (before the WriteThroughMode generate) so both the FSM
+    // inside it and the i_insitu_cache_core instance below can see them.
+    logic core_preread_task_valid;
+    logic core_retr_fifo_empty;
+
     if (WriteThroughMode) begin
 
         fifo_v3 #(
@@ -878,8 +884,8 @@ module insitu_cache_tcdm_wrapper
                                   ~core_miss_valid &&
                                   ~core_evic_valid &&
                                   ~write_through_valid &&
-                                  ~i_insitu_cache_core.preread_task_q.valid &&
-                                  i_insitu_cache_core.retr_fifo_empty &&
+                                  ~core_preread_task_valid &&
+                                  core_retr_fifo_empty &&
                                   ~proc_write_cache_req;
                       if (drain_now) begin
                           if (check_pend_drain_cnt_q < CheckPendDrainCycles[4:0]) begin
@@ -1187,7 +1193,9 @@ module insitu_cache_tcdm_wrapper
         .bank_write_meta_skip_o         (proc_write_meta_skip),
         .bank_read_data_skip_o          (proc_read_data_skip),
         .bank_write_data_buf_hit_i      (bank_write_data_buf_hit),
-        .bank_write_data_buf_full_cov_i (bank_write_data_buf_full_cov)
+        .bank_write_data_buf_full_cov_i (bank_write_data_buf_full_cov),
+        .preread_task_valid_o           (core_preread_task_valid),
+        .retr_fifo_empty_o              (core_retr_fifo_empty)
     );
 
     /***************************/
