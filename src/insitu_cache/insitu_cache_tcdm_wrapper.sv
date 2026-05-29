@@ -2196,75 +2196,64 @@ module pseudo_dual_port_tcdm_wrapper #(
             status = W_ONLY;
         end
 
+        /******************************************************************/
+        /* WRITE side -- write-priority, INDEPENDENT of read arbitration. */
+        /******************************************************************/
+        // Hoisted OUT of case(status) so bank_req_write / tcdm_bank_we_o do NOT
+        // combinationally depend on read_valid_i.  This breaks the (false)
+        // grant-feedback combinational loop reported by lint:
+        //   read_valid_i -> status -> bank_req_write -> tcdm_bank_we_o
+        //     -> (tile) part_we -> any_other_write_in_col -> l1_data_bank_gnt
+        //     -> bank_gnt_i -> read_valid_i
+        // Behaviour is bit-identical: every write-bearing status (W_ONLY /
+        // WR_DIFF_BANK / WR_SAME_ADDR / WR_CONFLICT) already asserted exactly
+        // these signals with the same write_bank_addr/data/mask -- a write is
+        // always issued when it has data; the read never alters the write that
+        // is granted.
+        if (write_has_data) begin
+            bank_req_write[write_bank_select] = 1'b1;
+            bank_addr[write_bank_select]      = write_bank_addr;
+            bank_wdata[write_bank_select]     = write_data_i;
+            bank_wmask[write_bank_select]     = write_mask_i;
+        end
+
         /************/
-        /* Main FSM */
+        /* Read FSM */
         /************/
+        // Read issue depends on the shared-bank arbitration status.  Reads do
+        // NOT feed the tile grant (gnt uses part_we only), so this side is
+        // loop-free.
         case (status)
-            W_ONLY: begin
-                bank_req_write[write_bank_select] = 1'b1;
-                bank_addr[write_bank_select]    = write_bank_addr;
-                bank_wdata[write_bank_select]   = write_data_i;
-                bank_wmask[write_bank_select]   = write_mask_i;
-            end
-
-            R_ONLY: begin
+            R_ONLY, WR_DIFF_BANK: begin
+                // Read targets a bank distinct from any concurrent write (or
+                // there is no write): drive the read address directly.  In
+                // WR_DIFF_BANK read_bank_select != write_bank_select, so this
+                // does not collide with the write's bank_addr above.
                 bank_req_read[read_bank_select] = 1'b1;
                 bank_addr[read_bank_select]     = read_bank_addr;
-
-                read_data_from_line_buffer_d    = '0;
-                read_data_from_bank_select_d    = read_bank_select;
-            end
-
-            WR_DIFF_BANK: begin
-                bank_req_write[write_bank_select] = 1'b1;
-                bank_addr[write_bank_select]    = write_bank_addr;
-                bank_wdata[write_bank_select]   = write_data_i;
-                bank_wmask[write_bank_select]   = write_mask_i;
-
-                bank_req_read[read_bank_select] = 1'b1;
-                bank_addr[read_bank_select]     = read_bank_addr;
-
                 read_data_from_line_buffer_d    = '0;
                 read_data_from_bank_select_d    = read_bank_select;
             end
 
             WR_SAME_ADDR: begin
-                // Issue BOTH read and write to the same pseudo-bank.
-                // Each TCDM word-bank independently reads or writes:
-                //   - Read-only words  → SRAM read (correct data)
-                //   - Write-only words → SRAM write
-                //   - Overlapping words → SRAM write, forward from write buffer
-                bank_req_write[write_bank_select] = 1'b1;
-                bank_req_read[read_bank_select]   = 1'b1;
-                bank_addr[write_bank_select]    = write_bank_addr;
-                bank_wdata[write_bank_select]   = write_data_i;
-                bank_wmask[write_bank_select]   = write_mask_i;
-
+                // Same pseudo-bank AND same address as the write: issue the
+                // read sharing the write's bank_addr (read_bank_addr ==
+                // write_bank_addr here).  Overlapping words forward from
+                // write_line_buffer via the per-word bypass.
+                bank_req_read[read_bank_select] = 1'b1;
                 read_data_from_line_buffer_d    = '0;
                 read_data_from_bank_select_d    = read_bank_select;
             end
 
             WR_CONFLICT: begin
-                bank_req_write[write_bank_select] = 1'b1;
-                bank_addr[write_bank_select]    = write_bank_addr;
-                bank_wdata[write_bank_select]   = write_data_i;
-                bank_wmask[write_bank_select]   = write_mask_i;
-
-                read_data_from_line_buffer_d    = '0;
-                read_data_from_bank_select_d    = '0;
+                // Same bank, different address: write wins, read retries next
+                // cycle.
+                read_ready_o                 = 1'b0;
+                read_data_from_bank_select_d = '0;
             end
 
-            default : /* default */;
+            default : /* W_ONLY / IDLE: no read issued */;
         endcase
-
-        /*********************/
-        /* Read Ready Logics */
-        /*********************/
-        // Block read only on true conflict (same bank, different address).
-        // WR_SAME_ADDR uses the write-line-buffer bypass, so read can proceed.
-        if (status == WR_CONFLICT) begin
-            read_ready_o = 1'b0;
-        end
     end
 
     assign read_data_o = read_data_from_line_buffer_q? write_line_buffer: bank_rdata[read_data_from_bank_select_q];
@@ -2751,9 +2740,18 @@ module insitu_cache_bank_access_controller #(
                         upstream_read_ready_o   = '0;
                         downstream_read_valid_o = '0;
                     end else if (bank_gnt_i == '0 && !fwd_rd_hit) begin
+                        // Read lost arbitration to another way's write in the
+                        // shared skew column: squash only the READ.  The write
+                        // is unconditionally granted by the tile arbiter
+                        // (gnt = we | ~any_other_write_in_col), so it is never
+                        // gated here; squashing downstream_write_req_o on
+                        // bank_gnt_i is both a no-op (this branch is reached
+                        // only when upstream_write_req_i==0, so the default is
+                        // already 0) and would re-create the grant-feedback
+                        // combinational loop.  Leaving the write ungated breaks
+                        // the loop arm through downstream_write_req_o.
                         upstream_read_ready_o   = '0;
                         downstream_read_valid_o = '0;
-                        downstream_write_req_o  = '0;
                     end
                 end
 
