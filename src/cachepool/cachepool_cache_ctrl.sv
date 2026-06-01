@@ -44,6 +44,8 @@ module cachepool_cache_ctrl #(
   parameter int unsigned DataPartSplit                                    = 1,
   /// Use hash-based way selection (1 way per lookup, no LRU).
   parameter bit          UseHashWaySelect                                = 1'b0,
+  /// Enable the SRAM forwarding buffer (default on; requires UseHashWaySelect).
+  parameter bit          UseForwardingBuffer                             = 1'b1,
   /// Number of Pseudo-Dual Banks
   parameter int unsigned BankFactor                                       = 2,
 
@@ -316,8 +318,13 @@ module cachepool_cache_ctrl #(
   assign coalescing_line_ofst = coalescing_first_ofst << WordOfstBits;
   assign coalescing_req_addr_with_ofst =
     (coalescing_req_addr & ~(CoalescerDataWidth/8-1)) | coalescing_line_ofst;
+  // Use an ascending fixed-width (`+:`) select so the range stays legal for any
+  // PartSplit.  When PartSplit==1, CoalescerLineOfstBits == LineOfstBits, and the
+  // descending form [LineOfstBits-1:CoalescerLineOfstBits] would be a reversed
+  // range ([5:6]) that fails elaboration even though the ternary discards it.
+  // [CoalescerLineOfstBits +: PartIdxWidth] equals the old [5:4] when folded.
   assign coalescing_req_part_idx =
-    (PartSplit > 1) ? coalescing_req_addr_with_ofst[LineOfstBits-1:CoalescerLineOfstBits] : '0;
+    (PartSplit > 1) ? coalescing_req_addr_with_ofst[CoalescerLineOfstBits +: PartIdxWidth] : '0;
 
   always_comb begin
     coalescing_req_wdata = '0;
@@ -495,6 +502,7 @@ module cachepool_cache_ctrl #(
     .SetAssociativity       (SetAssociativity       ),
     .DataPartSplit          (DataPartSplit          ),
     .UseHashWaySelect       (UseHashWaySelect       ),
+    .UseForwardingBuffer    (UseForwardingBuffer    ),
     .NumPseudoDualBanks     (BankFactor             ),
     .WriteThroughMode       (0                      ),
     .WordWidth              (WordWidth              ),

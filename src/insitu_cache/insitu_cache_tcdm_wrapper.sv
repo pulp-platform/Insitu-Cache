@@ -85,6 +85,11 @@ module insitu_cache_tcdm_wrapper
     /// same line, so we leave it tied off.
     parameter bit          DataFwdBufEnableRawForwarding = 1'b1,
     parameter bit          MetaFwdBufEnableRawForwarding = 1'b1,
+    /// Enable the SRAM forwarding buffer on the data/meta access controllers.
+    /// Default 1 (production).  Set 0 for the unfolded "conventional" cache
+    /// (LRU way-select, UseHashWaySelect=0), which is incompatible with the
+    /// buffer (see the elaboration guard below).
+    parameter bit          UseForwardingBuffer           = 1'b1,
 `ifndef TARGET_SYNTHESIS
     /// Name the cache
     parameter string       ModeleName               = "none",
@@ -231,12 +236,6 @@ module insitu_cache_tcdm_wrapper
         cache_mask_t                                        wmask;
     } down_req_t;
 
-    // Single source of truth for whether the forwarding buffer is enabled
-    // on the data / meta access controllers below.  Both .UseForwardingBuffer
-    // ports take this localparam so the elaboration check just below stays
-    // in sync if it is ever toggled.
-    localparam bit UseForwardingBuffer = 1'b1;
-
     // Guard against truncating cache metadata in tag/meta banks.
 `ifndef SYNTHESIS
     initial begin
@@ -261,9 +260,20 @@ module insitu_cache_tcdm_wrapper
     // but at the first eviction the SRAM read returns the wrong row's
     // data and the dirty install is lost.  See
     // reports/MULTI_TILE_BUG_ROOT_CAUSE.md for the full trace.
+    // Two independent reasons UseHashWaySelect=0 is unsafe:
+    //   (a) Forwarding buffer on: at the first eviction the all-ways-active
+    //       SRAM read returns the wrong row -> dirty install lost.
+    //   (b) Skewed-fold banks (PartSplit > 1): the tile arbiter collapses the
+    //       all-ways read onto one partition slot per column and cannot
+    //       disambiguate ways -- corrupt even with the buffer off.
+    // So UseHashWaySelect=0 is only legal for the UNFOLDED (PartSplit==1) cache
+    // with the forwarding buffer disabled (the conventional LRU config).
     initial begin
+        if ((PartSplit > 1) && !UseHashWaySelect) begin
+            $fatal(1, "[insitu_cache_tcdm_wrapper %m] Skewed-fold (DataPartSplit=%0d) requires UseHashWaySelect=1: with all-ways-active reads the tile fold arbiter cannot disambiguate ways.  Set UseHashWaySelect=1, or use the unfolded (DataPartSplit=1) cache.", DataPartSplit);
+        end
         if (UseForwardingBuffer && !UseHashWaySelect) begin
-            $fatal(1, "[insitu_cache_tcdm_wrapper %m] Forwarding buffer is enabled but UseHashWaySelect=0.  This combination silently corrupts dirty buffer data on eviction in multi-way + skewed-fold builds.  Set UseHashWaySelect=1 (the cachepool_cluster.sv default -- multi-tile configs need it propagated through cachepool_group.sv) or disable the forwarding buffer.");
+            $fatal(1, "[insitu_cache_tcdm_wrapper %m] Forwarding buffer is enabled but UseHashWaySelect=0.  This combination silently corrupts dirty buffer data on eviction in multi-way + skewed-fold builds.  Set UseHashWaySelect=1 (the cachepool_cluster.sv default -- multi-tile configs need it propagated through cachepool_group.sv) or disable the forwarding buffer (UseForwardingBuffer=0).");
         end
     end
 `endif

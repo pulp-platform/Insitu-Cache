@@ -933,7 +933,13 @@ module insitu_cache_core
     always_comb begin
         preread_part_idx = '0;
         if ((PartSplit > 1) && preread_bank_valid && ~preread_arbiter_payload.is_refill) begin
-            preread_part_idx = preread_arbiter_payload.task_pay.request.addr[$clog2(LineBytes)-1 : $clog2(PartBytes)];
+            // Ascending fixed-width (`+:`) select stays legal for any PartSplit.
+            // When PartSplit==1, $clog2(PartBytes)==$clog2(LineBytes), so the
+            // descending form [clog2(LineBytes)-1 : clog2(PartBytes)] would be a
+            // reversed range ([5:6]) that fails elaboration even though this
+            // branch is guarded off.  [clog2(PartBytes) +: PartIdxWidth] equals
+            // the old [5:4] when folded.
+            preread_part_idx = preread_arbiter_payload.task_pay.request.addr[$clog2(PartBytes) +: PartIdxWidth];
         end
     end
     assign refill_full_read_req = (PartSplit > 1) && preread_bank_valid && preread_arbiter_payload.is_refill;
