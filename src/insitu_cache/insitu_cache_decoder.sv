@@ -99,6 +99,14 @@ cache_tag_t              _tag;       // tag bits of the request addr
 cache_bank_depth_ptr_t   _depth;     // depth bits of the request addr
 byte_offset_t            _ofst;      // byte-offset bits of the request addr
 way_ptr_t                _hash_way;  // hash-derived way (UseHashWaySelect mode)
+// Flattened hash-way decode helpers (see proc_hash_way_req): the shared wide
+// tag compare + parallel status decode, hoisted out of the old priority
+// if/else-if cascade to shorten the meta-SRAM read -> dec_is_hit_* path.
+logic                    _tag_hit;
+logic                    _is_valid_way;
+logic                    _is_rpend_way;
+logic                    _is_wpend_way;
+logic                    _is_inval_way;
 
 assign {_tag, _depth, _ofst} = cache_task_i.task_pay.request.addr;
 
@@ -116,6 +124,14 @@ assign dec_cache_miss_meta_o= bank_read_cache_miss_meta_i[dec_way_o];
 assign dec_cache_mask_o     = bank_read_cache_mask_i[dec_way_o];
 assign dec_cache_tag_o      = bank_read_cache_tag_i[dec_way_o];
 assign dec_cache_data_o     = bank_read_cache_data_i[dec_way_o];
+
+// Hash-way decode helpers: wide tag compare computed once, status decoded in
+// parallel (status is a 1-hot enum), so proc_hash_way_req is a flat SOP.
+assign _tag_hit      = (bank_read_cache_tag_i[_hash_way]    == _tag);
+assign _is_valid_way = (bank_read_cache_status_i[_hash_way] == VALID);
+assign _is_rpend_way = (bank_read_cache_status_i[_hash_way] == READ_PEND);
+assign _is_wpend_way = (bank_read_cache_status_i[_hash_way] == WRITE_PEND);
+assign _is_inval_way = (bank_read_cache_status_i[_hash_way] == INVALID);
 
 always_comb begin : proc_bank_decode
 
@@ -144,41 +160,33 @@ always_comb begin : proc_bank_decode
         if (UseHashWaySelect && (SetAssociativity > 1)) begin : proc_hash_way_req
             dec_way_o = _hash_way;
 
-            if (bank_read_cache_status_i[_hash_way] == VALID &&
-                (bank_read_cache_tag_i[_hash_way] == _tag)) begin
-                dec_is_hit_o = 1;
-                dec_is_all_pend_o = 1'b0;
-            end else if (bank_read_cache_status_i[_hash_way] == READ_PEND &&
-                         (bank_read_cache_tag_i[_hash_way] == _tag)) begin
-                if (dec_is_write_req_o) begin
-                    dec_is_hit_conflit_o = 1;
-                end else begin
-                    dec_is_hit_pend_o = 1;
-`ifdef ENABLE_MULTI_READ_PEND
-                    if (bank_read_cache_miss_meta_i[_hash_way].is_full == 0) begin
-                        dec_is_hit_pend_new_entry_o = '0;
-                    end
-                    if (bank_read_cache_miss_meta_i[_hash_way].is_prime) begin
-                        dec_read_hit_pend_prime_way_o = _hash_way;
-                    end
-                    if (bank_read_cache_miss_meta_i[_hash_way].link_enable == 0) begin
-                        dec_read_hit_pend_linkable_way_o = _hash_way;
-                    end
-`endif
-                end
-            end else if (bank_read_cache_status_i[_hash_way] == WRITE_PEND &&
-                         (bank_read_cache_tag_i[_hash_way] == _tag)) begin
-                if (dec_is_write_req_o) begin
-                    dec_is_hit_pend_o = 1;
-                end else begin
-                    dec_is_hit_conflit_o = 1;
-                end
-            end
+            // Flattened decode (was a priority if/else-if cascade on status):
+            // status is a 1-hot enum so the arms are mutually exclusive --
+            // form each output as a flat SOP over the precomputed _tag_hit /
+            // _is_*_way helpers.  Behaviourally identical; removes the cascade
+            // depth from the critical dec_is_hit_conflit_o output.
+            dec_is_hit_o         = _tag_hit & _is_valid_way;
+            dec_is_hit_pend_o    = _tag_hit & ((_is_rpend_way & ~dec_is_write_req_o)
+                                             | (_is_wpend_way &  dec_is_write_req_o));
+            dec_is_hit_conflit_o = _tag_hit & ((_is_rpend_way &  dec_is_write_req_o)
+                                             | (_is_wpend_way & ~dec_is_write_req_o));
+            dec_is_all_pend_o    = ~(_is_valid_way | _is_inval_way);
 
-            if (bank_read_cache_status_i[_hash_way] == VALID ||
-                bank_read_cache_status_i[_hash_way] == INVALID) begin
-                dec_is_all_pend_o = 0;
+`ifdef ENABLE_MULTI_READ_PEND
+            // hit-under-miss append bookkeeping: only a READ to a READ_PEND line
+            // (the old READ_PEND / not-write arm).
+            if (_tag_hit & _is_rpend_way & ~dec_is_write_req_o) begin
+                if (bank_read_cache_miss_meta_i[_hash_way].is_full == 0) begin
+                    dec_is_hit_pend_new_entry_o = '0;
+                end
+                if (bank_read_cache_miss_meta_i[_hash_way].is_prime) begin
+                    dec_read_hit_pend_prime_way_o = _hash_way;
+                end
+                if (bank_read_cache_miss_meta_i[_hash_way].link_enable == 0) begin
+                    dec_read_hit_pend_linkable_way_o = _hash_way;
+                end
             end
+`endif
         end else begin : proc_full_assoc_req
             //2. Check request type
             for (int way = 0; way < SetAssociativity; way ++) begin : proc2_check_req_type
