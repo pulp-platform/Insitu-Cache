@@ -1633,19 +1633,10 @@ module insitu_cache_core
                                 req_hit_pend_subarray_cnt_tmp = dec_cache_mask[SubarrayCntWidth-1:0];
                                 //7.2 Update subarrays
                                 enc_cache_mask = cache_mask_t'(req_hit_pend_subarray_cnt_tmp + 1'b1);
-                                if (PartSplit > 1) begin
-                                    enc_mod_data_with_mask = 1'b1;
-                                    enc_mod_mask = mshr_subarray_mask(req_hit_pend_subarray_cnt_tmp);
-                                    // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
-                                    // The byte mask can touch bytes that contain adjacent subarray fields.
-                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
-                                        preread_task_q.task_pay.request.info;
-                                    enc_mod_write_data = req_hit_pend_cache_payload_tmp.data;
-                                end else begin
-                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
-                                        preread_task_q.task_pay.request.info;
-                                    enc_cache_data = req_hit_pend_cache_payload_tmp.data;
-                                end
+                                // Option X: full-line write-back (mirror of the active no-MRP path).
+                                req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
+                                    preread_task_q.task_pay.request.info;
+                                enc_cache_data = req_hit_pend_cache_payload_tmp.data;
 
                                 //7.3 update full signal if needed
                                 if (enc_cache_mask >= NumSubarray) begin
@@ -1725,19 +1716,14 @@ module insitu_cache_core
                                 /*Allow merge subarray*/
                                 //7.2 Update subarrays
                                 enc_cache_mask = cache_mask_t'(req_hit_pend_subarray_cnt_tmp + 1'b1);
-                                if (PartSplit > 1) begin
-                                    enc_mod_data_with_mask = 1'b1;
-                                    enc_mod_mask = mshr_subarray_mask(req_hit_pend_subarray_cnt_tmp);
-                                    // Preserve neighbor bits in the same byte lane when info_t is not byte-aligned.
-                                    // The byte mask can touch bytes that contain adjacent subarray fields.
-                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
-                                        preread_task_q.task_pay.request.info;
-                                    enc_mod_write_data = req_hit_pend_cache_payload_tmp.data;
-                                end else begin
-                                    req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
-                                        preread_task_q.task_pay.request.info;
-                                    enc_cache_data = req_hit_pend_cache_payload_tmp.data;
-                                end
+                                // Option X: full-line write-back for all PartSplit values.  dec_cache_data is
+                                // the complete line (bank_read_all_parts_o tied high, ~line 970) and is kept
+                                // fresh by the forwarding-buffer C3 invariant, so patch only subarrays[cnt]
+                                // and write the whole line with the default all-ones mask.  This removes the
+                                // variable barrel-shift mshr_subarray_mask() from the bank-write critical path.
+                                req_hit_pend_cache_payload_tmp.mshr.subarrays[req_hit_pend_subarray_cnt_tmp][InfoWidth-1:0] =
+                                    preread_task_q.task_pay.request.info;
+                                enc_cache_data = req_hit_pend_cache_payload_tmp.data;
 
                                 //7.4 Write to bank
                                 bank_write_req_o = 1;
