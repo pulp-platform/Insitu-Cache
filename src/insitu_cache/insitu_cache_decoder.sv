@@ -103,10 +103,9 @@ way_ptr_t                _hash_way;  // hash-derived way (UseHashWaySelect mode)
 // tag compare + parallel status decode, hoisted out of the old priority
 // if/else-if cascade to shorten the meta-SRAM read -> dec_is_hit_* path.
 logic                    _tag_hit;
-logic                    _is_valid_way;
-logic                    _is_rpend_way;
-logic                    _is_wpend_way;
-logic                    _is_inval_way;
+logic                    _is_rpend_way;  // == READ_PEND, for the MULTI_READ_PEND append arm
+logic                    _status_s1;     // status[1]: 1 => pending (READ_PEND/WRITE_PEND)
+logic                    _status_s0;     // status[0]
 
 assign {_tag, _depth, _ofst} = cache_task_i.task_pay.request.addr;
 
@@ -125,13 +124,17 @@ assign dec_cache_mask_o     = bank_read_cache_mask_i[dec_way_o];
 assign dec_cache_tag_o      = bank_read_cache_tag_i[dec_way_o];
 assign dec_cache_data_o     = bank_read_cache_data_i[dec_way_o];
 
-// Hash-way decode helpers: wide tag compare computed once, status decoded in
-// parallel (status is a 1-hot enum), so proc_hash_way_req is a flat SOP.
-assign _tag_hit      = (bank_read_cache_tag_i[_hash_way]    == _tag);
-assign _is_valid_way = (bank_read_cache_status_i[_hash_way] == VALID);
-assign _is_rpend_way = (bank_read_cache_status_i[_hash_way] == READ_PEND);
-assign _is_wpend_way = (bank_read_cache_status_i[_hash_way] == WRITE_PEND);
-assign _is_inval_way = (bank_read_cache_status_i[_hash_way] == INVALID);
+// Hash-way decode helpers: wide tag compare computed once; status (2-bit enum)
+// decoded as raw bits so the late SRAM bit s0 reaches each dec_is_* output via a
+// single XOR with the early dec_is_write_req_o (see proc_hash_way_req).
+assign _tag_hit    = (bank_read_cache_tag_i[_hash_way] == _tag);
+assign _status_s1  = bank_read_cache_status_i[_hash_way][1];
+assign _status_s0  = bank_read_cache_status_i[_hash_way][0];
+assign _is_rpend_way = _status_s1 & ~_status_s0;  // READ_PEND = 2'b10
+// T1.5 relies on the cache_status_t bit-encoding (INVALID=00,VALID=01,READ_PEND=10,
+// WRITE_PEND=11, insitu_cache_pkg.sv); guard against a future reorder.
+initial assert (int'(INVALID)==0 && int'(VALID)==1 && int'(READ_PEND)==2 && int'(WRITE_PEND)==3)
+    else $fatal(1, "insitu_cache_decoder: cache_status_t encoding changed; fix the status bit-decode");
 
 always_comb begin : proc_bank_decode
 
@@ -165,12 +168,12 @@ always_comb begin : proc_bank_decode
             // form each output as a flat SOP over the precomputed _tag_hit /
             // _is_*_way helpers.  Behaviourally identical; removes the cascade
             // depth from the critical dec_is_hit_conflit_o output.
-            dec_is_hit_o         = _tag_hit & _is_valid_way;
-            dec_is_hit_pend_o    = _tag_hit & ((_is_rpend_way & ~dec_is_write_req_o)
-                                             | (_is_wpend_way &  dec_is_write_req_o));
-            dec_is_hit_conflit_o = _tag_hit & ((_is_rpend_way &  dec_is_write_req_o)
-                                             | (_is_wpend_way & ~dec_is_write_req_o));
-            dec_is_all_pend_o    = ~(_is_valid_way | _is_inval_way);
+            // T1.5: status decoded as bit ops (s1=is-pending, s0); the late s0
+            // reaches each output through one XOR with the early write bit.
+            dec_is_hit_o         = _tag_hit & ~_status_s1 & _status_s0;
+            dec_is_hit_pend_o    = _tag_hit &  _status_s1 & ~(_status_s0 ^ dec_is_write_req_o);
+            dec_is_hit_conflit_o = _tag_hit &  _status_s1 &  (_status_s0 ^ dec_is_write_req_o);
+            dec_is_all_pend_o    =  _status_s1;
 
 `ifdef ENABLE_MULTI_READ_PEND
             // hit-under-miss append bookkeeping: only a READ to a READ_PEND line
