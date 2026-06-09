@@ -1433,13 +1433,11 @@ module insitu_cache_tcdm_wrapper
     //     l1d_lock_q[t] stuck at 1).
     //   - During IDLE/FINISH/READ_BANK, fall back to the original
     //     priority: flush only when proc has nothing pending.
-    assign bank_read_sel_flush         = (sync_ctrl_status_q == SYNC_CTRL_INIT
-                                          || sync_ctrl_status_q == SYNC_CTRL_FLUSH
-                                          || sync_ctrl_status_q == SYNC_CTRL_INVALID)
-                                         ? 1'b1
-                                         : ((sync_ctrl_status_q == SYNC_CTRL_READ_BANK)
-                                              ? ~proc_read_cache_valid
-                                              : ~proc_read_cache_valid);
+    // Timing (T1.2): the inner ternary arms were identical (~proc_read_cache_valid),
+    // and the outer (INIT||FLUSH||INVALID) condition is exactly sync_block_install
+    // (:1394).  Reuse it (CSE) and drop the dead SYNC_CTRL_READ_BANK comparator +
+    // one mux level.  Bit-identical incl. 4-state X:  (a ? 1'b1 : b) === (a | b).
+    assign bank_read_sel_flush         = sync_block_install | ~proc_read_cache_valid;
     assign bank_read_cache_valid       = bank_read_sel_flush? flush_read_cache_valid : proc_read_cache_valid;
     // Fix: proc must only see ready when the arbiter is actually serving
     // proc.  Previously this was unconditionally bank_read_cache_ready,
