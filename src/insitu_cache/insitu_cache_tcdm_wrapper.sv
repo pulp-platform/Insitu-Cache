@@ -2129,7 +2129,10 @@ module pseudo_dual_port_tcdm_wrapper #(
             assign word_in_part[i][j] = read_all_parts_i ? 1'b1 :
               ((PartSplit > 1) ? (read_part_idx_i == WordPart[PartIdxWidth-1:0]) : 1'b1);
             assign word_read_en[i][j] = bank_req_read[i] & read_valid_i & word_in_part[i][j];
-            assign word_write_en[i][j] = bank_req_write[i] & write_has_data &
+            // T2.2: bank_req_write[i] is set only inside `if (write_has_data)`,
+            // so it already implies write_has_data -- drop the redundant term
+            // (smaller endpoint AND fan-in, lower write_has_data load).
+            assign word_write_en[i][j] = bank_req_write[i] &
               (|bank_wmask[i][j*WordBytes +: WordBytes]);
             assign tcdm_bank_req_o[i*NumWordsPerLine + j]    = word_read_en[i][j] | word_write_en[i][j];
             assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = word_write_en[i][j];
