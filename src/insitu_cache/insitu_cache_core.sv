@@ -624,6 +624,16 @@ module insitu_cache_core
     cache_mask_t                                            dec_cache_mask;
     cache_tag_t                                             dec_cache_tag;
     cache_data_t                                            dec_cache_data;
+
+    // T1.3: per-way all-ones reduction of the read mask, precomputed so the
+    // 64-input AND overlaps the meta-SRAM read / dec_way resolution instead of
+    // following the 4:1 dec_cache_mask mux on the meta-write-skip endpoint.
+    // mask_all_ones[dec_way] === &dec_cache_mask (= &bank_read_cache_mask_i[dec_way]),
+    // bit-identical (&(sel?a:b) == sel?&a:&b).
+    logic [SetAssociativity-1:0]                            mask_all_ones;
+    for (genvar w = 0; w < SetAssociativity; w++) begin : gen_mask_all_ones
+        assign mask_all_ones[w] = &bank_read_cache_mask_i[w];
+    end
 `ifdef ENABLE_MULTI_READ_PEND
     logic                                                   dec_is_hit_pend_new_entry;
     way_ptr_t                                               dec_read_hit_pend_prime_way;
@@ -1593,7 +1603,7 @@ module insitu_cache_core
 
                             //6.5 Write to bank
                             bank_write_req_o = 1;
-                            bank_write_meta_skip_o = &dec_cache_mask;
+                            bank_write_meta_skip_o = mask_all_ones[dec_way];
 
                             //6.6 Write to LRU
                             bank_write_LRU_req_o = 1;
