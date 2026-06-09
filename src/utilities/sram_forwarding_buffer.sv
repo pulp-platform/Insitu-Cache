@@ -319,7 +319,10 @@ module sram_forwarding_buffer #(
     //   - invalid OR clean (no writeback needed), OR
     //   - valid+dirty but same address (full write overrides dirty data).
     logic wr_full_hit;
-    assign wr_full_hit = wr_full_line & has_wr_data & !sram_rd_pend_q
+    // T2.1: has_wr_data (=wr_req & |mask) is redundant here -- wr_full_line
+    // (=wr_req & &mask) implies it (&mask => |mask, MaskBits>=1). Dropping it
+    // removes one late AND + the |mask OR-tree from this cone.
+    assign wr_full_hit = wr_full_line & !sram_rd_pend_q
                        & (!buf_valid_q | !buf_dirty_q
                           | (buf_addr_q == wr_addr_i));
 
