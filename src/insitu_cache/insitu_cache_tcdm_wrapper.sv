@@ -92,7 +92,7 @@ module insitu_cache_tcdm_wrapper
     parameter bit          UseForwardingBuffer           = 1'b1,
 `ifndef TARGET_SYNTHESIS
     /// Name the cache
-    parameter string       ModeleName               = "none",
+    parameter              ModeleName               = "none",
 `endif
     /// Word width of narrow data to upstream
     parameter int unsigned UpstreamWidth            = CacheLineWidth,

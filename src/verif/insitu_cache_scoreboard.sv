@@ -50,7 +50,7 @@ module insitu_cache_scoreboard
     // SubarrayCntWidth bits (=3 for 7 sub-entries) are the count.
     parameter int unsigned MetaMaskWidth     = 64,
     parameter int unsigned SubarrayCntWidth  = 3,
-    parameter string       CtrlName         = "ctrl?",
+    parameter              CtrlName         = "ctrl?",
     // Soft-disable individual checks if you want only one kind of report.
     parameter bit          CheckHitMiss     = 1'b1,
     parameter bit          CheckHitData     = 1'b1,

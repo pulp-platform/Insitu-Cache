@@ -21,7 +21,7 @@ module folded_data_bank #(
     /// Read latency in cycles.
     parameter int unsigned Latency      = 1,
     /// Simulation init pattern ("zeros" or "none").
-    parameter string       SimInit      = "zeros",
+    parameter              SimInit      = "zeros",
     // Dependent parameters, do not override.
     localparam int unsigned AddrWidth       = (DepthPerWay > 1) ? $clog2(DepthPerWay) : 1,
     localparam int unsigned ByteCount       = DataWidth / ByteWidth,

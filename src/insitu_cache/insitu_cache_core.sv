@@ -68,7 +68,7 @@ module insitu_cache_core
     parameter bit          WriteThroughMode                 = 0,
 `ifndef TARGET_SYNTHESIS
     /// Name the cache
-    parameter string       ModeleName                       = "none",
+    parameter              ModeleName                       = "none",
 `endif
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheBankDepth                  = NumCacheEntry/SetAssociativity,

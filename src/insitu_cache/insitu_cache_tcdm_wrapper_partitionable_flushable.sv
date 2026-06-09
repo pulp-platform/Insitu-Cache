@@ -71,7 +71,7 @@ module insitu_cache_tcdm_wrapper_partitionable_flushable
     parameter bit          WriteThroughMode         = 0,
 `ifndef TARGET_SYNTHESIS
     /// Name the cache
-    parameter string       ModeleName               = "none",
+    parameter              ModeleName               = "none",
 `endif
     /// Word width of narrow data to upstream
     parameter int unsigned UpstreamWidth            = CacheLineWidth,
