@@ -994,13 +994,18 @@ module insitu_cache_core
 
     // For hash way select: use one-hot mask for both requests (hash)
     // and refills (stored way from miss FIFO).
+    // Timing (T1.4): refill_full_read_req (=PartSplit>1 & valid & is_refill, :945)
+    // implies is_refill, so in hash mode the refill_full_read_req arm + its 3-input
+    // AND are redundant -- once evict fails the result is ~is_refill?hash:refill.
+    // Param-safe (the !UseHashWaySelect path keeps the original refill/all-ones
+    // behaviour).  Bit-identical for all params (R=1&&I=0 cannot occur).
     assign bank_read_way_mask_o = evict_full_read_req ? evict_read_way_mask :
-                                  refill_full_read_req ? refill_read_way_mask :
-                                  (UseHashWaySelect & ~preread_arbiter_payload.is_refill) ?
+                                  !UseHashWaySelect ?
+                                      (refill_full_read_req ? refill_read_way_mask
+                                                            : {SetAssociativity{1'b1}}) :
+                                  ~preread_arbiter_payload.is_refill ?
                                       hash_way_mask_preread :
-                                  (UseHashWaySelect &  preread_arbiter_payload.is_refill) ?
-                                      refill_read_way_mask :
-                                  {SetAssociativity{1'b1}};
+                                      refill_read_way_mask;
     assign bank_read_data_skip_o = 1'b0;
 
     // Phase 3 advisory: tell the access ctrl whether the line being written
