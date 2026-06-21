@@ -1641,15 +1641,11 @@ module insitu_cache_tcdm_wrapper
             };
         end
 
-        // Per-way data write request: only the targeted way sees the write
-        // pulse on processor writes. Flush writes still broadcast.
-        logic data_proc_write_req;
-        always_comb begin
-            data_proc_write_req = 1'b0;
-            if (bank_write_cache_req && (proc_write_cache_way == way_ptr_t'(i))) begin
-                data_proc_write_req = 1'b1;
-            end
-        end
+        // T2.6: the per-way data write request is inlined into
+        // upstream_write_req_i below as a flat (proc-arm | flush-broadcast),
+        // removing the nested proc_write_select mux + the data_proc_write_req
+        // intermediate. Only the targeted way sees the proc write pulse; flush
+        // writes still broadcast to every way.
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
@@ -1690,8 +1686,11 @@ module insitu_cache_tcdm_wrapper
             .upstream_read_all_parts_i   (bank_read_all_parts_sel),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
-            .upstream_write_req_i        (proc_write_select ? data_proc_write_req :
-                                          bank_write_cache_req),
+            // T2.6: flat (proc-arm | flush-broadcast). proc_write_cache_req is 0
+            // whenever proc_write_select=0, so the proc term vanishes and flush
+            // broadcasts to every way -- equivalent to the prior nested mux.
+            .upstream_write_req_i        ((proc_write_cache_req & (proc_write_cache_way == way_ptr_t'(i)))
+                                          | (~proc_write_select & flush_write_cache_req_valid)),
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
             .upstream_write_ready_o      (data_bank_write_ready[i]),
@@ -1751,17 +1750,10 @@ module insitu_cache_tcdm_wrapper
             end
         end
 
-        logic meta_proc_write_req;
-        always_comb begin
-            meta_proc_write_req = 1'b0;
-            if (bank_write_cache_req && !bank_write_meta_skip &&
-                !mc_suppress_meta_write &&
-                (proc_write_cache_way == way_ptr_t'(i))) begin
-                meta_proc_write_req = 1'b1;
-            end
-            // LRU-only updates → LRU register file (no meta SRAM write).
-            // Write hits on VALID → dirty RF + LRU RF only (meta_skip=1).
-        end
+        // T2.6: the per-way meta write request is inlined into
+        // upstream_write_req_i below as a flat (proc-arm | flush-broadcast).
+        // LRU-only updates → LRU register file (no meta SRAM write).
+        // Write hits on VALID → dirty RF + LRU RF only (meta_skip=1).
 
         insitu_cache_bank_access_controller #(
             .DEPTH              (CacheBankDepth),
@@ -1794,8 +1786,11 @@ module insitu_cache_tcdm_wrapper
             .upstream_read_all_parts_i   (1'b1),
 
             .upstream_write_addr_i       (bank_write_cache_addr),
-            .upstream_write_req_i        (proc_write_select ? meta_proc_write_req :
-                                          flush_write_cache_req_valid),
+            // T2.6: flat (proc-arm | flush-broadcast). meta_skip / mc_suppress
+            // kept verbatim; proc_write_cache_req=0 when proc_write_select=0.
+            .upstream_write_req_i        ((proc_write_cache_req & ~bank_write_meta_skip & ~mc_suppress_meta_write
+                                           & (proc_write_cache_way == way_ptr_t'(i)))
+                                          | (~proc_write_select & flush_write_cache_req_valid)),
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
             .upstream_write_ready_o      (meta_bank_write_ready[i]),
