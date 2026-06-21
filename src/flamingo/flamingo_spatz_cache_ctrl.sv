@@ -143,6 +143,9 @@ module flamingo_spatz_cache_ctrl #(
     typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
     typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
     typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
+    localparam int unsigned                                                 LineOfstBits = $clog2(CacheLineWidth/8);
+    localparam int unsigned                                                 WordOfstBits = $clog2(WordWidth/8);
+    localparam int unsigned                                                 CoalPorts = NumPorts * CoalExtFactor;
 
     typedef struct packed {
         logic                                                               id;
@@ -196,6 +199,9 @@ module flamingo_spatz_cache_ctrl #(
     logic                                                                   coalescing_resp_ready;
     coalescing_data_t                                                       coalescing_resp_data;
     coalescing_info_t                                                       coalescing_resp_info;
+    coal_ofst_t                                                             coalescing_first_ofst;
+    logic            [LineOfstBits-1:0]                                     coalescing_line_ofst;
+    addr_t                                                                  coalescing_req_addr_with_ofst;
     logic                                                                   coalescing_resp_write;
 
     /// Cache request
@@ -290,6 +296,21 @@ module flamingo_spatz_cache_ctrl #(
         .downstream_resp_write_i(coalescing_resp_write)
     );
 
+    always_comb begin
+        logic found;
+        coalescing_first_ofst = '0;
+        found = 1'b0;
+        for (int i = 0; i < CoalPorts; i++) begin
+            if (coalescing_req_info.hitmap[i] && !found) begin
+                coalescing_first_ofst = coalescing_req_info.ofsts[i];
+                found = 1'b1;
+            end
+        end
+    end
+    assign coalescing_line_ofst = coalescing_first_ofst << WordOfstBits;
+    assign coalescing_req_addr_with_ofst =
+        (coalescing_req_addr & ~(CacheLineWidth/8-1)) | coalescing_line_ofst;
+
     //2.Insitu-Cache controller
     insitu_cache_tcdm_wrapper_partitionable_flushable #(
         .ReqAddrWidth           (AddrWidth),
@@ -312,7 +333,7 @@ module flamingo_spatz_cache_ctrl #(
 
         .upstream_req_valid_i   (coalescing_req_valid   ),
         .upstream_req_ready_o   (coalescing_req_ready   ),
-        .upstream_req_addr_i    (coalescing_req_addr    ),
+        .upstream_req_addr_i    (coalescing_req_addr_with_ofst),
         .upstream_req_info_i    (coalescing_req_info    ),
         .upstream_req_write_i   (coalescing_req_write   ),
         .upstream_req_wdata_i   (coalescing_req_wdata   ),

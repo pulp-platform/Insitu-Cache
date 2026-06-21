@@ -64,22 +64,58 @@ module rsp_spliter_v2 #(
 
     //Data path
     upstream_data_t [NumAddrOfst-1:0] downstream_unpacked_data;
+    logic [NumPorts-1:0] coal_strb_active;
+    addr_ofst_t [NumPorts-1:0] coal_port_addr_ofst_active;
 
     assign downstream_unpacked_data = downstream_data_i;
 
     for (genvar i = 0; i < NumPorts; i++) begin: gen_upstream_data
-        assign rsp_data_o[i] = downstream_unpacked_data[coal_port_addr_ofst_i[i]] ;
+        assign rsp_data_o[i] = downstream_unpacked_data[coal_port_addr_ofst_active[i]] ;
     end
 
     //Control signal
     logic [NumPorts-1:0] handshack_mask_q, handshack_mask_d;
     `FFARN (handshack_mask_q, handshack_mask_d, '0, clk_i, rst_ni)
+    logic [NumPorts-1:0] handshack_mask_eff;
     logic [NumPorts-1:0] handshack_mask_record;
-    assign handshack_mask_record = handshack_mask_q | (rsp_ready_i & rsp_valid_o);
+    logic split_active_q, split_active_d;
+    logic [NumPorts-1:0] coal_strb_q, coal_strb_d;
+    addr_ofst_t [NumPorts-1:0] coal_port_addr_ofst_q, coal_port_addr_ofst_d;
+    logic split_done;
+    `FFARN(split_active_q, split_active_d, 1'b0, clk_i, rst_ni)
+    `FFARN(coal_strb_q, coal_strb_d, '0, clk_i, rst_ni)
+    `FFARN(coal_port_addr_ofst_q, coal_port_addr_ofst_d, '0, clk_i, rst_ni)
+    assign coal_strb_active = split_active_q ? coal_strb_q : coal_strb_i;
+    assign coal_port_addr_ofst_active = split_active_q ? coal_port_addr_ofst_q : coal_port_addr_ofst_i;
+    // Keep only bits relevant to the current response bitmap.
+    // This prevents stale bits in handshack_mask_q from blocking progress
+    // if coal_strb_i changes while the downstream beat is backpressured.
+    assign handshack_mask_eff = handshack_mask_q & coal_strb_active;
+    assign handshack_mask_record = handshack_mask_eff | (rsp_ready_i & rsp_valid_o);
+
+    always_comb begin : proc_split_snapshot
+        split_active_d = split_active_q;
+        coal_strb_d = coal_strb_q;
+        coal_port_addr_ofst_d = coal_port_addr_ofst_q;
+
+        // Capture metadata only when a beat starts but cannot fully complete in
+        // the same cycle. This avoids stale metadata on back-to-back responses.
+        if (!split_active_q && downstream_valid_i && !split_done) begin
+            split_active_d = 1'b1;
+            coal_strb_d = coal_strb_i;
+            coal_port_addr_ofst_d = coal_port_addr_ofst_i;
+        end
+
+        // Release snapshot when the stalled beat completes or disappears.
+        if (split_active_q && (split_done || !downstream_valid_i)) begin
+            split_active_d = 1'b0;
+        end
+    end
 
 
     always_comb begin : proc_control
         handshack_mask_d = handshack_mask_record;
+        split_done = 1'b0;
 
         downstream_ready_o = '0;
         rsp_valid_o = '0;
@@ -88,13 +124,14 @@ module rsp_spliter_v2 #(
         coal_port_addr_ofst_pop_o = '0;
 
         for (int i = 0; i < NumPorts; i++) begin
-            rsp_valid_o[i] = downstream_valid_i & coal_strb_i[i] & ~handshack_mask_q[i];
+            rsp_valid_o[i] = downstream_valid_i & coal_strb_active[i] & ~handshack_mask_eff[i];
         end
 
         if (downstream_valid_i) begin
-            if (handshack_mask_record == coal_strb_i) begin
+            if (handshack_mask_record == coal_strb_active) begin
                 handshack_mask_d = '0;
                 downstream_ready_o = 1'b1;
+                split_done = 1'b1;
             end
         end
     end

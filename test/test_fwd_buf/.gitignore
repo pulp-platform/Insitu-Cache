@@ -1,0 +1,5 @@
+build/
+modelsim.ini
+transcript
+vsim.wlf
+*.log

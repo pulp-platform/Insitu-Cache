@@ -6,6 +6,7 @@
 
 package insitu_cache_pkg;
 
+  `include "insitu_cache/hash.svh"
 
   //////////////////
   //  Parameters  //

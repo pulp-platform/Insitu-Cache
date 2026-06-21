@@ -193,7 +193,9 @@ module par_coalescer_extend_window #(
         .UpstreamDataWidth  (UpstreamDataWidth),
         .DownstreamDataWidth(DownstreamDataWidth),
         .ByteWidth          (ByteWidth),
-        .SpliterSpillReg    (0)
+        // Keep response bundle stable (data/info/write) under backpressure
+        // before rsp_spliter_v2 consumes it.
+        .SpliterSpillReg    (1)
     ) i_par_coalescer (
         .clk_i,
         .rst_ni,

@@ -40,6 +40,12 @@ module cachepool_cache_ctrl #(
   parameter int unsigned CacheLineWidth                                   = 512,
   /// Number of Associatity
   parameter int unsigned SetAssociativity                                 = 4,
+  /// Number of parts per cache line for data banks (1 = unfolded).
+  parameter int unsigned DataPartSplit                                    = 1,
+  /// Use hash-based way selection (1 way per lookup, no LRU).
+  parameter bit          UseHashWaySelect                                = 1'b0,
+  /// Enable the SRAM forwarding buffer (default on; requires UseHashWaySelect).
+  parameter bit          UseForwardingBuffer                             = 1'b1,
   /// Number of Pseudo-Dual Banks
   parameter int unsigned BankFactor                                       = 2,
 
@@ -68,6 +74,13 @@ module cachepool_cache_ctrl #(
   localparam int unsigned NumDataBankPerWay                               = BankFactor * (CacheLineWidth/WordWidth),
   // Dependent parameter, do not override. Number of meta bank per way.
   localparam int unsigned NumTagBankPerWay                                = BankFactor,
+  // Dependent parameter, do not override. Part split (min 1).
+  localparam int unsigned PartSplit                                       = (DataPartSplit == 0) ? 1 : DataPartSplit,
+  // Dependent parameter, do not override. Coalescer data width (part width when folded).
+  localparam int unsigned CoalescerDataWidth                              =
+    (PartSplit > 1) ? (CacheLineWidth/PartSplit) : CacheLineWidth,
+  // Dependent parameter, do not override. Part index width (min 1).
+  localparam int unsigned PartIdxWidth                                    = (PartSplit > 1) ? $clog2(PartSplit) : 1,
   // Dependent parameter, do not override. Address type.
   localparam type         addr_t                                          = logic [AddrWidth-1:0],
   // Dependent parameter, do not override. Address type.
@@ -153,7 +166,14 @@ module cachepool_cache_ctrl #(
 
   typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
-  typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
+  typedef logic [CoalescerDataWidth-1:0]                                  coal_data_t;
+  typedef logic [CoalescerDataWidth/ByteWidth-1:0]                        coal_mask_t;
+  typedef logic [$clog2(CoalescerDataWidth/WordWidth)-1:0]                coal_ofst_t;
+  typedef logic [PartIdxWidth-1:0]                                        part_idx_t;
+  localparam int unsigned                                                 LineOfstBits = $clog2(CacheLineWidth/8);
+  localparam int unsigned                                                 CoalescerLineOfstBits = $clog2(CoalescerDataWidth/8);
+  localparam int unsigned                                                 WordOfstBits = $clog2(WordWidth/8);
+  localparam int unsigned                                                 CoalPorts = (NumPorts - 1) * CoalExtFactor;
 
   typedef struct packed {
     logic                                                                 id;
@@ -162,6 +182,11 @@ module cachepool_cache_ctrl #(
     core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
     logic                                                                 bypass_coalescer;
   } coalescing_info_t;
+
+  typedef struct packed {
+    part_idx_t                                                            part_idx;
+    coalescing_info_t                                                     coal;
+  } coal_cache_info_t;
 
   typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            cache_mask_t;
@@ -177,6 +202,29 @@ module cachepool_cache_ctrl #(
     way_ptr_t                                                             way;
   } cache_info_t;
 
+  localparam int unsigned                                                 BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
+  typedef logic [BypassAddrOfstWidth-1:0]                                 bypass_addr_ofst_t;
+  typedef struct packed {
+    logic [$bits(coal_cache_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
+    core_meta_t                                                           core_meta;
+    bypass_addr_ofst_t                                                    addr_offset;
+    logic                                                                 bypass_coalescer;
+  } bypass_info_t;
+  typedef union packed {
+    coal_cache_info_t                                                     coal;
+    bypass_info_t                                                         bypass;
+  } coalescer_xbar_info_union_t;
+
+  `ifndef SYNTHESIS
+  // Ensure the packed union members overlay cleanly
+  initial begin
+    if ($bits(bypass_info_t) != $bits(coal_cache_info_t)) begin
+      $error("Width mismatch: bypass_info_t=%0d, coal_cache_info_t=%0d",
+            $bits(bypass_info_t), $bits(coal_cache_info_t));
+    end
+  end
+  `endif
+
 
   //////////////////////////////////////
   //        Signal Definition         //
@@ -188,29 +236,28 @@ module cachepool_cache_ctrl #(
   addr_t                                                                  coalescing_req_addr;
   coalescing_info_t                                                       coalescing_req_info;
   logic                                                                   coalescing_req_write;
+  coal_data_t                                                             coal_req_wdata;
+  coal_mask_t                                                             coal_req_wmask;
   coalescing_data_t                                                       coalescing_req_wdata;
   coalescing_mask_t                                                       coalescing_req_wmask;
+  part_idx_t                                                              coalescing_req_part_idx;
 
   /// Coalesced response
   logic                                                                   coalescing_resp_valid;
   logic                                                                   coalescing_resp_ready;
-  coalescing_data_t                                                       coalescing_resp_data;
+  coal_data_t                                                             coalescing_resp_data;
   coalescing_info_t                                                       coalescing_resp_info;
   logic                                                                   coalescing_resp_write;
+  part_idx_t                                                              coalescing_resp_part_idx;
 
   // Bypass xbar signals
   logic                                                                   bypass_xbar_req_valid;
   logic                                                                   bypass_xbar_req_ready;
-  addr_t                                                                  bypass_xbar_req_addr;
-  coalescing_info_t                                                       bypass_xbar_req_info;
-  logic                                                                   bypass_xbar_req_write;
-  coalescing_data_t                                                       bypass_xbar_req_wdata;
-  coalescing_mask_t                                                       bypass_xbar_req_wmask;
 
   logic                                                                   bypass_xbar_resp_valid;
   logic                                                                   bypass_xbar_resp_ready;
   coalescing_data_t                                                       bypass_xbar_resp_data;
-  coalescing_info_t                                                       bypass_xbar_resp_info;
+  coalescer_xbar_info_union_t                                              bypass_xbar_resp_info;
   logic                                                                   bypass_xbar_resp_write;
 
   /// Cache request
@@ -244,6 +291,9 @@ module cachepool_cache_ctrl #(
 
   coalescing_data_t bypass_pad_data;
   logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
+  coal_ofst_t coalescing_first_ofst;
+  logic [CoalescerLineOfstBits-1:0] coalescing_line_ofst;
+  addr_t coalescing_req_addr_with_ofst;
 
   assign bypass_word_index =
     core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)];
@@ -253,6 +303,37 @@ module cachepool_cache_ctrl #(
     // Data from the core is already aligned to the byte lane indicated by strb.
     bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
       core_req_wdata_i[NumPorts-1];
+  end
+  always_comb begin
+    logic found;
+    coalescing_first_ofst = '0;
+    found = 1'b0;
+    for (int i = 0; i < CoalPorts; i++) begin
+      if (coalescing_req_info.hitmap[i] && !found) begin
+        coalescing_first_ofst = coalescing_req_info.ofsts[i];
+        found = 1'b1;
+      end
+    end
+  end
+  assign coalescing_line_ofst = coalescing_first_ofst << WordOfstBits;
+  assign coalescing_req_addr_with_ofst =
+    (coalescing_req_addr & ~(CoalescerDataWidth/8-1)) | coalescing_line_ofst;
+  // Use an ascending fixed-width (`+:`) select so the range stays legal for any
+  // PartSplit.  When PartSplit==1, CoalescerLineOfstBits == LineOfstBits, and the
+  // descending form [LineOfstBits-1:CoalescerLineOfstBits] would be a reversed
+  // range ([5:6]) that fails elaboration even though the ternary discards it.
+  // [CoalescerLineOfstBits +: PartIdxWidth] equals the old [5:4] when folded.
+  assign coalescing_req_part_idx =
+    (PartSplit > 1) ? coalescing_req_addr_with_ofst[CoalescerLineOfstBits +: PartIdxWidth] : '0;
+
+  always_comb begin
+    coalescing_req_wdata = '0;
+    coalescing_req_wmask = '0;
+    coalescing_req_wdata[coalescing_req_part_idx * CoalescerDataWidth +: CoalescerDataWidth] =
+      coal_req_wdata;
+    coalescing_req_wmask[
+      coalescing_req_part_idx * (CoalescerDataWidth/ByteWidth) +: (CoalescerDataWidth/ByteWidth)
+    ] = coal_req_wmask;
   end
 
 
@@ -268,7 +349,7 @@ module cachepool_cache_ctrl #(
     .info_t                 (core_meta_t          ),
     .down_id_t              (logic                ),
     .UpstreamDataWidth      (WordWidth            ),
-    .DownstreamDataWidth    (CacheLineWidth       ),
+    .DownstreamDataWidth    (CoalescerDataWidth   ),
     .ByteWidth              (ByteWidth            )
   ) i_par_coalescer_for_spatz (
     .clk_i,
@@ -294,8 +375,8 @@ module cachepool_cache_ctrl #(
     .downstream_req_addr_o  (coalescing_req_addr  ),
     .downstream_req_info_o  (coalescing_req_info  ),
     .downstream_req_write_o (coalescing_req_write ),
-    .downstream_req_wdata_o (coalescing_req_wdata ),
-    .downstream_req_wmask_o (coalescing_req_wmask ),
+    .downstream_req_wdata_o (coal_req_wdata       ),
+    .downstream_req_wmask_o (coal_req_wmask       ),
 
     .downstream_resp_valid_i(coalescing_resp_valid),
     .downstream_resp_ready_o(coalescing_resp_ready),
@@ -305,28 +386,6 @@ module cachepool_cache_ctrl #(
   );
 
   //1.mux/demux to divide snitch and spatz req/resp
-  localparam int unsigned BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
-  typedef logic [BypassAddrOfstWidth-1:0]    bypass_addr_ofst_t;
-  typedef struct packed {
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
-    core_meta_t                       core_meta;
-    bypass_addr_ofst_t                addr_offset;
-    logic                             bypass_coalescer;
-  } bypass_info_t;
-
-  typedef union packed {
-    coalescing_info_t   coalescer;
-    bypass_info_t       bypass;
-  } coalescer_xbar_info_union_t;
-
-  // Ensure the packed union members overlay cleanly
-  initial begin
-    if ($bits(bypass_info_t) != $bits(coalescing_info_t)) begin
-      $error("Width mismatch: bypass_info_t=%0d, coalescing_info_t=%0d",
-            $bits(bypass_info_t), $bits(coalescing_info_t));
-    end
-  end
-
   typedef struct packed {
     addr_t              addr;
     coalescer_xbar_info_union_t   info;
@@ -345,8 +404,13 @@ module cachepool_cache_ctrl #(
   drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
 
   assign coalescer_req = '{
-    addr    : coalescing_req_addr,
-    info    : coalescer_xbar_info_union_t'(coalescing_req_info),
+    addr    : coalescing_req_addr_with_ofst,
+    info    : coalescer_xbar_info_union_t'(
+      coal_cache_info_t'{
+        part_idx: coalescing_req_part_idx,
+        coal    : coalescing_req_info
+      }
+    ),
     write   : coalescing_req_write,
     wdata   : coalescing_req_wdata,
     wmask   : coalescing_req_wmask
@@ -358,7 +422,7 @@ module cachepool_cache_ctrl #(
   // };
 
   assign bypass_req = '{
-    addr    : core_req_addr_i [NumPorts-1] & ~(CacheLineWidth/8-1),
+    addr    : core_req_addr_i [NumPorts-1],
     info    : coalescer_xbar_info_union_t'(
       bypass_info_t'{
         padding    : '0,
@@ -379,6 +443,13 @@ module cachepool_cache_ctrl #(
     write   : bypass_xbar_resp_write,
     meta    : bypass_xbar_resp_info
   };
+  logic bypass_xbar_resp_sel;
+  always_comb begin
+    bypass_xbar_resp_sel = 1'b0;
+    if (bypass_xbar_resp_info.bypass.bypass_coalescer === 1'b1) begin
+      bypass_xbar_resp_sel = 1'b1;
+    end
+  end
 
   reqrsp_xbar #(
     .NumInp           (2                ),
@@ -406,13 +477,15 @@ module cachepool_cache_ctrl #(
     .mst_rsp_i        (bypass_xbar_resp         ),
     .mst_rsp_valid_i  (bypass_xbar_resp_valid    ),
     .mst_rsp_ready_o  (bypass_xbar_resp_ready    ),
-    .mst_sel_i        (bypass_xbar_resp_info.bypass_coalescer),
+    .mst_sel_i        (bypass_xbar_resp_sel),
     .mst_rr_i         ('0               )
   );
 
     // resp xbar to coalescer
-  assign coalescing_resp_data  = coalescer_resp.data;
-  assign coalescing_resp_info  = coalescer_resp.meta.coalescer;
+  assign coalescing_resp_part_idx = coalescer_resp.meta.coal.part_idx;
+  assign coalescing_resp_data =
+    coalescer_resp.data[coalescing_resp_part_idx * CoalescerDataWidth +: CoalescerDataWidth];
+  assign coalescing_resp_info  = coalescer_resp.meta.coal.coal;
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
   assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
@@ -423,10 +496,13 @@ module cachepool_cache_ctrl #(
   insitu_cache_tcdm_wrapper #(
     .ReqAddrWidth           (AddrWidth              ),
     .TagWidth               (TagWidth               ),
-    .info_t                 (coalescing_info_t      ),
+    .info_t                 (coalescer_xbar_info_union_t),
     .CacheLineWidth         (CacheLineWidth         ),
     .NumCacheEntry          (NumCacheEntry          ),
     .SetAssociativity       (SetAssociativity       ),
+    .DataPartSplit          (DataPartSplit          ),
+    .UseHashWaySelect       (UseHashWaySelect       ),
+    .UseForwardingBuffer    (UseForwardingBuffer    ),
     .NumPseudoDualBanks     (BankFactor             ),
     .WriteThroughMode       (0                      ),
     .WordWidth              (WordWidth              ),
@@ -494,20 +570,24 @@ module cachepool_cache_ctrl #(
   coalescing_data_t   refill_data_d, refill_data_q;
   burst_cnt_t         refill_cnt_d,  refill_cnt_q;
   cache_info_t        refill_info_d, refill_info_q;
+  cache_info_t        refill_req_info_d, refill_req_info_q;
 
   coalescing_data_t   write_data_d, write_data_q;
   cache_strb_t        write_strb_d, write_strb_q;
   addr_t              write_addr_d, write_addr_q;
   burst_cnt_t         write_cnt_d,  write_cnt_q;
+  logic               refill_read_outstanding_d, refill_read_outstanding_q;
 
   `FF(refill_data_q, refill_data_d, '0)
   `FF(refill_cnt_q,  refill_cnt_d,  '0)
   `FF(refill_info_q, refill_info_d, '0)
+  `FF(refill_req_info_q, refill_req_info_d, '0)
 
   `FF(write_data_q, write_data_d, '0)
   `FF(write_strb_q, write_strb_d, '0)
   `FF(write_addr_q, write_addr_d, '0)
   `FF(write_cnt_q,  write_cnt_d,  '0)
+  `FF(refill_read_outstanding_q, refill_read_outstanding_d, 1'b0)
 
   typedef enum logic [1:0] {
     // idle until response comes
@@ -575,12 +655,14 @@ module cachepool_cache_ctrl #(
       refill_cnt_d        = refill_cnt_q;
       refill_rsp_state_d  = refill_rsp_state_q;
       refill_info_d       = refill_info_q;
+      refill_req_info_d   = refill_req_info_q;
 
       refill_req_state_d  = refill_req_state_q;
       write_data_d        = write_data_q;
       write_strb_d        = write_strb_q;
       write_addr_d        = write_addr_q;
       write_cnt_d         = write_cnt_q;
+      refill_read_outstanding_d = refill_read_outstanding_q;
 
       write_strb_is_zero  = 1'b0;
 
@@ -599,7 +681,7 @@ module cachepool_cache_ctrl #(
           // Judge if it is a read or write request
           // If read: send out burst
           // If write: send out single req and switch mode
-          if (cache_req_valid) begin
+          if (cache_req_valid && !refill_read_outstanding_q) begin
             // By default, send these info for valid request
             refill_req_o = '{
               addr : cache_req_addr,
@@ -643,6 +725,10 @@ module cachepool_cache_ctrl #(
               // read request side
               cache_req_ready     = refill_req_ready_i;
               refill_req_valid_o  = cache_req_valid;
+              if (cache_req_valid && refill_req_ready_i) begin
+                refill_read_outstanding_d = 1'b1;
+                refill_req_info_d = cache_req_info;
+              end
 
               refill_burst_o      = '{
                 // Send burst if the request is valid
@@ -725,7 +811,7 @@ module cachepool_cache_ctrl #(
               // Acknowledge the acceptance of the data
               refill_rsp_ready_o  = 1'b1;
               // Fill the refill info
-              refill_info_d       = refill_rsp_i.info;
+              refill_info_d       = refill_req_info_q;
               // Response not yet ready
               cache_resp_valid    = 1'b0;
               // move to the next state
@@ -739,9 +825,9 @@ module cachepool_cache_ctrl #(
           end
         end
         Partial: begin
-          if (refill_rsp_valid_i) begin
-            // We got a valid response, is it from write?
-            if (refill_rsp_i.write == 1'b0) begin
+            if (refill_rsp_valid_i) begin
+              // We got a valid response, is it from write?
+              if (refill_rsp_i.write == 1'b0) begin
               // Add counter
               refill_cnt_d        = refill_cnt_q + 1;
               // Move data to right to add new data
@@ -752,8 +838,8 @@ module cachepool_cache_ctrl #(
               refill_rsp_ready_o  = 1'b1;
               // The refill info should be the same, raise a warning if not
             `ifndef TARGET_SYNTHESIS
-              if (refill_rsp_i.info != refill_info_q) begin
-                $warning("[L1 D$ Ctrl] Info mismatch!");
+              if (refill_rsp_i.info != refill_req_info_q) begin
+                $warning("[L1 D$ Ctrl] Info mismatch! rsp=%p req=%p", refill_rsp_i.info, refill_req_info_q);
               end
             `endif
               // Response not yet ready
@@ -769,7 +855,7 @@ module cachepool_cache_ctrl #(
           // The refill data
           cache_resp_data     = refill_data_q;
           // The refill info
-          cache_resp_info     = refill_info_q;
+          cache_resp_info     = refill_req_info_q;
           // Write response is not handled here
           cache_resp_write    = 1'b0;
           // raise the valid flag
@@ -780,6 +866,7 @@ module cachepool_cache_ctrl #(
 
           if (cache_resp_ready) begin
             // The refill is accepted
+            refill_read_outstanding_d = 1'b0;
             // Clear all FF and reset the state
             if (refill_rsp_valid_i & (refill_rsp_i.write == 1'b0)) begin
               // If we already have a valid response
@@ -793,7 +880,7 @@ module cachepool_cache_ctrl #(
               // Acknowledge the acceptance of the data
               refill_rsp_ready_o  = 1'b1;
               // Fill the refill info
-              refill_info_d       = refill_rsp_i.info;
+              refill_info_d       = refill_req_info_q;
               // move to the next state
               refill_rsp_state_d  = Partial;
             end else begin
@@ -805,6 +892,7 @@ module cachepool_cache_ctrl #(
         end
       endcase
     end
+
   end
 
   //////////////////////////////////////
@@ -845,5 +933,131 @@ module cachepool_cache_ctrl #(
   end
 `endif
 
+
+`ifndef TARGET_SYNTHESIS
+  // WB probes (Stages 4+5) — off by default; enable with `+wb_trace`.
+  bit wb_trace_en_ctrl = 1'b0;
+  initial wb_trace_en_ctrl = $test$plusargs("wb_trace");
+  // WRITEBACK-PROBE Stage 4: writeback enters the cachepool_cache_ctrl
+  // refill-request FSM (cache_req_*) from the wrapper's downstream port.
+  always @(posedge clk_i) begin
+    if (wb_trace_en_ctrl && rst_ni && cache_req_valid && cache_req_ready && cache_req_write) begin
+      $display("[WB-S4-CTRL %m] t=%0t CACHE_REQ_WRITE addr=0x%0h strb_low=0x%0h wdata[31:0]=0x%0h",
+               $time, cache_req_addr, cache_req_strb[15:0],
+               cache_req_wdata[31:0]);
+    end
+  end
+  // WRITEBACK-PROBE Stage 5: writeback beat actually leaves the cache
+  // controller toward AXI / DRAM via the unified refill_req_o port.
+  always @(posedge clk_i) begin
+    if (wb_trace_en_ctrl && rst_ni && refill_req_valid_o && refill_req_ready_i && refill_req_o.write) begin
+      $display("[WB-S5-AXI %m] t=%0t REFILL_REQ_WRITE addr=0x%0h wstrb=0x%0h wdata[31:0]=0x%0h is_burst=%0b burst_len=%0d",
+               $time, refill_req_o.addr, refill_req_o.wstrb,
+               refill_req_o.wdata[31:0], refill_burst_o.is_burst,
+               refill_burst_o.burst_len);
+    end
+  end
+
+  // ---------------------------------------------------------------------
+  // Probe D: targeted address watcher.
+  // Off by default; enable with +ctrl_write_watch plusarg.
+  // ---------------------------------------------------------------------
+  bit ctrl_write_watch_en = 1'b0;
+  initial ctrl_write_watch_en = $test$plusargs("ctrl_write_watch");
+
+  // Loop indices hoisted out of always/final blocks (debug-only).
+  int unsigned dbg_ctrlw_p;
+  int unsigned dbg_wab_p;
+  int unsigned dbg_wab_fp;
+  int unsigned dbg_wab_fs;
+
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && ctrl_write_watch_en) begin
+      for (dbg_ctrlw_p = 0; dbg_ctrlw_p < NumPorts; dbg_ctrlw_p++) begin
+        if (core_req_valid_i[dbg_ctrlw_p] && core_req_ready_o[dbg_ctrlw_p] && core_req_write_i[dbg_ctrlw_p]) begin
+          // Original and rotated forms of the 3 target addrs for FFT
+          // l1d_xbar_config(6) = full interleave, 16-bank, N=4 rotation.
+          if (core_req_addr_i[dbg_ctrlw_p] == 32'ha0001308 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'ha0001700 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'ha0001730 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000108 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000140 ||
+              core_req_addr_i[dbg_ctrlw_p] == 32'hCA000170) begin
+            $display("[CTRL-WRITE-WATCH %0t %m port %0d] addr=0x%08h data=0x%08h strb=0x%h meta=0x%h",
+                     $time, dbg_ctrlw_p, core_req_addr_i[dbg_ctrlw_p], core_req_wdata_i[dbg_ctrlw_p],
+                     core_req_wstrb_i[dbg_ctrlw_p], core_req_meta_i[dbg_ctrlw_p]);
+          end
+        end
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------
+  // Probe A: per-port write-ack balance.
+  // Count every write request entering the cache controller and every
+  // write response leaving it, per port.  At sim end, if any port has
+  // n_write_req != n_write_rsp, dump the residue and the orphan addrs.
+  // Used to root-cause the fft-32b_M1024_N16 multi-remote-port lost
+  // write-ack bug.
+  // ---------------------------------------------------------------------
+  logic [NumPorts-1:0][63:0] wab_n_req;
+  logic [NumPorts-1:0][63:0] wab_n_rsp;
+  // For each port, keep a FIFO of outstanding writes' (addr, meta) so we
+  // can dump the orphans precisely when an imbalance is detected.
+  typedef struct packed {
+    logic         valid;
+    addr_t        addr;
+    core_meta_t   meta;
+    logic [63:0]  t_issued;
+  } wab_entry_t;
+  // 32 deep matches Spatz's max-outstanding budget per port.
+  wab_entry_t [NumPorts-1:0][31:0] wab_fifo;
+  logic [NumPorts-1:0][31:0]       wab_head;  // pop here
+  logic [NumPorts-1:0][31:0]       wab_tail;  // push here
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wab_n_req <= '0;
+      wab_n_rsp <= '0;
+      wab_head  <= '0;
+      wab_tail  <= '0;
+      wab_fifo  <= '0;
+    end else begin
+      for (dbg_wab_p = 0; dbg_wab_p < NumPorts; dbg_wab_p++) begin
+        if (core_req_valid_i[dbg_wab_p] && core_req_ready_o[dbg_wab_p] && core_req_write_i[dbg_wab_p]) begin
+          wab_n_req[dbg_wab_p] <= wab_n_req[dbg_wab_p] + 64'd1;
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].valid    <= 1'b1;
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].addr     <= core_req_addr_i[dbg_wab_p];
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].meta     <= core_req_meta_i[dbg_wab_p];
+          wab_fifo[dbg_wab_p][wab_tail[dbg_wab_p]].t_issued <= 64'($time);
+          wab_tail[dbg_wab_p] <= (wab_tail[dbg_wab_p] + 32'd1) % 32'd32;
+        end
+        if (core_resp_valid_o[dbg_wab_p] && core_resp_ready_i[dbg_wab_p] && core_resp_write_o[dbg_wab_p]) begin
+          wab_n_rsp[dbg_wab_p] <= wab_n_rsp[dbg_wab_p] + 64'd1;
+          wab_fifo[dbg_wab_p][wab_head[dbg_wab_p]].valid <= 1'b0;
+          wab_head[dbg_wab_p] <= (wab_head[dbg_wab_p] + 32'd1) % 32'd32;
+        end
+      end
+    end
+  end
+
+  final begin
+    for (dbg_wab_fp = 0; dbg_wab_fp < NumPorts; dbg_wab_fp++) begin
+      if (wab_n_req[dbg_wab_fp] != wab_n_rsp[dbg_wab_fp]) begin
+        $error("[CTRL-WR-BAL %m port %0d] IMBALANCE  reqs=%0d rsps=%0d  diff=%0d",
+               dbg_wab_fp, wab_n_req[dbg_wab_fp], wab_n_rsp[dbg_wab_fp],
+               wab_n_req[dbg_wab_fp] - wab_n_rsp[dbg_wab_fp]);
+        for (dbg_wab_fs = 0; dbg_wab_fs < 32; dbg_wab_fs++) begin
+          if (wab_fifo[dbg_wab_fp][dbg_wab_fs].valid) begin
+            $display("    orphan write: slot=%0d addr=0x%08h meta=0x%0h issued@%0t",
+                     dbg_wab_fs, wab_fifo[dbg_wab_fp][dbg_wab_fs].addr,
+                     wab_fifo[dbg_wab_fp][dbg_wab_fs].meta,
+                     wab_fifo[dbg_wab_fp][dbg_wab_fs].t_issued);
+          end
+        end
+      end
+    end
+  end
+`endif
 
 endmodule : cachepool_cache_ctrl

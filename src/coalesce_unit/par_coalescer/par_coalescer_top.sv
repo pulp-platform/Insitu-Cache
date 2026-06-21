@@ -135,7 +135,8 @@ end else begin : gen_equal_window
         .down_id_t          (down_id_t),
         .UpstreamDataWidth  (UpstreamDataWidth),
         .DownstreamDataWidth(DownstreamDataWidth),
-        .ByteWidth          (ByteWidth)
+        .ByteWidth          (ByteWidth),
+        .SpliterSpillReg    (1)
     ) i_par_coalescer_equal_window (
         .clk_i,
         .rst_ni,
