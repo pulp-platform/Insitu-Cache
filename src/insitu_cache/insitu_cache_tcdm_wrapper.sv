@@ -2082,6 +2082,9 @@ module pseudo_dual_port_tcdm_wrapper #(
     logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_read_en;
     logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_read_en_q;
     logic         [NumPseudoDualBanks-1:0][NumWordsPerLine-1:0] word_write_en;
+    // T2.4: per-word "has write data" reduce, precomputed once from write_mask_i
+    // (no pseudo-bank dependence) -- see use at word_write_en below.
+    logic         [NumWordsPerLine-1:0]                         word_has_wmask;
 
     //read & write port address info
     bank_select_t                                   read_bank_select;
@@ -2122,18 +2125,37 @@ module pseudo_dual_port_tcdm_wrapper #(
     //        Instance Modules          //
     //////////////////////////////////////
 
+    // T2.4: precompute the per-word byte-mask OR once, directly from the module
+    // input write_mask_i, so the WordBytes-wide reduce resolves in parallel with
+    // the bank-select demux instead of being serialized AFTER it (it currently
+    // OR-reduces the demuxed bank_wmask[i]).  See word_write_en below.
+    for (genvar j = 0; j < NumWordsPerLine; j++) begin : gen_word_has_wmask
+        assign word_has_wmask[j] = |write_mask_i[j*WordBytes +: WordBytes];
+    end
+
     for (genvar i = 0; i < NumPseudoDualBanks; i++) begin
         assign bank_wdata_words[i] = bank_wdata[i];
         for (genvar j = 0; j < NumWordsPerLine; j++) begin
             localparam int unsigned WordPart = (PartSplit > 1) ? (j / PartWords) : 0;
             assign word_in_part[i][j] = read_all_parts_i ? 1'b1 :
               ((PartSplit > 1) ? (read_part_idx_i == WordPart[PartIdxWidth-1:0]) : 1'b1);
-            assign word_read_en[i][j] = bank_req_read[i] & read_valid_i & word_in_part[i][j];
+            // T2.3: bank_req_read[i] is asserted only in the read_valid_i-gated
+            // status arms (R_ONLY / WR_DIFF_BANK / WR_SAME_ADDR), so it already
+            // implies read_valid_i -- drop the redundant term.  Read-side mirror
+            // of T2.2: removes one series AND on the latest net (read_valid_i)
+            // right at the SRAM clock-gate enable and halves its endpoint load.
+            // INVARIANT: never assert bank_req_read[i] outside a read_valid_i
+            // -gated arm, or this redundancy becomes a real (missing) term.
+            assign word_read_en[i][j] = bank_req_read[i] & word_in_part[i][j];
             // T2.2: bank_req_write[i] is set only inside `if (write_has_data)`,
             // so it already implies write_has_data -- drop the redundant term
             // (smaller endpoint AND fan-in, lower write_has_data load).
-            assign word_write_en[i][j] = bank_req_write[i] &
-              (|bank_wmask[i][j*WordBytes +: WordBytes]);
+            // T2.4: use the precomputed word_has_wmask[j] instead of OR-reducing
+            // the demuxed bank_wmask[i].  Identical: bank_wmask[i] is '0 except
+            // at write_bank_select (== write_mask_i there) and bank_req_write[i]
+            // =1 only there, so bank_req_write[i] & |bank_wmask[i][word]
+            // === bank_req_write[i] & |write_mask_i[word].
+            assign word_write_en[i][j] = bank_req_write[i] & word_has_wmask[j];
             assign tcdm_bank_req_o[i*NumWordsPerLine + j]    = word_read_en[i][j] | word_write_en[i][j];
             assign tcdm_bank_we_o[i*NumWordsPerLine + j]     = word_write_en[i][j];
             assign tcdm_bank_addr_o[i*NumWordsPerLine + j]   = bank_addr[i];
