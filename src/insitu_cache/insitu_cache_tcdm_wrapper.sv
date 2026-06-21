@@ -2070,6 +2070,7 @@ module pseudo_dual_port_tcdm_wrapper #(
 
     //bank signals
     logic         [NumPseudoDualBanks-1:0]          bank_req_read;
+    logic                                           read_issue; // T2.5: flat read-enable term
     logic         [NumPseudoDualBanks-1:0]          bank_req_write;
     bank_addr_t   [NumPseudoDualBanks-1:0]          bank_addr;
     data_t        [NumPseudoDualBanks-1:0]          bank_wdata;
@@ -2262,7 +2263,7 @@ module pseudo_dual_port_tcdm_wrapper #(
                 // there is no write): drive the read address directly.  In
                 // WR_DIFF_BANK read_bank_select != write_bank_select, so this
                 // does not collide with the write's bank_addr above.
-                bank_req_read[read_bank_select] = 1'b1;
+                // T2.5: bank_req_read driven by the flat one-hot after endcase.
                 bank_addr[read_bank_select]     = read_bank_addr;
                 read_data_from_line_buffer_d    = '0;
                 read_data_from_bank_select_d    = read_bank_select;
@@ -2273,7 +2274,7 @@ module pseudo_dual_port_tcdm_wrapper #(
                 // read sharing the write's bank_addr (read_bank_addr ==
                 // write_bank_addr here).  Overlapping words forward from
                 // write_line_buffer via the per-word bypass.
-                bank_req_read[read_bank_select] = 1'b1;
+                // T2.5: bank_req_read driven by the flat one-hot after endcase.
                 read_data_from_line_buffer_d    = '0;
                 read_data_from_bank_select_d    = read_bank_select;
             end
@@ -2287,6 +2288,19 @@ module pseudo_dual_port_tcdm_wrapper #(
 
             default : /* W_ONLY / IDLE: no read issued */;
         endcase
+
+        // T2.5: drive bank_req_read as a flat one-hot instead of the status-enum
+        // encode -> case-decode round-trip, so the late read_valid_i is the FINAL
+        // AND on the path to the SRAM clock-gate enable.
+        //   read issued === status in {R_ONLY, WR_DIFF_BANK, WR_SAME_ADDR}
+        //              === read_valid_i & ~(write_has_data & same-bank & diff-addr)
+        // (absorption: ~wd | wd&~C === ~(wd&C)).  The wide read/write bank-addr
+        // compare resolves from early write operands; read_valid_i ANDs in last.
+        // bank_req_read defaults to '0 above; only read_bank_select is set here.
+        read_issue = read_valid_i &
+            ~(write_has_data & (read_bank_select == write_bank_select)
+                             & (read_bank_addr   != write_bank_addr));
+        bank_req_read[read_bank_select] = read_issue;
     end
 
     assign read_data_o = read_data_from_line_buffer_q? write_line_buffer: bank_rdata[read_data_from_bank_select_q];
