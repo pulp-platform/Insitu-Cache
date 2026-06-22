@@ -77,7 +77,14 @@ module cachepool_cache_ctrl #(
   // Dependent parameter, do not override. word type.
   localparam type         word_data_t                                     = logic [WordWidth-1:0],
   // Dependent parameter, do not override. byte strobe type.
-  localparam type         strb_t                                          = logic [WordWidth/ByteWidth-1:0]
+  localparam type         strb_t                                          = logic [WordWidth/ByteWidth-1:0],
+  // [LP1] Single cacheline-wide core port. After the private-L1 (LP1) insertion the
+  // shared cache became the L2: the L1 already coalesces the Spatz lanes and merges
+  // the Snitch port, so the L2 controller sees ONE cacheline-granular request stream
+  // (data = CacheLineWidth, byte-mask = CacheLineWidth/ByteWidth). WordWidth stays the
+  // cache's internal sub-line word granularity (= core DataWidth) for the bank layout.
+  localparam type         cl_data_t                                       = logic [CacheLineWidth-1:0],
+  localparam type         cl_strb_t                                       = logic [CacheLineWidth/ByteWidth-1:0]
   )(
   /// Clock, positive edge triggered.
   input  logic                                                            clk_i,
@@ -96,21 +103,34 @@ module cachepool_cache_ctrl #(
   /// Cache Partitioning Signals
   input  tcdm_bank_addr_t                                                 bank_depth_for_SPM_i,
 
-  /// spatz requests
-  input  logic            [NumPorts-1:0]                                  core_req_valid_i,
-  output logic            [NumPorts-1:0]                                  core_req_ready_o,
-  input  addr_t           [NumPorts-1:0]                                  core_req_addr_i,
-  input  core_meta_t      [NumPorts-1:0]                                  core_req_meta_i,
-  input  logic            [NumPorts-1:0]                                  core_req_write_i,
-  input  word_data_t      [NumPorts-1:0]                                  core_req_wdata_i,
-  input  strb_t           [NumPorts-1:0]                                  core_req_wstrb_i,
+  /// [LP1] Single cacheline-wide core (L1->L2) request. Old per-lane NumPorts array
+  /// (Spatz lanes + Snitch bypass) removed: the private L1 does that upstream now.
+  // input  logic            [NumPorts-1:0]                                  core_req_valid_i,
+  // output logic            [NumPorts-1:0]                                  core_req_ready_o,
+  // input  addr_t           [NumPorts-1:0]                                  core_req_addr_i,
+  // input  core_meta_t      [NumPorts-1:0]                                  core_req_meta_i,
+  // input  logic            [NumPorts-1:0]                                  core_req_write_i,
+  // input  word_data_t      [NumPorts-1:0]                                  core_req_wdata_i,
+  // input  strb_t           [NumPorts-1:0]                                  core_req_wstrb_i,
+  input  logic                                                            core_req_valid_i,
+  output logic                                                            core_req_ready_o,
+  input  addr_t                                                           core_req_addr_i,
+  input  core_meta_t                                                      core_req_meta_i,
+  input  logic                                                            core_req_write_i,
+  input  cl_data_t                                                        core_req_wdata_i,
+  input  cl_strb_t                                                        core_req_wstrb_i,
 
-  /// spatz responses
-  output logic            [NumPorts-1:0]                                  core_resp_valid_o,
-  input  logic            [NumPorts-1:0]                                  core_resp_ready_i,
-  output logic            [NumPorts-1:0]                                  core_resp_write_o,
-  output word_data_t      [NumPorts-1:0]                                  core_resp_data_o,
-  output core_meta_t      [NumPorts-1:0]                                  core_resp_meta_o,
+  /// [LP1] Single cacheline-wide core (L2->L1) response.
+  // output logic            [NumPorts-1:0]                                  core_resp_valid_o,
+  // input  logic            [NumPorts-1:0]                                  core_resp_ready_i,
+  // output logic            [NumPorts-1:0]                                  core_resp_write_o,
+  // output word_data_t      [NumPorts-1:0]                                  core_resp_data_o,
+  // output core_meta_t      [NumPorts-1:0]                                  core_resp_meta_o,
+  output logic                                                            core_resp_valid_o,
+  input  logic                                                            core_resp_ready_i,
+  output logic                                                            core_resp_write_o,
+  output cl_data_t                                                        core_resp_data_o,
+  output core_meta_t                                                      core_resp_meta_o,
 
   /// Refill port
   output refill_req_t                                                     refill_req_o,
@@ -151,17 +171,21 @@ module cachepool_cache_ctrl #(
   //        Types Definition          //
   //////////////////////////////////////
 
+  // [LP1] coalescing_data_t (the cacheline-wide internal payload) is still used by
+  // the refill FSM below. The coalescer scatter struct (coalescing_info_t) is gone:
+  // the private L1 carries/scatters its own per-lane metadata now, so the L2 only
+  // needs to echo the opaque core_meta_t. (Its (NumPorts-1)-sized arrays would also
+  // be degenerate at NumPorts==1.)
   typedef logic [CacheLineWidth-1:0]                                      coalescing_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            coalescing_mask_t;
-  typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
-
-  typedef struct packed {
-    logic                                                                 id;
-    logic       [(NumPorts-1) * CoalExtFactor - 1:0]                      hitmap;
-    coal_ofst_t [(NumPorts-1) * CoalExtFactor - 1:0]                      ofsts;
-    core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
-    logic                                                                 bypass_coalescer;
-  } coalescing_info_t;
+  // typedef logic [$clog2(CacheLineWidth/WordWidth)-1:0]                    coal_ofst_t;
+  // typedef struct packed {
+  //   logic                                                                 id;
+  //   logic       [(NumPorts-1) * CoalExtFactor - 1:0]                      hitmap;
+  //   coal_ofst_t [(NumPorts-1) * CoalExtFactor - 1:0]                      ofsts;
+  //   core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
+  //   logic                                                                 bypass_coalescer;
+  // } coalescing_info_t;
 
   typedef logic [CacheLineWidth-1:0]                                      cache_data_t;
   typedef logic [CacheLineWidth/ByteWidth-1:0]                            cache_mask_t;
@@ -182,36 +206,35 @@ module cachepool_cache_ctrl #(
   //        Signal Definition         //
   //////////////////////////////////////
 
-  /// Coalesced request
-  logic                                                                   coalescing_req_valid;
-  logic                                                                   coalescing_req_ready;
-  addr_t                                                                  coalescing_req_addr;
-  coalescing_info_t                                                       coalescing_req_info;
-  logic                                                                   coalescing_req_write;
-  coalescing_data_t                                                       coalescing_req_wdata;
-  coalescing_mask_t                                                       coalescing_req_wmask;
-
-  /// Coalesced response
-  logic                                                                   coalescing_resp_valid;
-  logic                                                                   coalescing_resp_ready;
-  coalescing_data_t                                                       coalescing_resp_data;
-  coalescing_info_t                                                       coalescing_resp_info;
-  logic                                                                   coalescing_resp_write;
-
-  // Bypass xbar signals
-  logic                                                                   bypass_xbar_req_valid;
-  logic                                                                   bypass_xbar_req_ready;
-  addr_t                                                                  bypass_xbar_req_addr;
-  coalescing_info_t                                                       bypass_xbar_req_info;
-  logic                                                                   bypass_xbar_req_write;
-  coalescing_data_t                                                       bypass_xbar_req_wdata;
-  coalescing_mask_t                                                       bypass_xbar_req_wmask;
-
-  logic                                                                   bypass_xbar_resp_valid;
-  logic                                                                   bypass_xbar_resp_ready;
-  coalescing_data_t                                                       bypass_xbar_resp_data;
-  coalescing_info_t                                                       bypass_xbar_resp_info;
-  logic                                                                   bypass_xbar_resp_write;
+  // [LP1] Coalescer + Snitch-bypass-xbar signals removed (those stages now live in
+  // the private L1). The single cacheline core port drives the insitu wrapper directly.
+  // /// Coalesced request
+  // logic                                                                   coalescing_req_valid;
+  // logic                                                                   coalescing_req_ready;
+  // addr_t                                                                  coalescing_req_addr;
+  // coalescing_info_t                                                       coalescing_req_info;
+  // logic                                                                   coalescing_req_write;
+  // coalescing_data_t                                                       coalescing_req_wdata;
+  // coalescing_mask_t                                                       coalescing_req_wmask;
+  // /// Coalesced response
+  // logic                                                                   coalescing_resp_valid;
+  // logic                                                                   coalescing_resp_ready;
+  // coalescing_data_t                                                       coalescing_resp_data;
+  // coalescing_info_t                                                       coalescing_resp_info;
+  // logic                                                                   coalescing_resp_write;
+  // // Bypass xbar signals
+  // logic                                                                   bypass_xbar_req_valid;
+  // logic                                                                   bypass_xbar_req_ready;
+  // addr_t                                                                  bypass_xbar_req_addr;
+  // coalescing_info_t                                                       bypass_xbar_req_info;
+  // logic                                                                   bypass_xbar_req_write;
+  // coalescing_data_t                                                       bypass_xbar_req_wdata;
+  // coalescing_mask_t                                                       bypass_xbar_req_wmask;
+  // logic                                                                   bypass_xbar_resp_valid;
+  // logic                                                                   bypass_xbar_resp_ready;
+  // coalescing_data_t                                                       bypass_xbar_resp_data;
+  // coalescing_info_t                                                       bypass_xbar_resp_info;
+  // logic                                                                   bypass_xbar_resp_write;
 
   /// Cache request
   logic                                                                   cache_req_valid;
@@ -242,18 +265,25 @@ module cachepool_cache_ctrl #(
     return strb;
   endfunction
 
-  coalescing_data_t bypass_pad_data;
-  logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
+  // [LP1] ================================================================
+  // Removed: Snitch bypass-padding, the Spatz par_coalescer, and the 2-input
+  // bypass xbar. The private L1 now performs Spatz-lane coalescing and the
+  // Snitch/Spatz merge upstream, so the single cacheline core port feeds the
+  // insitu wrapper directly (see the instantiation below). The old logic is
+  // commented out for reference.
+  /*=============================================================== */
+  // coalescing_data_t bypass_pad_data;
+  // logic [$clog2(CacheLineWidth/WordWidth)-1:0] bypass_word_index;
 
-  assign bypass_word_index =
-    core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)];
+  // assign bypass_word_index =
+  //   core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)];
 
-  always_comb begin
-    bypass_pad_data = '0;
-    // Data from the core is already aligned to the byte lane indicated by strb.
-    bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
-      core_req_wdata_i[NumPorts-1];
-  end
+  // always_comb begin
+  //   bypass_pad_data = '0;
+  //   // Data from the core is already aligned to the byte lane indicated by strb.
+  //   bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
+  //     core_req_wdata_i[NumPorts-1];
+  // end
 
 
   /////////////////////////////////////
@@ -261,169 +291,170 @@ module cachepool_cache_ctrl #(
   /////////////////////////////////////
 
   //0.Coalescer
-  par_coalescer_top #(
-    .ReqAddrWidth           (AddrWidth            ),
-    .NumPorts               (NumPorts - 1         ), // Only spatz vlsu goes through coalescer
-    .ExtFactor              (CoalExtFactor        ),
-    .info_t                 (core_meta_t          ),
-    .down_id_t              (logic                ),
-    .UpstreamDataWidth      (WordWidth            ),
-    .DownstreamDataWidth    (CacheLineWidth       ),
-    .ByteWidth              (ByteWidth            )
-  ) i_par_coalescer_for_spatz (
-    .clk_i,
-    .rst_ni,
-    .id_i                   ('0                   ),
+  // par_coalescer_top #(
+  //   .ReqAddrWidth           (AddrWidth            ),
+  //   .NumPorts               (NumPorts - 1         ), // Only spatz vlsu goes through coalescer
+  //   .ExtFactor              (CoalExtFactor        ),
+  //   .info_t                 (core_meta_t          ),
+  //   .down_id_t              (logic                ),
+  //   .UpstreamDataWidth      (WordWidth            ),
+  //   .DownstreamDataWidth    (CacheLineWidth       ),
+  //   .ByteWidth              (ByteWidth            )
+  // ) i_par_coalescer_for_spatz (
+  //   .clk_i,
+  //   .rst_ni,
+  //   .id_i                   ('0                   ),
 
-    .upstream_req_valid_i   (core_req_valid_i [NumPorts-2:0]    ),
-    .upstream_req_ready_o   (core_req_ready_o [NumPorts-2:0]    ),
-    .upstream_req_addr_i    (core_req_addr_i  [NumPorts-2:0]    ),
-    .upstream_req_info_i    (core_req_meta_i  [NumPorts-2:0]    ),
-    .upstream_req_write_i   (core_req_write_i [NumPorts-2:0]    ),
-    .upstream_req_wdata_i   (core_req_wdata_i [NumPorts-2:0]    ),
-    .upstream_req_wstrb_i   (core_req_wstrb_i [NumPorts-2:0]    ),
+  //   .upstream_req_valid_i   (core_req_valid_i [NumPorts-2:0]    ),
+  //   .upstream_req_ready_o   (core_req_ready_o [NumPorts-2:0]    ),
+  //   .upstream_req_addr_i    (core_req_addr_i  [NumPorts-2:0]    ),
+  //   .upstream_req_info_i    (core_req_meta_i  [NumPorts-2:0]    ),
+  //   .upstream_req_write_i   (core_req_write_i [NumPorts-2:0]    ),
+  //   .upstream_req_wdata_i   (core_req_wdata_i [NumPorts-2:0]    ),
+  //   .upstream_req_wstrb_i   (core_req_wstrb_i [NumPorts-2:0]    ),
 
-    .upstream_resp_valid_o  (core_resp_valid_o[NumPorts-2:0]    ),
-    .upstream_resp_ready_i  (core_resp_ready_i[NumPorts-2:0]    ),
-    .upstream_resp_write_o  (core_resp_write_o[NumPorts-2:0]    ),
-    .upstream_resp_data_o   (core_resp_data_o [NumPorts-2:0]    ),
-    .upstream_resp_info_o   (core_resp_meta_o [NumPorts-2:0]    ),
+  //   .upstream_resp_valid_o  (core_resp_valid_o[NumPorts-2:0]    ),
+  //   .upstream_resp_ready_i  (core_resp_ready_i[NumPorts-2:0]    ),
+  //   .upstream_resp_write_o  (core_resp_write_o[NumPorts-2:0]    ),
+  //   .upstream_resp_data_o   (core_resp_data_o [NumPorts-2:0]    ),
+  //   .upstream_resp_info_o   (core_resp_meta_o [NumPorts-2:0]    ),
 
-    .downstream_req_valid_o (coalescing_req_valid ),
-    .downstream_req_ready_i (coalescing_req_ready ),
-    .downstream_req_addr_o  (coalescing_req_addr  ),
-    .downstream_req_info_o  (coalescing_req_info  ),
-    .downstream_req_write_o (coalescing_req_write ),
-    .downstream_req_wdata_o (coalescing_req_wdata ),
-    .downstream_req_wmask_o (coalescing_req_wmask ),
+  //   .downstream_req_valid_o (coalescing_req_valid ),
+  //   .downstream_req_ready_i (coalescing_req_ready ),
+  //   .downstream_req_addr_o  (coalescing_req_addr  ),
+  //   .downstream_req_info_o  (coalescing_req_info  ),
+  //   .downstream_req_write_o (coalescing_req_write ),
+  //   .downstream_req_wdata_o (coalescing_req_wdata ),
+  //   .downstream_req_wmask_o (coalescing_req_wmask ),
 
-    .downstream_resp_valid_i(coalescing_resp_valid),
-    .downstream_resp_ready_o(coalescing_resp_ready),
-    .downstream_resp_data_i (coalescing_resp_data ),
-    .downstream_resp_info_i (coalescing_resp_info ),
-    .downstream_resp_write_i(coalescing_resp_write)
-  );
+  //   .downstream_resp_valid_i(coalescing_resp_valid),
+  //   .downstream_resp_ready_o(coalescing_resp_ready),
+  //   .downstream_resp_data_i (coalescing_resp_data ),
+  //   .downstream_resp_info_i (coalescing_resp_info ),
+  //   .downstream_resp_write_i(coalescing_resp_write)
+  // );
 
-  //1.mux/demux to divide snitch and spatz req/resp
-  localparam int unsigned BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
-  typedef logic [BypassAddrOfstWidth-1:0]    bypass_addr_ofst_t;
-  typedef struct packed {
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
-    core_meta_t                       core_meta;
-    bypass_addr_ofst_t                addr_offset;
-    logic                             bypass_coalescer;
-  } bypass_info_t;
+  // //1.mux/demux to divide snitch and spatz req/resp
+  // localparam int unsigned BypassAddrOfstWidth = $clog2(CacheLineWidth/WordWidth);
+  // typedef logic [BypassAddrOfstWidth-1:0]    bypass_addr_ofst_t;
+  // typedef struct packed {
+  //   logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
+  //   core_meta_t                       core_meta;
+  //   bypass_addr_ofst_t                addr_offset;
+  //   logic                             bypass_coalescer;
+  // } bypass_info_t;
 
-  typedef union packed {
-    coalescing_info_t   coalescer;
-    bypass_info_t       bypass;
-  } coalescer_xbar_info_union_t;
+  // typedef union packed {
+  //   coalescing_info_t   coalescer;
+  //   bypass_info_t       bypass;
+  // } coalescer_xbar_info_union_t;
 
-  // Ensure the packed union members overlay cleanly
-  initial begin
-    if ($bits(bypass_info_t) != $bits(coalescing_info_t)) begin
-      $error("Width mismatch: bypass_info_t=%0d, coalescing_info_t=%0d",
-            $bits(bypass_info_t), $bits(coalescing_info_t));
-    end
-  end
+  // // Ensure the packed union members overlay cleanly
+  // initial begin
+  //   if ($bits(bypass_info_t) != $bits(coalescing_info_t)) begin
+  //     $error("Width mismatch: bypass_info_t=%0d, coalescing_info_t=%0d",
+  //           $bits(bypass_info_t), $bits(coalescing_info_t));
+  //   end
+  // end
 
-  typedef struct packed {
-    addr_t              addr;
-    coalescer_xbar_info_union_t   info;
-    logic               write;
-    coalescing_data_t   wdata;
-    cache_mask_t        wmask;
-  } dreq_chan_t;
+  // typedef struct packed {
+  //   addr_t              addr;
+  //   coalescer_xbar_info_union_t   info;
+  //   logic               write;
+  //   coalescing_data_t   wdata;
+  //   cache_mask_t        wmask;
+  // } dreq_chan_t;
 
-  typedef struct packed {
-    coalescing_data_t           data;
-    coalescer_xbar_info_union_t meta;
-    logic                       write;
-  } drsp_chan_t;
+  // typedef struct packed {
+  //   coalescing_data_t           data;
+  //   coalescer_xbar_info_union_t meta;
+  //   logic                       write;
+  // } drsp_chan_t;
 
-  dreq_chan_t coalescer_req, bypass_req, bypass_xbar_req;
-  drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
+  // dreq_chan_t coalescer_req, bypass_req, bypass_xbar_req;
+  // drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
 
-  assign coalescer_req = '{
-    addr    : coalescing_req_addr,
-    info    : coalescer_xbar_info_union_t'(coalescing_req_info),
-    write   : coalescing_req_write,
-    wdata   : coalescing_req_wdata,
-    wmask   : coalescing_req_wmask
-  };
-
-  // bypass_info_t _binfo = '{
-  //   core_meta   : core_req_meta_i[NumPorts-1],
-  //   addr_offset : core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0]
+  // assign coalescer_req = '{
+  //   addr    : coalescing_req_addr,
+  //   info    : coalescer_xbar_info_union_t'(coalescing_req_info),
+  //   write   : coalescing_req_write,
+  //   wdata   : coalescing_req_wdata,
+  //   wmask   : coalescing_req_wmask
   // };
 
-  assign bypass_req = '{
-    addr    : core_req_addr_i [NumPorts-1] & ~(CacheLineWidth/8-1),
-    info    : coalescer_xbar_info_union_t'(
-      bypass_info_t'{
-        padding    : '0,
-        core_meta  : core_req_meta_i[NumPorts-1],
-        addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)], // Snitch always accept word-width aligned response
-        bypass_coalescer: 1'b1
-      }
-    ),
-    write   : core_req_write_i[NumPorts-1],
-    wdata   : bypass_pad_data,
-    wmask   :
-      core_req_wstrb_i[NumPorts-1][WordWidth/ByteWidth-1:0] <<
-        (WordWidth/ByteWidth * bypass_word_index)
-  };
+  // // bypass_info_t _binfo = '{
+  // //   core_meta   : core_req_meta_i[NumPorts-1],
+  // //   addr_offset : core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):0]
+  // // };
 
-  assign bypass_xbar_resp = '{
-    data    : bypass_xbar_resp_data,
-    write   : bypass_xbar_resp_write,
-    meta    : bypass_xbar_resp_info
-  };
+  // assign bypass_req = '{
+  //   addr    : core_req_addr_i [NumPorts-1] & ~(CacheLineWidth/8-1),
+  //   info    : coalescer_xbar_info_union_t'(
+  //     bypass_info_t'{
+  //       padding    : '0,
+  //       core_meta  : core_req_meta_i[NumPorts-1],
+  //       addr_offset: core_req_addr_i[NumPorts-1][($clog2(CacheLineWidth/8)-1):$clog2(WordWidth/8)], // Snitch always accept word-width aligned response
+  //       bypass_coalescer: 1'b1
+  //     }
+  //   ),
+  //   write   : core_req_write_i[NumPorts-1],
+  //   wdata   : bypass_pad_data,
+  //   wmask   :
+  //     core_req_wstrb_i[NumPorts-1][WordWidth/ByteWidth-1:0] <<
+  //       (WordWidth/ByteWidth * bypass_word_index)
+  // };
 
-  reqrsp_xbar #(
-    .NumInp           (2                ),
-    .NumOut           (1                ),
-    .PipeReg          (1'b0             ),
-    .ExtReqPrio       (1'b0             ),
-    .ExtRspPrio       (1'b0             ),
-    .tcdm_req_chan_t  (dreq_chan_t      ),
-    .tcdm_rsp_chan_t  (drsp_chan_t      )
-  ) i_bypass_xbar (
-    .clk_i            (clk_i            ),
-    .rst_ni           (rst_ni           ),
-    .slv_req_i        ({bypass_req                   , coalescer_req       } ),
-    .slv_req_valid_i  ({core_req_valid_i[NumPorts-1] , coalescing_req_valid} ),
-    .slv_req_ready_o  ({core_req_ready_o[NumPorts-1] , coalescing_req_ready} ),
-    .slv_rsp_o        ({bypass_resp                  , coalescer_resp      } ),
-    .slv_rsp_valid_o  ({core_resp_valid_o[NumPorts-1], coalescing_resp_valid} ),
-    .slv_rsp_ready_i  ({core_resp_ready_i[NumPorts-1], coalescing_resp_ready} ),
-    .slv_sel_i        ('0               ),
-    .slv_rr_i         ('0               ),
-    .slv_selected_o   (                 ),
-    .mst_req_o        (bypass_xbar_req          ),
-    .mst_req_valid_o  (bypass_xbar_req_valid    ),
-    .mst_req_ready_i  (bypass_xbar_req_ready    ),
-    .mst_rsp_i        (bypass_xbar_resp         ),
-    .mst_rsp_valid_i  (bypass_xbar_resp_valid    ),
-    .mst_rsp_ready_o  (bypass_xbar_resp_ready    ),
-    .mst_sel_i        (bypass_xbar_resp_info.bypass_coalescer),
-    .mst_rr_i         ('0               )
-  );
+  // assign bypass_xbar_resp = '{
+  //   data    : bypass_xbar_resp_data,
+  //   write   : bypass_xbar_resp_write,
+  //   meta    : bypass_xbar_resp_info
+  // };
 
-    // resp xbar to coalescer
-  assign coalescing_resp_data  = coalescer_resp.data;
-  assign coalescing_resp_info  = coalescer_resp.meta.coalescer;
-  assign coalescing_resp_write = coalescer_resp.write;
-    // resp xbar to snitch
-  assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
-  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset * WordWidth +: WordWidth];
-  assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
+  // reqrsp_xbar #(
+  //   .NumInp           (2                ),
+  //   .NumOut           (1                ),
+  //   .PipeReg          (1'b0             ),
+  //   .ExtReqPrio       (1'b0             ),
+  //   .ExtRspPrio       (1'b0             ),
+  //   .tcdm_req_chan_t  (dreq_chan_t      ),
+  //   .tcdm_rsp_chan_t  (drsp_chan_t      )
+  // ) i_bypass_xbar (
+  //   .clk_i            (clk_i            ),
+  //   .rst_ni           (rst_ni           ),
+  //   .slv_req_i        ({bypass_req                   , coalescer_req       } ),
+  //   .slv_req_valid_i  ({core_req_valid_i[NumPorts-1] , coalescing_req_valid} ),
+  //   .slv_req_ready_o  ({core_req_ready_o[NumPorts-1] , coalescing_req_ready} ),
+  //   .slv_rsp_o        ({bypass_resp                  , coalescer_resp      } ),
+  //   .slv_rsp_valid_o  ({core_resp_valid_o[NumPorts-1], coalescing_resp_valid} ),
+  //   .slv_rsp_ready_i  ({core_resp_ready_i[NumPorts-1], coalescing_resp_ready} ),
+  //   .slv_sel_i        ('0               ),
+  //   .slv_rr_i         ('0               ),
+  //   .slv_selected_o   (                 ),
+  //   .mst_req_o        (bypass_xbar_req          ),
+  //   .mst_req_valid_o  (bypass_xbar_req_valid    ),
+  //   .mst_req_ready_i  (bypass_xbar_req_ready    ),
+  //   .mst_rsp_i        (bypass_xbar_resp         ),
+  //   .mst_rsp_valid_i  (bypass_xbar_resp_valid    ),
+  //   .mst_rsp_ready_o  (bypass_xbar_resp_ready    ),
+  //   .mst_sel_i        (bypass_xbar_resp_info.bypass_coalescer),
+  //   .mst_rr_i         ('0               )
+  // );
+
+  //   // resp xbar to coalescer
+  // assign coalescing_resp_data  = coalescer_resp.data;
+  // assign coalescing_resp_info  = coalescer_resp.meta.coalescer;
+  // assign coalescing_resp_write = coalescer_resp.write;
+  //   // resp xbar to snitch
+  // assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
+  // assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset * WordWidth +: WordWidth];
+  // assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
 
   //2.Insitu-Cache controller
   insitu_cache_tcdm_wrapper #(
     .ReqAddrWidth           (AddrWidth              ),
     .TagWidth               (TagWidth               ),
-    .info_t                 (coalescing_info_t      ),
+    // [LP1] info_t is the opaque core_meta_t (tcdm_user_t) echoed by the L2.
+    .info_t                 (core_meta_t            ),
     .CacheLineWidth         (CacheLineWidth         ),
     .NumCacheEntry          (NumCacheEntry          ),
     .SetAssociativity       (SetAssociativity       ),
@@ -443,19 +474,21 @@ module cachepool_cache_ctrl #(
     .cache_sync_insn_i      (cache_sync_insn_i      ),
     .cache_part_base_i      ('0                     ),
 
-    .upstream_req_valid_i   (bypass_xbar_req_valid  ),
-    .upstream_req_ready_o   (bypass_xbar_req_ready  ),
-    .upstream_req_addr_i    (bypass_xbar_req.addr   ),
-    .upstream_req_info_i    (bypass_xbar_req.info   ),
-    .upstream_req_write_i   (bypass_xbar_req.write  ),
-    .upstream_req_wdata_i   (bypass_xbar_req.wdata  ),
-    .upstream_req_wmask_i   (bypass_xbar_req.wmask  ),
+    // [LP1] The single cacheline core port (L1->L2) feeds the wrapper directly;
+    // core_req_wstrb_i is the cacheline byte-mask (= upstream_req_wmask_i).
+    .upstream_req_valid_i   (core_req_valid_i       ),
+    .upstream_req_ready_o   (core_req_ready_o       ),
+    .upstream_req_addr_i    (core_req_addr_i        ),
+    .upstream_req_info_i    (core_req_meta_i        ),
+    .upstream_req_write_i   (core_req_write_i       ),
+    .upstream_req_wdata_i   (core_req_wdata_i       ),
+    .upstream_req_wmask_i   (core_req_wstrb_i       ),
 
-    .upstream_resp_valid_o  (bypass_xbar_resp_valid  ),
-    .upstream_resp_ready_i  (bypass_xbar_resp_ready  ),
-    .upstream_resp_write_o  (bypass_xbar_resp_write  ),
-    .upstream_resp_data_o   (bypass_xbar_resp_data   ),
-    .upstream_resp_info_o   (bypass_xbar_resp_info   ),
+    .upstream_resp_valid_o  (core_resp_valid_o      ),
+    .upstream_resp_ready_i  (core_resp_ready_i      ),
+    .upstream_resp_write_o  (core_resp_write_o      ),
+    .upstream_resp_data_o   (core_resp_data_o       ),
+    .upstream_resp_info_o   (core_resp_meta_o       ),
 
     .downstream_req_valid_o (cache_req_valid        ),
     .downstream_req_ready_i (cache_req_ready        ),
@@ -822,8 +855,12 @@ module cachepool_cache_ctrl #(
       else $fatal(1,"CoalExtFactor must be greater than 0 and a power of 2. Current value: %0d", CoalExtFactor);
     assert (AddrWidth >= 2 && is_pow2(AddrWidth))
       else $fatal(1,"AddrWidth must be greater than or equal to 2 and a power of 2. Current value: %0d", AddrWidth);
-    assert (WordWidth >= 8 && is_pow2(WordWidth) && WordWidth < CacheLineWidth)
-      else $fatal(1,"WordWidth must be greater than or equal to 8, a power of 2, and less than CacheLineWidth. Current value: %0d", WordWidth);
+    // assert (WordWidth >= 8 && is_pow2(WordWidth) && WordWidth < CacheLineWidth)
+    //   else $fatal(1,"WordWidth must be greater than or equal to 8, a power of 2, and less than CacheLineWidth. Current value: %0d", WordWidth);
+    // [LP1] Relaxed `<` to `<=`: with cacheline-granular L1->L2 traffic the L2's
+    // internal word IS the full cache line (WordWidth == CacheLineWidth).
+    assert (WordWidth >= 8 && is_pow2(WordWidth) && WordWidth <= CacheLineWidth)
+      else $fatal(1,"WordWidth must be >= 8, a power of 2, and <= CacheLineWidth. Current value: %0d", WordWidth);
     assert (NumCacheEntry >= 2 && is_pow2(NumCacheEntry) && NumCacheEntry > (SetAssociativity * BankFactor))
       else $fatal(1,"NumCacheEntry must be greater than or equal to 2 and a power of 2, NumCacheEntry must be greater than SetAssociativity * BankFactor. Current value: %0d", NumCacheEntry);
     assert (CacheLineWidth > $bits(core_meta_t) && is_pow2(CacheLineWidth))
