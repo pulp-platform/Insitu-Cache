@@ -533,6 +533,7 @@ module cachepool_cache_ctrl #(
   addr_t              write_addr_d, write_addr_q;
   burst_cnt_t         write_cnt_d,  write_cnt_q;
 
+if (BurstLength > 1) begin
   `FF(refill_data_q, refill_data_d, '0)
   `FF(refill_cnt_q,  refill_cnt_d,  '0)
   `FF(refill_info_q, refill_info_d, '0)
@@ -541,6 +542,7 @@ module cachepool_cache_ctrl #(
   `FF(write_strb_q, write_strb_d, '0)
   `FF(write_addr_q, write_addr_d, '0)
   `FF(write_cnt_q,  write_cnt_d,  '0)
+end
 
   typedef enum logic [1:0] {
     // idle until response comes
