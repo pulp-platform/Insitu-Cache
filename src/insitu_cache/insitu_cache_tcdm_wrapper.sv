@@ -1,4 +1,4 @@
-// Copyright 2023 ETH Zurich and 
+// Copyright 2023 ETH Zurich and
 // University of Bologna
 
 // Solderpad Hardware License
@@ -179,7 +179,7 @@ module insitu_cache_tcdm_wrapper
     output logic                                    downstream_req_write_o,
     output downstream_data_t                        downstream_req_wdata_o,
     output cache_mask_t                             downstream_req_wmask_o,
- 
+
     /// Downsteam response
     input  logic                                    downstream_resp_valid_i,
     output logic                                    downstream_resp_ready_o,
@@ -470,7 +470,7 @@ module insitu_cache_tcdm_wrapper
     cache_tag_t             [SetAssociativity - 1 : 0]      proc_read_cache_tag;
     cache_data_t            [SetAssociativity - 1 : 0]      proc_read_cache_data;
     way_ptr_t               [SetAssociativity - 1 : 0]      proc_read_cache_LRU;
-    
+
 
     cache_bank_depth_ptr_t                                  proc_write_cache_addr;
     logic                                                   proc_write_cache_req;
@@ -513,7 +513,7 @@ module insitu_cache_tcdm_wrapper
     cache_tag_t             [SetAssociativity - 1 : 0]      flush_read_cache_tag;
     cache_data_t            [SetAssociativity - 1 : 0]      flush_read_cache_data;
     way_ptr_t               [SetAssociativity - 1 : 0]      flush_read_cache_LRU;
-    
+
 
     cache_bank_depth_ptr_t                                  flush_write_cache_addr;
     logic                                                   flush_write_cache_req_valid;
@@ -731,16 +731,19 @@ module insitu_cache_tcdm_wrapper
         assign winfo_fifo_push             =    ~winfo_fifo_full & upstream_req_valid_i & upstream_req_ready_o & upstream_req_write_i;
         assign winfo_fifo_in               =    upstream_req_info_i;
 
-        assign upstream_req_to_cache_payload.addr = cache_addr_hashing(
-                                                        upstream_req_addr_i,
-                                                        $clog2(DownstreamWidth/8),
-                                                        $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
-                                                        AddrHashLength
-                                                    );
-        assign upstream_req_to_cache_payload.info = upstream_req_info_i;
-        assign upstream_req_to_cache_payload.write = upstream_req_write_i;
-        assign upstream_req_to_cache_payload.wdata = upstream_req_wdata_i;
-        assign upstream_req_to_cache_payload.wmask = upstream_req_wmask_i;
+        assign upstream_req_to_cache_payload = '{
+            addr:  cache_addr_hashing   (
+                                            upstream_req_addr_i,
+                                            $clog2(DownstreamWidth/8),
+                                            $clog2(CacheBankDepth) + $clog2(DownstreamWidth/8),
+                                            AddrHashLength
+                                        ),
+            info:  upstream_req_info_i,
+            write: upstream_req_write_i,
+            wdata: upstream_req_wdata_i,
+            wmask: upstream_req_wmask_i
+        };
+
 
         /***************************************/
         /*  Cache Flush + Invalidation Process */
@@ -2217,7 +2220,7 @@ module pseudo_dual_port_tcdm_wrapper #(
             end else begin
                 status = WR_CONFLICT;
             end
-        end else 
+        end else
         if (read_valid_i) begin
             status = R_ONLY;
         end else
