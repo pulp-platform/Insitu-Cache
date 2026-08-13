@@ -538,9 +538,7 @@ module insitu_cache_scoreboard
         logic [CacheLineWidth-1:0]     read_snap_line;
     } sb_req_track_t;
 
-    // Associative array keyed by upreq_info (sparse — only used info-ids
-    // get entries).  Each in-flight request occupies one entry until the
-    // matching response consumes it.
+    // Reads only -- info isn't unique for writes (see upreq snoop below).
     sb_req_track_t sb_req_track [logic [InfoWidth-1:0]];
 
     // ---------------------------------------------------------------------
@@ -582,15 +580,20 @@ module insitu_cache_scoreboard
     // -- Snoop accepted upstream requests --
     always @(posedge clk_i) begin
         if (rst_ni && upreq_valid && upreq_ready) begin
-            sb_req_track_t entry;
-            entry.valid           = 1'b1;
-            entry.addr            = upreq_addr;
-            entry.write           = upreq_write;
-            entry.t_issued        = $time;
-            entry.read_snap_valid = 1'b0;
-            entry.read_snap_line  = '0;
-            sb_req_track[upreq_info] = entry;
             n_req_fires = n_req_fires + 1;
+
+            // Writes aren't tracked here -- ROB slots free at send time, so
+            // info can repeat across concurrently outstanding stores.
+            if (!upreq_write) begin
+                sb_req_track_t entry;
+                entry.valid           = 1'b1;
+                entry.addr            = upreq_addr;
+                entry.write           = 1'b0;
+                entry.t_issued        = $time;
+                entry.read_snap_valid = 1'b0;
+                entry.read_snap_line  = '0;
+                sb_req_track[upreq_info] = entry;
+            end
 
             // -- Update shadow memory on writes --
             if (upreq_write) begin
@@ -706,29 +709,20 @@ module insitu_cache_scoreboard
     // -- Snoop accepted upstream responses + cross-check --
     always @(posedge clk_i) begin
         if (rst_ni && upresp_valid && upresp_ready) begin
-            sb_req_track_t entry;
             n_resp_total = n_resp_total + 1;
-            if (upresp_write) n_resp_write = n_resp_write + 1;
-            else              n_resp_read  = n_resp_read  + 1;
 
-            if (!sb_req_track.exists(upresp_info)) begin
-                n_resp_stray = n_resp_stray + 1;
-                $error("[SB %m] RESP STRAY  t=%0t  info=0x%0h  %s  data=0x%0h\n        (no outstanding request with this info)",
-                       $time, upresp_info,
-                       upresp_write ? "WRITE" : "READ ",
-                       upresp_data);
+            // Writes aren't matched here -- see upreq snoop for why.
+            if (upresp_write) begin
+                n_resp_write = n_resp_write + 1;
             end else begin
-                entry = sb_req_track[upresp_info];
+                sb_req_track_t entry;
+                n_resp_read = n_resp_read + 1;
 
-                // Direction check
-                if (entry.write !== upresp_write) begin
-                    n_resp_dir_mismatch = n_resp_dir_mismatch + 1;
-                    $error("[SB %m] RESP DIR MISMATCH  t=%0t  info=0x%0h  req.write=%0b  rsp.write=%0b  addr=0x%0h",
-                           $time, upresp_info, entry.write, upresp_write, entry.addr);
-                end
-
-                // Data check (READ responses only)
-                if (!upresp_write) begin
+                if (!sb_req_track.exists(upresp_info)) begin
+                    n_resp_stray = n_resp_stray + 1;
+                    $error("[SB %m] RESP STRAY  t=%0t  info=0x%0h  READ   data=0x%0h\n        (no outstanding request with this info)",
+                           $time, upresp_info, upresp_data);
+                end else begin
                     logic                       sb_hit;
                     logic [WayBits-1:0]         sb_hw;
                     logic [CacheLineWidth-1:0]  sb_line;
@@ -736,6 +730,7 @@ module insitu_cache_scoreboard
                     int unsigned                ofst_bytes;
                     int unsigned                ofst_bits;
 
+                    entry = sb_req_track[upresp_info];
                     sb_hit = sb_find_hit(entry.addr, sb_hw);
                     // Same-cycle install bypass: if the cache is installing
                     // the very line being read THIS cycle, the NBA-driven
@@ -890,10 +885,10 @@ module insitu_cache_scoreboard
                         end
                     end
                 end // close wrapper begin from line 565
-                end // close if (!upresp_write)
 
-                // Consume the entry
-                sb_req_track.delete(upresp_info);
+                    // Consume the entry
+                    sb_req_track.delete(upresp_info);
+                end
             end
         end
     end
