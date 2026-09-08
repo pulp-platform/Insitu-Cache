@@ -41,6 +41,12 @@ module sram_forwarding_buffer #(
     /// When > 1, the buffer tracks per-part validity as a bitmap
     /// and supports incremental same-line accumulation.
     parameter int unsigned PartSplit      = 1,
+    /// T3.6: consume precomputed |wr_mask_i / &wr_mask_i from wr_mask_any_i /
+    /// wr_mask_all_i instead of reducing wr_mask_i here.  The mask is on the
+    /// cache's critical path; its reductions are not, because upstream can
+    /// derive them from a register.  0 keeps the original self-contained
+    /// behaviour (and the inputs are then ignored).
+    parameter bit          UseEarlyMaskReduce = 1'b0,
     /// Read-after-write forwarding within the buffer.
     ///   0 (default): when a read AND write to the same line both hit the
     ///                buffer in the same cycle, the read sees the
@@ -92,6 +98,9 @@ module sram_forwarding_buffer #(
     input  addr_t  wr_addr_i,
     input  data_t  wr_data_i,
     input  mask_t  wr_mask_i,
+    input  logic   wr_mask_any_i,  // T3.6: |wr_mask_i, precomputed upstream
+    input  logic   wr_mask_all_i,  // T3.6: &wr_mask_i, precomputed upstream
+    input  logic [((PartSplit>1)?PartSplit:1)-1:0] wr_mask_parts_i, // T3.8: per-part |mask
     input  logic   wr_req_i,       // upstream write request (1-cycle pulse)
 
     // -- SRAM tracking --
@@ -117,6 +126,9 @@ module sram_forwarding_buffer #(
     output addr_t  wb_addr_o,      // writeback address
     output data_t  wb_data_o,      // writeback data
     output mask_t  wb_mask_o,      // writeback byte mask (only cached parts)
+    /// T3.10: |wb_mask_o.  wb_mask_o is built by expanding a PartSplit-wide
+    /// bitmap, so its OR-reduce is 4 bits here rather than MaskBits downstream.
+    output logic   wb_mask_any_o,
     input  logic   wb_done_i,      // writeback completed (clear dirty)
 
     // -- Phase 3 advisory: target line is currently in VALID state at the
@@ -208,12 +220,25 @@ module sram_forwarding_buffer #(
             rd_parts_bm[rd_part_idx_i] = 1'b1;
         end
         for (int p = 0; p < PartSplit; p++)
-            wr_parts_bm[p] = wr_req_i & (|wr_mask_i[p*PartMaskBits +: PartMaskBits]);
+            // T3.8: take the per-part reduction from upstream when available --
+            // otherwise this PartMaskBits-wide OR sits on the late write mask.
+            wr_parts_bm[p] = wr_req_i & (UseEarlyMaskReduce ? wr_mask_parts_i[p]
+                                                            : (|wr_mask_i[p*PartMaskBits +: PartMaskBits]));
     end
 
     // -- Read part match: every requested part is in the buffer --
     logic rd_part_match;
-    assign rd_part_match = ((rd_parts_bm & buf_parts_valid_q) == rd_parts_bm);
+    // T3.12: algebraically identical to ((rd_parts_bm & buf_parts_valid_q) ==
+    // rd_parts_bm), but restructured so the LATE rd_all_parts_i is a 1-bit mux
+    // select instead of fanning into a PartSplit bitmap that then feeds an
+    // AND and a PartSplit-wide equality:
+    //   all-parts  -> rd_parts_bm = '1        -> match = &buf_parts_valid_q
+    //   one part   -> rd_parts_bm = 1<<idx    -> match = buf_parts_valid_q[idx]
+    // Both arms are register-only, so they resolve while rd_all_parts_i is
+    // still being computed.
+    assign rd_part_match = (PartSplit <= 1) ? (&buf_parts_valid_q)
+                         : rd_all_parts_i    ? (&buf_parts_valid_q)
+                                             : buf_parts_valid_q[rd_part_idx_i];
 
     // -- Write parts coverage (normal: vs. buffer state) --
     logic wr_parts_covered;
@@ -277,12 +302,20 @@ module sram_forwarding_buffer #(
     // when wr_req_i=0; treating those as a fresh write absorption would
     // corrupt buf_data_q via the wr_*_hit signals (notably the (B)
     // PEND_DISJOINT NBA path that doesn't redundantly check wr_req_i).
+    // T3.6: take the reductions from upstream when available.  |wr_mask_i and
+    // &wr_mask_i are MaskBits-wide trees that would otherwise start only after
+    // the late write mask has been built; upstream can compute them from the
+    // registered request mask instead, leaving just the AND with wr_req_i here.
+    logic wr_mask_any, wr_mask_all;
+    assign wr_mask_any = UseEarlyMaskReduce ? wr_mask_any_i : (|wr_mask_i);
+    assign wr_mask_all = UseEarlyMaskReduce ? wr_mask_all_i : (&wr_mask_i);
+
     logic has_wr_data;
-    assign has_wr_data = wr_req_i & (|wr_mask_i);
+    assign has_wr_data = wr_req_i & wr_mask_any;
 
     // Full-line write detection: all bytes being written.
     logic wr_full_line;
-    assign wr_full_line = wr_req_i & (&wr_mask_i);
+    assign wr_full_line = wr_req_i & wr_mask_all;
 
     // -- Write hit classification --
     // wr_buf_hit fires in two cases:
@@ -344,6 +377,31 @@ module sram_forwarding_buffer #(
           | (wr_buf_hit_pend_disjoint & (&post_absorb_parts_pd))
           | (wr_concurrent_hit        & (&post_absorb_parts_cc)));
 
+`ifndef TARGET_SYNTHESIS
+    // T3.6 contract: the precomputed reductions MUST equal the real ones.  If
+    // upstream ever changes how the write mask is built without updating the
+    // reductions, the buffer would silently mis-classify writes -- catch it at
+    // the cycle of divergence instead.
+    always_ff @(posedge clk_i) begin : proc_assert_early_mask_reduce
+        if (rst_ni && UseEarlyMaskReduce && wr_req_i) begin
+            if (wr_mask_any_i !== (|wr_mask_i)) begin
+                $error("[FWDBUF %m] wr_mask_any_i=%0b but |wr_mask_i=%0b (mask=0x%0h)",
+                       wr_mask_any_i, (|wr_mask_i), wr_mask_i);
+            end
+            if (wr_mask_all_i !== (&wr_mask_i)) begin
+                $error("[FWDBUF %m] wr_mask_all_i=%0b but &wr_mask_i=%0b (mask=0x%0h)",
+                       wr_mask_all_i, (&wr_mask_i), wr_mask_i);
+            end
+            for (int p = 0; p < PartSplit; p++) begin
+                if (wr_mask_parts_i[p] !== (|wr_mask_i[p*PartMaskBits +: PartMaskBits])) begin
+                    $error("[FWDBUF %m] wr_mask_parts_i[%0d]=%0b mismatch (mask=0x%0h)",
+                           p, wr_mask_parts_i[p], wr_mask_i);
+                end
+            end
+        end
+    end
+`endif
+
     // -- Writeback outputs --
     assign wb_needed_o = Enable & buf_dirty_q;
     assign wb_addr_o   = buf_addr_q;
@@ -393,6 +451,8 @@ module sram_forwarding_buffer #(
                     wb_mask_o[p*PartMaskBits +: PartMaskBits] = '1;
         end
     end
+
+    assign wb_mask_any_o = (PartSplit <= 1) ? 1'b1 : (|wb_parts_post_absorb);
 
     // -- Internal merge gate --
     // Buffer only merges when the write is actually absorbed (address match,
