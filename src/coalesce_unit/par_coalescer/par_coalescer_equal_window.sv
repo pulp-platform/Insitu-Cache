@@ -162,8 +162,29 @@ module par_coalescer_equal_window #(
         assign write_mixed_addr[i] = {upstream_req_write_i[i], upstream_req_addr_i[i]};
     end
 
+    // A load must not overtake an older store to the same block arriving on another port.
+    // Accepted requests leave in order, so only a store still waiting at an input can be
+    // overtaken: hold a load while a store to its block is valid at any other input.
+    localparam int unsigned BlockOfstBits = $clog2(DownstreamDataWidth/ByteWidth);
+
+    logic [NumPorts-1:0] load_blocked;
+
+    for (genvar i = 0; i < NumPorts; i++) begin : gen_load_block
+        logic [NumPorts-1:0] store_same_block;
+        for (genvar j = 0; j < NumPorts; j++) begin : gen_store_cmp
+            if (j == i) begin : gen_self
+                assign store_same_block[j] = 1'b0;
+            end else begin : gen_other
+                assign store_same_block[j] = upstream_req_valid_i[j] & upstream_req_write_i[j] &
+                    (upstream_req_addr_i[j][ReqAddrWidth-1:BlockOfstBits] ==
+                     upstream_req_addr_i[i][ReqAddrWidth-1:BlockOfstBits]);
+            end
+        end
+        assign load_blocked[i] = ~upstream_req_write_i[i] & (|store_same_block);
+    end
+
     assign req_fifo_full = req_info_full | req_wdata_full | req_wstrb_full;
-    assign upstream_req_valid_gated = upstream_req_valid_i & ~req_fifo_full;
+    assign upstream_req_valid_gated = upstream_req_valid_i & ~req_fifo_full & ~load_blocked;
     assign upstream_req_ready_o = upstream_req_ready_raw & ~req_fifo_full;
 
     req_coalescer_v2 #(
