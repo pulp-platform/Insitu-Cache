@@ -29,6 +29,10 @@ module insitu_cache_encoder
     parameter int unsigned WordWidth                        = 64,
     /// Width of byte (granularity of byte mask)
     parameter int unsigned ByteWidth                        = 8,
+    /// T3.8: parts per cache line, to size the per-part mask reduction.
+    parameter int unsigned PartSplit                        = 1,
+    // T3.8: byte-mask bits per part (constant, needed for the part-select).
+    localparam int unsigned EncPartMaskBits                 = (CacheLineWidth/ByteWidth)/PartSplit,
     // Dependent parameter, do not override. Depth of cache bank.
     localparam int unsigned CacheBankDepth                  = NumCacheEntry/SetAssociativity,
     // Dependent parameter, do not override. way ptr type.
@@ -72,6 +76,12 @@ module insitu_cache_encoder
     input  cache_data_t                                     enc_cache_data_i,
     input  logic                                            enc_mod_data_with_mask_i,
     input  cache_mask_t                                     enc_mod_mask_i,
+    /// T3.7: |enc_mod_mask_i and &enc_mod_mask_i, reduced upstream from the
+    /// register that feeds the mask rather than from the late mux output.
+    input  logic                                            enc_mod_mask_any_i,
+    input  logic                                            enc_mod_mask_all_i,
+    /// T3.8: per-part |mask, reduced upstream from the same registers.
+    input  logic [PartSplit-1:0]                            enc_mod_mask_parts_i,
     input  cache_data_t                                     enc_mod_write_data_i,
     input  logic                                            clear_pend_cnt_i,
 
@@ -92,6 +102,12 @@ module insitu_cache_encoder
     output cache_tag_t              [SetAssociativity-1:0]  bank_write_cache_tag_o,
     output cache_data_t             [SetAssociativity-1:0]  bank_write_cache_data_o,
     output cache_mask_t             [SetAssociativity-1:0]  bank_write_data_mask_o,
+    // T3.6: |mask and &mask per way, computed here (see the note at their
+    // assignment) so the forwarding buffer does not have to reduce the late
+    // mask itself.
+    output logic                    [SetAssociativity-1:0]  bank_write_data_mask_any_o,
+    output logic                    [SetAssociativity-1:0]  bank_write_data_mask_all_o,
+    output logic [SetAssociativity-1:0][PartSplit-1:0]      bank_write_data_mask_parts_o,
     output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o
 );
 
@@ -178,6 +194,9 @@ module insitu_cache_encoder
         bank_write_cache_data_o = bank_read_cache_data_i;
         bank_write_cache_LRU_o = bank_read_cache_LRU_i;
         bank_write_data_mask_o = '{default: '0};
+        bank_write_data_mask_any_o = '0;
+        bank_write_data_mask_all_o = '0;
+        bank_write_data_mask_parts_o = '0;
 
         pendline_cnt_d = pendline_cnt_q;
         has_pend_line_o = (pendline_cnt_q != '0);
@@ -200,6 +219,31 @@ module insitu_cache_encoder
             bank_write_data_mask_o[enc_way_i] = enc_mod_mask_i;
         end else begin
             bank_write_data_mask_o[enc_way_i] = '1;
+        end
+
+    // Timing (T3.6): early reductions of the write byte-mask.
+    // The forwarding buffer needs |mask and &mask.  Computing them THERE means
+    // a 64-input OR/AND tree that only starts once the mask has been built by
+    // this encoder -- and the mask is on the cache's critical path (measured:
+    // mask at 0.433 ns, buffer write-hit at 0.535 ns).  But the mask can only
+    // ever be all-ones, all-zeros, or enc_mod_mask_i, and enc_mod_mask_i comes
+    // straight from preread_task_q (a register).  So the reductions can be
+    // computed from the register at the start of the cycle and merely SELECTED
+    // by the late enc_mod_data_with_mask_i / enc_way_i -- trees off the path,
+    // one mux left on it.
+        // Mirrors bank_write_data_mask_o exactly: '0 for every way except
+        // enc_way_i, which gets enc_mod_mask_i or all-ones.
+        if (enc_mod_data_with_mask_i) begin
+            // T3.7: use the upstream reductions.  Reducing enc_mod_mask_i here
+            // would put the tree after the FSM's late mask mux, which is what
+            // T3.6 alone still did.
+            bank_write_data_mask_any_o[enc_way_i] = enc_mod_mask_any_i;
+            bank_write_data_mask_all_o[enc_way_i] = enc_mod_mask_all_i;
+            bank_write_data_mask_parts_o[enc_way_i] = enc_mod_mask_parts_i;
+        end else begin
+            bank_write_data_mask_any_o[enc_way_i] = 1'b1;
+            bank_write_data_mask_all_o[enc_way_i] = 1'b1;
+            bank_write_data_mask_parts_o[enc_way_i] = '1;
         end
 
         //modify selescted way
@@ -234,5 +278,30 @@ module insitu_cache_encoder
         end
 `endif
     end 
+
+`ifndef TARGET_SYNTHESIS
+    // T3.7 contract: the upstream reductions must match the mask they describe.
+    // The FSM sets enc_mod_mask and its two reductions at six separate sites;
+    // if any future edit updates one and forgets the others, catch it here
+    // rather than let the forwarding buffer mis-classify writes.
+    always_ff @(posedge clk_i) begin : proc_assert_enc_mask_reduce
+        if (rst_ni && enc_mod_data_with_mask_i) begin
+            if (enc_mod_mask_any_i !== (|enc_mod_mask_i)) begin
+                $error("[ENC %m] enc_mod_mask_any_i=%0b but |enc_mod_mask_i=%0b (mask=0x%0h)",
+                       enc_mod_mask_any_i, (|enc_mod_mask_i), enc_mod_mask_i);
+            end
+            if (enc_mod_mask_all_i !== (&enc_mod_mask_i)) begin
+                $error("[ENC %m] enc_mod_mask_all_i=%0b but &enc_mod_mask_i=%0b (mask=0x%0h)",
+                       enc_mod_mask_all_i, (&enc_mod_mask_i), enc_mod_mask_i);
+            end
+            for (int p = 0; p < PartSplit; p++) begin
+                if (enc_mod_mask_parts_i[p] !== (|enc_mod_mask_i[p*EncPartMaskBits +: EncPartMaskBits])) begin
+                    $error("[ENC %m] enc_mod_mask_parts_i[%0d]=%0b mismatch (mask=0x%0h)",
+                           p, enc_mod_mask_parts_i[p], enc_mod_mask_i);
+                end
+            end
+        end
+    end
+`endif
 
 endmodule

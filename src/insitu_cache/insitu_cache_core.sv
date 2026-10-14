@@ -182,6 +182,11 @@ module insitu_cache_core
     output cache_tag_t              [SetAssociativity-1:0]  bank_write_cache_tag_o,
     output cache_data_t             [SetAssociativity-1:0]  bank_write_cache_data_o,
     output cache_mask_t             [SetAssociativity-1:0]  bank_write_data_mask_o,
+    /// T3.6: |mask / &mask per way, produced by the encoder from registered
+    /// state so the forwarding buffer need not reduce the late mask.
+    output logic                    [SetAssociativity-1:0]  bank_write_data_mask_any_o,
+    output logic                    [SetAssociativity-1:0]  bank_write_data_mask_all_o,
+    output logic [SetAssociativity-1:0][PartSplit-1:0]      bank_write_data_mask_parts_o,
     output logic                                            bank_write_LRU_req_o,
     output way_ptr_t                [SetAssociativity-1:0]  bank_write_cache_LRU_o,
     /// When asserted with bank_write_req_o, the meta SRAM write can be
@@ -649,6 +654,11 @@ module insitu_cache_core
     cache_tag_t                                             enc_cache_tag;
     cache_data_t                                            enc_cache_data;
     logic                                                   enc_mod_data_with_mask;
+    // T3.7: |enc_mod_mask and &enc_mod_mask, selected by the FSM in lockstep
+    // with enc_mod_mask itself (see the note at req_wmask_any).
+    logic                                                   enc_mod_mask_any;
+    logic                                                   enc_mod_mask_all;
+    logic [PartSplit-1:0]                                   enc_mod_mask_parts;
     cache_mask_t                                            enc_mod_mask;
     cache_data_t                                            enc_mod_write_data;
 `ifdef ENABLE_MULTI_READ_PEND
@@ -861,14 +871,30 @@ module insitu_cache_core
     // stale data for those parts.  Treat it like an SRAM write -- stall.
     logic                                                   bank_write_buf_safe_bypass;
     assign bank_write_buf_safe_bypass = bank_write_data_buf_hit_i & bank_write_data_buf_full_cov_i;
+    // Timing (T3.4): compare-then-mux instead of mux-then-compare.
+    //
+    // bank_write_cache_tag_o[bank_write_way_o] == <tag> put a SetAssociativity:1
+    // mux of wide tags in FRONT of a wide comparator, with both the mux select
+    // (bank_write_way_o) and the array itself coming out of the FSM/encoder --
+    // so the whole comparator tree resolved after the late way index.  Doing
+    // the compares per way and muxing the 1-bit results lets the comparators
+    // resolve in parallel with bank_write_way_o; only a 1-bit mux is left in
+    // series.  Bit-identical by construction (selecting then comparing equals
+    // comparing then selecting the same index).
+    logic [SetAssociativity-1:0] wr_tag_eq_upstream, wr_tag_eq_req_buf;
+    for (genvar w = 0; w < SetAssociativity; w++) begin : gen_wr_tag_eq
+        assign wr_tag_eq_upstream[w] = (bank_write_cache_tag_o[w] == upstream_req_tag_tmp);
+        assign wr_tag_eq_req_buf [w] = (bank_write_cache_tag_o[w] == req_buf_tag_tmp);
+    end
+
     assign upstream_req_issue_hazard_now = upstream_req_valid_i & bank_write_req_o &
                                            ~bank_write_buf_safe_bypass &
                                            (bank_write_addr_o == upstream_req_depth_tmp) &
-                                           (bank_write_cache_tag_o[bank_write_way_o] == upstream_req_tag_tmp);
+                                           wr_tag_eq_upstream[bank_write_way_o];
     assign req_buf_issue_hazard_now = req_buf_valid_q & bank_write_req_o &
                                       ~bank_write_buf_safe_bypass &
                                       (bank_write_addr_o == req_buf_depth_tmp) &
-                                      (bank_write_cache_tag_o[bank_write_way_o] == req_buf_tag_tmp);
+                                      wr_tag_eq_req_buf[bank_write_way_o];
     assign req_buf_push = upstream_req_valid_i & upstream_req_ready_o;
     // Once the pre-reader arbiter actually selects the buffered request, keep the
     // request visible until the handshake completes. Deriving this from the real
@@ -974,6 +1000,24 @@ module insitu_cache_core
         end
     endgenerate
 
+    // Timing (T3.3): evict_full_read_req selects the FIRST ternary of
+    // bank_read_addr_o, bank_read_valid_o, bank_read_part_idx_o and
+    // bank_read_way_mask_o, so it gates the whole bank-read issue -- and the
+    // bank read issue is the endpoint class that owns most of the design TNS.
+    //
+    // It was assigned inside the 1500-line Cache_FSM always_comb (default 0,
+    // set to 1 in the EVIC_STALL arm), which lets synthesis serialise it
+    // behind that block's priority cascade.  But its value depends ONLY on
+    // registers: cache_status_q, evict_full_wait_q, evict_full_data_valid_q.
+    // Likewise evict_full_read_addr was always evict_stall_depth_q, in both
+    // the default and the arm.  Hoisting both to continuous assigns makes the
+    // register-only derivation structural instead of something the tool has
+    // to rediscover.  Logically identical: the EVIC_STALL arm is a case arm on
+    // cache_status_q and the inner guard is reproduced verbatim below.
+    assign evict_full_read_req  = (PartSplit > 1) & (cache_status_q == EVIC_STALL)
+                                & ~evict_full_wait_q & ~evict_full_data_valid_q;
+    assign evict_full_read_addr = evict_stall_depth_q;
+
     assign bank_read_part_idx_o = (evict_full_read_req || refill_full_read_req) ? '0 : preread_part_idx;
     assign bank_read_addr_o = evict_full_read_req ? evict_full_read_addr : bank_read_addr_arb;
     assign bank_read_valid_o = evict_full_read_req ? 1'b1 : preread_bank_valid;
@@ -1024,8 +1068,19 @@ module insitu_cache_core
     // its parts-preserving behavior away from PEND lines (where the cache
     // controller's status array is mid-protocol and (D) absorption could
     // make the controller miss a needed refill match).
-    assign bank_write_target_valid_o =
-        (bank_read_cache_status_i[bank_write_way_o] == VALID);
+    // Timing (T3.5): same compare-then-mux transform as T3.4.  Indexing the
+    // status array by the late bank_write_way_o and THEN comparing puts a
+    // SetAssociativity:1 mux of SRAM read data in front of the comparator, so
+    // the compare could only start once the way index resolved.  Comparing
+    // every way in parallel (each against a constant) and selecting the 1-bit
+    // result lets the compares finish while bank_write_way_o is still being
+    // computed.  Bit-identical: selecting-then-comparing == comparing-then-
+    // selecting at the same index.
+    logic [SetAssociativity-1:0] bank_read_status_is_valid;
+    for (genvar w = 0; w < SetAssociativity; w++) begin : gen_status_is_valid
+        assign bank_read_status_is_valid[w] = (bank_read_cache_status_i[w] == VALID);
+    end
+    assign bank_write_target_valid_o = bank_read_status_is_valid[bank_write_way_o];
 
 
 
@@ -1304,6 +1359,112 @@ module insitu_cache_core
     // always the victim.  For hits, the decoder already returns the
     // correct way (only 1 way has valid meta due to the one-hot mask).
     // Compute hash from the FSM-stage address (preread_task_q).
+    // Timing (T3.7): completes T3.6.
+    //
+    // T3.6 moved the write-mask reductions out of the forwarding buffer into
+    // the encoder -- but the encoder was still reducing enc_mod_mask_i, which
+    // is a MUX of four register values selected by the FSM.  A mux selected
+    // late makes its output late, so the reduce tree was still downstream of
+    // the late select: the tree moved, it did not leave the path.
+    //
+    // enc_mod_mask is only ever one of: '0, the request's wmask, the deferred
+    // write's mask, or the refill-stall wmask -- ALL REGISTERS.  So reduce each
+    // candidate here (from the register, at the start of the cycle) and let the
+    // FSM select the 1-bit results alongside the mask itself.  Reduce-then-mux
+    // instead of mux-then-reduce, the same transform as T3.4/T3.5.
+    // T3.8: completes T3.7 for the PER-PART reductions.  The forwarding buffer
+    // also does wr_parts_bm[p] = wr_req_i & |wr_mask_i[p*PartMaskBits +: ...],
+    // a PartMaskBits-wide OR per part, and that tree was still left on the late
+    // mask.  Same treatment: reduce each register candidate per part here, and
+    // let the FSM select the bitmaps in lockstep with the mask.
+    localparam int unsigned PartMaskBitsC = (CacheLineWidth/ByteWidth) / PartSplit;
+    logic [PartSplit-1:0] req_wmask_parts, defwr_mask_parts, rfstall_mask_parts;
+    for (genvar p = 0; p < PartSplit; p++) begin : gen_mask_part_reduce
+        assign req_wmask_parts[p] =
+            |preread_task_q.task_pay.request.wmask[p*PartMaskBitsC +: PartMaskBitsC];
+        assign defwr_mask_parts[p] =
+            |deferred_bank_write_q.mod_mask[p*PartMaskBitsC +: PartMaskBitsC];
+        assign rfstall_mask_parts[p] =
+            |fsm_refill_stall_q.wmask[p*PartMaskBitsC +: PartMaskBitsC];
+    end
+
+    logic req_wmask_any,     req_wmask_all;
+    logic defwr_mask_any,    defwr_mask_all;
+    logic rfstall_mask_any,  rfstall_mask_all;
+    assign req_wmask_any    = |preread_task_q.task_pay.request.wmask;
+    assign req_wmask_all    = &preread_task_q.task_pay.request.wmask;
+    assign defwr_mask_any   = |deferred_bank_write_q.mod_mask;
+    assign defwr_mask_all   = &deferred_bank_write_q.mod_mask;
+    assign rfstall_mask_any = |fsm_refill_stall_q.wmask;
+    assign rfstall_mask_all = &fsm_refill_stall_q.wmask;
+
+    // Timing (T3.9): bank_write_way_o / bank_write_addr_o out of the FSM.
+    //
+    // proc_write_cache_way (= bank_write_way_o) is the SELECT of
+    //   bank_write_data_buf_hit = data_bank_write_hit[proc_write_cache_way]
+    // which sits directly on the measured critical path, and it also demuxes
+    // the encoder and gates the per-way write request in the wrapper.  It was
+    // assigned at four points inside the 1500-line Cache_FSM, so the tool
+    // serialises it behind that priority cascade.
+    //
+    // Yet every arm's VALUE and every arm's GUARD is a register:
+    //   refill   (after endcase, so highest priority):
+    //       guard preread_task_q.valid & is_refill      -> .refill.info.way/.depth
+    //   deferred (EVIC_STALL case arm):
+    //       guard cache_status_q==EVIC_STALL & PartSplit>1 & evict_full_data_valid_q
+    //             & ~evic_fifo_full & deferred_bank_write_q.valid
+    //                                                  -> deferred_bank_write_q.way/.addr
+    //   request  (REQ_PROC case arm):
+    //       guard cache_status_q==REQ_PROC & preread_task_q.valid & ~is_refill
+    //                                                  -> hash_way_fsm / req addr bits
+    //   otherwise '0
+    // (evic_fifo_full is a fifo_v3 flag off its own count register, so early.
+    //  In LRU mode req_way_tmp uses dec_way and is NOT register-only -- the
+    //  expression stays correct, it simply stops being early.)
+    //
+    // The FSM still computes bank_write_*_fsm and an assertion below checks the
+    // two agree every cycle, so a future FSM edit cannot silently desync them.
+    way_ptr_t              bank_write_way_fsm;
+    way_ptr_t              enc_way_fsm;          // T3.11 equivalence reference
+    cache_bank_depth_ptr_t bank_write_addr_fsm;
+    logic                  t39_refill_arm, t39_defer_arm, t39_req_arm;
+
+    assign t39_refill_arm = preread_task_q.valid & preread_task_q.is_refill;
+    assign t39_defer_arm  = (cache_status_q == EVIC_STALL) & (PartSplit > 1)
+                          & evict_full_data_valid_q & ~evic_fifo_full
+                          & deferred_bank_write_q.valid;
+    assign t39_req_arm    = (cache_status_q == REQ_PROC) & preread_task_q.valid
+                          & ~preread_task_q.is_refill;
+
+    assign bank_write_way_o  = t39_refill_arm ? refill_way_tmp
+                             : t39_defer_arm  ? deferred_bank_write_q.way
+                             : t39_req_arm    ? req_way_tmp
+                                              : '0;
+    assign bank_write_addr_o = t39_refill_arm ? preread_task_q.task_pay.refill.info.depth
+                             : t39_defer_arm  ? deferred_bank_write_q.addr
+                             : t39_req_arm    ? req_depth_tmp
+                                              : '0;
+
+`ifndef TARGET_SYNTHESIS
+    always_ff @(posedge clk_i) begin : proc_assert_t39_write_sel
+        if (rst_ni) begin
+            if (bank_write_way_o !== bank_write_way_fsm) begin
+                $error("[T3.9 %m] bank_write_way flat=%0d fsm=%0d (refill=%0b defer=%0b req=%0b status=%0d)",
+                       bank_write_way_o, bank_write_way_fsm,
+                       t39_refill_arm, t39_defer_arm, t39_req_arm, cache_status_q);
+            end
+            if (bank_write_addr_o !== bank_write_addr_fsm) begin
+                $error("[T3.9 %m] bank_write_addr flat=%0d fsm=%0d",
+                       bank_write_addr_o, bank_write_addr_fsm);
+            end
+            if (enc_way !== enc_way_fsm) begin
+                $error("[T3.11 %m] enc_way flat=%0d fsm=%0d (defer=%0b)",
+                       enc_way, enc_way_fsm, t39_defer_arm);
+            end
+        end
+    end
+`endif
+
     way_ptr_t hash_way_fsm;
     if (UseHashWaySelect && SetAssociativity > 1) begin : gen_hash_way_fsm
         localparam int unsigned WayBits = $clog2(SetAssociativity);
@@ -1317,6 +1478,22 @@ module insitu_cache_core
     end else begin : gen_no_hash_way_fsm
         assign hash_way_fsm = '0;
     end
+
+    // Timing (T3.11): enc_way demuxes every encoder output -- including
+    // bank_write_data_mask_o[enc_way_i], which is the 0.065 ns / 5-level
+    // encoder segment of the critical path.  It was assigned at two points
+    // inside Cache_FSM, and both are register-derived in hash mode:
+    //   deferred arm (later, so it wins): deferred_bank_write_q.way
+    //   otherwise: refill.info.way / hash_way_fsm  (dec_way only in LRU mode,
+    //              where this stops being early but stays correct)
+    // The deferred guard is exactly t39_defer_arm, already built for T3.9.
+    assign enc_way = t39_defer_arm ? deferred_bank_write_q.way
+                   : (UseHashWaySelect && preread_task_q.valid)
+                       ? (preread_task_q.is_refill
+                            ? preread_task_q.task_pay.refill.info.way
+                            : hash_way_fsm)
+                       : dec_way;
+
 
 
     ///////////////////////////////////////
@@ -1332,7 +1509,8 @@ module insitu_cache_core
         .NumCacheEntry   (NumCacheEntry),
         .SetAssociativity(SetAssociativity),
         .WordWidth       (WordWidth),
-        .ByteWidth       (ByteWidth)
+        .ByteWidth       (ByteWidth),
+        .PartSplit       (PartSplit)
     ) i_insitu_cache_encoder (
         .clk_i,
         .rst_ni,
@@ -1347,6 +1525,9 @@ module insitu_cache_core
         .enc_cache_data_i         (enc_cache_data         ),
         .enc_mod_data_with_mask_i (enc_mod_data_with_mask ),
         .enc_mod_mask_i           (enc_mod_mask           ),
+        .enc_mod_mask_any_i       (enc_mod_mask_any       ),
+        .enc_mod_mask_all_i       (enc_mod_mask_all       ),
+        .enc_mod_mask_parts_i     (enc_mod_mask_parts     ),
         .enc_mod_write_data_i     (enc_mod_write_data     ),
         .clear_pend_cnt_i         (clear_pend_cnt_i       ),
 `ifdef ENABLE_MULTI_READ_PEND
@@ -1370,6 +1551,9 @@ module insitu_cache_core
         .bank_write_cache_tag_o,
         .bank_write_cache_data_o,
         .bank_write_data_mask_o,
+        .bank_write_data_mask_any_o,
+        .bank_write_data_mask_all_o,
+        .bank_write_data_mask_parts_o,
         .bank_write_cache_LRU_o
     );
 
@@ -1408,8 +1592,6 @@ module insitu_cache_core
         evict_full_data_d = evict_full_data_q;
         evict_full_data_valid_d = evict_full_data_valid_q;
         evict_full_wait_d = evict_full_wait_q;
-        evict_full_read_req = 1'b0;
-        evict_full_read_addr = evict_stall_depth_q;
         fsm_refill_stall_d = fsm_refill_stall_q;
         fsm_refill_way_d = fsm_refill_way_q;
         deferred_bank_write_d = deferred_bank_write_q;
@@ -1431,12 +1613,14 @@ module insitu_cache_core
         // With hash way select, the encoder must index the hashed way
         // (for requests) or the FIFO way (for refills), not dec_way
         // which defaults to the decoder's LRU-based selection.
+        // T3.11: enc_way is driven by a continuous assign (see below); the FSM
+        // keeps its own copy for the equivalence check only.
         if (UseHashWaySelect && preread_task_q.valid) begin
-            enc_way = preread_task_q.is_refill ?
-                      preread_task_q.task_pay.refill.info.way :
-                      hash_way_fsm;
+            enc_way_fsm = preread_task_q.is_refill ?
+                          preread_task_q.task_pay.refill.info.way :
+                          hash_way_fsm;
         end else begin
-            enc_way = dec_way;
+            enc_way_fsm = dec_way;
         end
         enc_cache_status = dec_cache_status;
         enc_cache_dirty = dec_cache_dirty;
@@ -1446,6 +1630,9 @@ module insitu_cache_core
         enc_cache_data = dec_cache_data;
         enc_mod_data_with_mask = '0;
         enc_mod_mask = '0;
+        enc_mod_mask_any = 1'b0;
+        enc_mod_mask_all = 1'b0;
+        enc_mod_mask_parts = '0;
         enc_mod_write_data = '0;
 `ifdef ENABLE_MULTI_READ_PEND
         enc_link_exec = '0;
@@ -1462,9 +1649,9 @@ module insitu_cache_core
 `endif
 
         //Cache Bank
-        bank_write_addr_o = '0;
+        bank_write_addr_fsm = '0;
         bank_write_req_o = '0;
-        bank_write_way_o = '0;
+        bank_write_way_fsm = '0;
         bank_write_LRU_req_o = '0;
         bank_write_meta_skip_o = '0;
 
@@ -1549,8 +1736,8 @@ module insitu_cache_core
                     {req_tag_tmp, req_depth_tmp, req_ofst_tmp} = preread_task_q.task_pay.request.addr;
                     req_is_write_through_ignore_tmp = WriteThroughMode & req_is_write_tmp;
 
-                    bank_write_way_o = req_way_tmp;
-                    bank_write_addr_o = req_depth_tmp;
+                    bank_write_way_fsm = req_way_tmp;
+                    bank_write_addr_fsm = req_depth_tmp;
 
                     //4. Process for different request type
                     if (req_is_hit_tmp) begin
@@ -1599,6 +1786,9 @@ module insitu_cache_core
                             //6.3 Update data line
                             enc_mod_data_with_mask = 1'b1;
                             enc_mod_mask = preread_task_q.task_pay.request.wmask;
+                            enc_mod_mask_any = req_wmask_any;
+                            enc_mod_mask_all = req_wmask_all;
+                            enc_mod_mask_parts = req_wmask_parts;
                             enc_mod_write_data = preread_task_q.task_pay.request.wdata;
 
                             //6.5 Write to bank
@@ -1772,6 +1962,9 @@ module insitu_cache_core
                             //8.3 Update data line
                             enc_mod_data_with_mask = 1'b1;
                             enc_mod_mask = preread_task_q.task_pay.request.wmask;
+                            enc_mod_mask_any = req_wmask_any;
+                            enc_mod_mask_all = req_wmask_all;
+                            enc_mod_mask_parts = req_wmask_parts;
                             enc_mod_write_data = preread_task_q.task_pay.request.wdata;
 
                             //8.5 Write to bank
@@ -1841,6 +2034,9 @@ module insitu_cache_core
                                 enc_cache_data = '0;
                                 enc_mod_data_with_mask = 1'b1;
                                 enc_mod_mask = preread_task_q.task_pay.request.wmask;
+                            enc_mod_mask_any = req_wmask_any;
+                            enc_mod_mask_all = req_wmask_all;
+                            enc_mod_mask_parts = req_wmask_parts;
                                 enc_mod_write_data = preread_task_q.task_pay.request.wdata;
 
                             end
@@ -2230,9 +2426,10 @@ module insitu_cache_core
                         evict_full_wait_d = 1'b0;
                     end
 
+                    // T3.3: evict_full_read_req / evict_full_read_addr are now
+                    // driven by continuous assigns (see near bank_read_addr_o).
+                    // Only the FSM state update stays here.
                     if (~evict_full_wait_q && ~evict_full_data_valid_q) begin
-                        evict_full_read_req = 1'b1;
-                        evict_full_read_addr = evict_stall_depth_q;
                         if (bank_read_ready_i) begin
                             evict_full_wait_d = 1'b1;
                         end
@@ -2246,7 +2443,7 @@ module insitu_cache_core
                             evic_fifo_push = 1;
                             evict_full_data_valid_d = 1'b0;
                             if (deferred_bank_write_q.valid) begin
-                                enc_way = deferred_bank_write_q.way;
+                                enc_way_fsm = deferred_bank_write_q.way;
                                 enc_cache_status = deferred_bank_write_q.cache_status;
                                 enc_cache_dirty = deferred_bank_write_q.cache_dirty;
                                 enc_cache_miss_meta = deferred_bank_write_q.cache_miss_meta;
@@ -2255,9 +2452,12 @@ module insitu_cache_core
                                 enc_cache_data = deferred_bank_write_q.cache_data;
                                 enc_mod_data_with_mask = deferred_bank_write_q.mod_data_with_mask;
                                 enc_mod_mask = deferred_bank_write_q.mod_mask;
+                                enc_mod_mask_any = defwr_mask_any;
+                                enc_mod_mask_all = defwr_mask_all;
+                                enc_mod_mask_parts = defwr_mask_parts;
                                 enc_mod_write_data = deferred_bank_write_q.mod_write_data;
-                                bank_write_addr_o = deferred_bank_write_q.addr;
-                                bank_write_way_o = deferred_bank_write_q.way;
+                                bank_write_addr_fsm = deferred_bank_write_q.addr;
+                                bank_write_way_fsm = deferred_bank_write_q.way;
                                 bank_write_req_o = 1'b1;
                                 bank_write_LRU_req_o = deferred_bank_write_q.LRU_update;
                                 deferred_bank_write_d = '0;
@@ -2410,8 +2610,8 @@ module insitu_cache_core
 
             //2.5 Write to bank
             bank_write_req_o = 1;
-            bank_write_addr_o = preread_task_q.task_pay.refill.info.depth;
-            bank_write_way_o = refill_way_tmp;
+            bank_write_addr_fsm = preread_task_q.task_pay.refill.info.depth;
+            bank_write_way_fsm = refill_way_tmp;
 
             //2.6 Record data in case of eviction
             refill_evic_data_in_words_tmp = refill_cache_data_in_words_tmp;
@@ -2500,6 +2700,9 @@ module insitu_cache_core
                     enc_cache_data = refill_cache_data_in_words_tmp;
                     enc_mod_data_with_mask = 1'b1;
                     enc_mod_mask = fsm_refill_stall_q.wmask;
+                    enc_mod_mask_any = rfstall_mask_any;
+                    enc_mod_mask_all = rfstall_mask_all;
+                    enc_mod_mask_parts = rfstall_mask_parts;
                     enc_mod_write_data = fsm_refill_stall_q.wdata;
 
                     //6.4 Return status and continue preread for request
@@ -2554,6 +2757,9 @@ module insitu_cache_core
                     enc_cache_data = refill_cache_data_in_words_tmp;
                     enc_mod_data_with_mask = 1'b1;
                     enc_mod_mask = fsm_refill_stall_q.wmask;
+                    enc_mod_mask_any = rfstall_mask_any;
+                    enc_mod_mask_all = rfstall_mask_all;
+                    enc_mod_mask_parts = rfstall_mask_parts;
                     enc_mod_write_data = fsm_refill_stall_q.wdata;
 
                 end

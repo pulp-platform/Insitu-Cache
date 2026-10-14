@@ -440,6 +440,8 @@ module insitu_cache_tcdm_wrapper
     logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_write_req;
     cache_meta_t            [SetAssociativity - 1 : 0]      gnt_meta_bank_write_data;
     logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_write_mask;
+    logic                   [SetAssociativity - 1 : 0]      gnt_data_bank_write_mask_any;
+    logic                   [SetAssociativity - 1 : 0]      gnt_meta_bank_write_mask_any;
 
 
     cache_bank_depth_ptr_t                                  bank_write_cache_addr;
@@ -452,6 +454,13 @@ module insitu_cache_tcdm_wrapper
     cache_data_t            [SetAssociativity - 1 : 0]      bank_write_cache_data;
     cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask;
     cache_mask_t            [SetAssociativity - 1 : 0]      bank_write_data_mask_sel;
+    // T3.6: early |mask / &mask from the encoder, muxed alongside the mask.
+    logic                   [SetAssociativity - 1 : 0]      bank_write_data_mask_any;
+    logic                   [SetAssociativity - 1 : 0]      bank_write_data_mask_all;
+    logic                   [SetAssociativity - 1 : 0]      bank_write_data_mask_any_sel;
+    logic                   [SetAssociativity - 1 : 0]      bank_write_data_mask_all_sel;
+    logic [SetAssociativity-1:0][PartSplit-1:0]             bank_write_data_mask_parts;
+    logic [SetAssociativity-1:0][PartSplit-1:0]             bank_write_data_mask_parts_sel;
     logic                                                   bank_write_LRU_req;
     way_ptr_t               [SetAssociativity - 1 : 0]      bank_write_cache_LRU;
     logic                                                   bank_write_meta_skip;
@@ -1201,6 +1210,9 @@ module insitu_cache_tcdm_wrapper
         .bank_write_cache_tag_o         (proc_write_cache_tag),
         .bank_write_cache_data_o        (proc_write_cache_data),
         .bank_write_data_mask_o         (bank_write_data_mask),
+        .bank_write_data_mask_any_o     (bank_write_data_mask_any),
+        .bank_write_data_mask_all_o     (bank_write_data_mask_all),
+        .bank_write_data_mask_parts_o   (bank_write_data_mask_parts),
         .bank_write_LRU_req_o           (proc_write_LRU_req),
         .bank_write_cache_LRU_o         (proc_write_cache_LRU),
         .bank_write_meta_skip_o         (proc_write_meta_skip),
@@ -1441,7 +1453,20 @@ module insitu_cache_tcdm_wrapper
     // (:1394).  Reuse it (CSE) and drop the dead SYNC_CTRL_READ_BANK comparator +
     // one mux level.  Bit-identical incl. 4-state X:  (a ? 1'b1 : b) === (a | b).
     assign bank_read_sel_flush         = sync_block_install | ~proc_read_cache_valid;
-    assign bank_read_cache_valid       = bank_read_sel_flush? flush_read_cache_valid : proc_read_cache_valid;
+    // Timing (T3.1): bank_read_cache_valid feeds the meta/data SRAM
+    // clock-gate enable, and proc_read_cache_valid is the LATEST input here
+    // (it comes out of the cache core's pre-reader arbiter).  Routing it
+    // through the mux SELECT costs inv -> or -> mux-select; as a flat
+    // AND/OR it is two gates and the late signal lands on the final OR.
+    //   sel   = s | ~p
+    //   valid = sel ? f : p
+    //         = s ? f : (p ? p : f)   = s ? f : (p | f)
+    //         = f | (~s & p)          [f absorbs both s arms]
+    // Bit-identical for all 8 input combinations.  (2-state; with sel=X the
+    // old form could yield X where this yields a defined value -- same
+    // licence the existing T1.2/T2.5 rewrites in this file already take.)
+    assign bank_read_cache_valid       = flush_read_cache_valid
+                                       | (~sync_block_install & proc_read_cache_valid);
     // Fix: proc must only see ready when the arbiter is actually serving
     // proc.  Previously this was unconditionally bank_read_cache_ready,
     // which spuriously completed a proc handshake whenever the bank
@@ -1503,6 +1528,11 @@ module insitu_cache_tcdm_wrapper
     assign bank_write_cache_data       = proc_write_select? proc_write_cache_data : flush_write_cache_data;
     assign bank_write_cache_LRU        = proc_write_select? proc_write_cache_LRU : flush_write_cache_LRU;
     assign bank_write_data_mask_sel    = proc_write_select? bank_write_data_mask : '{default: '1};
+    // T3.6: the flush arm drives an all-ones mask, so both reductions are 1.
+    assign bank_write_data_mask_any_sel = proc_write_select? bank_write_data_mask_any : '1;
+    assign bank_write_data_mask_all_sel = proc_write_select? bank_write_data_mask_all : '1;
+    assign bank_write_data_mask_parts_sel = proc_write_select? bank_write_data_mask_parts
+                                                             : '{default: '1};
     assign bank_write_meta_skip        = proc_write_select? proc_write_meta_skip : 1'b0;
     assign bank_read_data_skip         = bank_read_sel_flush? 1'b0 : proc_read_data_skip;
 
@@ -1696,6 +1726,9 @@ module insitu_cache_tcdm_wrapper
                                           | (~proc_write_select & flush_write_cache_req_valid)),
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
+            .upstream_write_mask_any_i   (bank_write_data_mask_any_sel[i]),
+            .upstream_write_mask_all_i   (bank_write_data_mask_all_sel[i]),
+            .upstream_write_mask_parts_i (bank_write_data_mask_parts_sel[i]),
             .upstream_write_ready_o      (data_bank_write_ready[i]),
             .upstream_write_target_valid_i (proc_write_target_valid),
 
@@ -1708,6 +1741,7 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_req_o      (gnt_data_bank_write_req[i]),
             .downstream_write_data_o     (gnt_data_bank_write_data[i]),
             .downstream_write_mask_o     (gnt_data_bank_write_mask[i]),
+            .downstream_write_mask_any_o (gnt_data_bank_write_mask_any[i]),
 
             .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i])),
             .fwd_wr_hit_o                (data_bank_write_hit[i]),
@@ -1737,6 +1771,7 @@ module insitu_cache_tcdm_wrapper
             .write_req_i        (gnt_data_bank_write_req[i]),
             .write_data_i       (gnt_data_bank_write_data[i]),
             .write_mask_i       (gnt_data_bank_write_mask[i]),
+            .write_mask_any_i   (gnt_data_bank_write_mask_any[i]),
 
             .tcdm_bank_req_o    (tcdm_data_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_data_bank_we_o[i]),
@@ -1796,6 +1831,9 @@ module insitu_cache_tcdm_wrapper
                                           | (~proc_write_select & flush_write_cache_req_valid)),
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
+            .upstream_write_mask_any_i   (1'b1  ),
+            .upstream_write_mask_all_i   (1'b1  ),
+            .upstream_write_mask_parts_i ('1    ),
             .upstream_write_ready_o      (meta_bank_write_ready[i]),
             // Meta side does not have (D) gating today; tie to 1 (no-op
             // for the existing buffer code paths).
@@ -1810,8 +1848,32 @@ module insitu_cache_tcdm_wrapper
             .downstream_write_req_o      (gnt_meta_bank_write_req[i]),
             .downstream_write_data_o     (gnt_meta_bank_write_data[i]),
             .downstream_write_mask_o     (gnt_meta_bank_write_mask[i]),
+            .downstream_write_mask_any_o (gnt_meta_bank_write_mask_any[i]),
 
-            .bank_gnt_i                  (&(tcdm_data_bank_gnt_i[i])),
+            // Timing (T3.2): the meta (tag) SRAMs are plain per-way macros -- the
+            // tile exposes NO grant for them (tcdm_tag_bank_* has no gnt port);
+            // only the SKEWED FOLDED DATA banks can lose a column arbitration.
+            // Feeding the data grant in here put the whole cross-way loop
+            //   other way's data write -> part_we -> any_other_write_in_col
+            //   -> l1_data_bank_gnt -> bank_gnt_i -> downstream_read_valid_o
+            //   -> tcdm_meta_bank_req_o -> meta SRAM clock-gate enable
+            // on the meta SRAM's enable/address, which is the design's WNS
+            // endpoint (~15 levels / 0.16 ns of the failing path).
+            //
+            // Dropping it is safe: the UPSTREAM handshake still carries the
+            // denial.  bank_read_cache_ready_per_way[i] ANDs in
+            // data_bank_read_ready[i], which goes low when the data side
+            // loses the grant, so bank_read_cache_ready falls, the core's
+            // preread_task_d.valid stays 0, the task is not consumed and the
+            // request is replayed next cycle -- exactly as before.  The only
+            // difference is that the meta SRAM performs one extra (ignored)
+            // read; its result is discarded because preread_task_q.valid is 0
+            // in the next cycle, and the meta forwarding buffer simply
+            // populates the line that the replay is about to ask for again.
+            // The buffer's dirty-line protection is unaffected: it lives in
+            // the EARLIER `fwd_wb_needed && ... && !buf_has_free_clean` arm,
+            // which still fires (assertion AC-4 does not involve bank_gnt_i).
+            .bank_gnt_i                  (1'b1),
             .fwd_wr_hit_o                (),
             .fwd_wr_full_coverage_o      ()
 
@@ -1839,6 +1901,7 @@ module insitu_cache_tcdm_wrapper
             .write_req_i        (gnt_meta_bank_write_req[i]),
             .write_data_i       (gnt_meta_bank_write_data[i]),
             .write_mask_i       (gnt_meta_bank_write_mask[i]),
+            .write_mask_any_i   (gnt_meta_bank_write_mask_any[i]),
 
             .tcdm_bank_req_o    (tcdm_meta_bank_req_o[i]),
             .tcdm_bank_we_o     (tcdm_meta_bank_we_o[i]),
@@ -2030,6 +2093,9 @@ module pseudo_dual_port_tcdm_wrapper #(
     input  logic                                    write_req_i,
     input  data_t                                   write_data_i,
     input  mask_t                                   write_mask_i,
+    /// T3.10: |write_mask_i, reduced upstream (see the note in the access
+    /// controller).  Keeps the MaskBits-wide OR off the late write mask.
+    input  logic                                    write_mask_any_i,
 
     /// bank ports
     output logic         [NumBanks-1:0]             tcdm_bank_req_o,
@@ -2202,7 +2268,10 @@ module pseudo_dual_port_tcdm_wrapper #(
         read_data_from_line_buffer_d = '0;
         read_data_from_bank_select_d = '0;
 
-        write_has_data = write_req_i & (|write_mask_i);
+        // T3.10: write_mask_any_i is |write_mask_i, computed upstream from
+        // early sources; the local reduce below is kept only as the contract
+        // reference (see the assertion at the end of this module).
+        write_has_data = write_req_i & write_mask_any_i;
 
         /*******************/
         /* Determin Status */
@@ -2303,6 +2372,16 @@ module pseudo_dual_port_tcdm_wrapper #(
 
     assign read_data_o = read_data_from_line_buffer_q? write_line_buffer: bank_rdata[read_data_from_bank_select_q];
 
+`ifndef TARGET_SYNTHESIS
+    // T3.10 contract: the upstream reduction must equal the real one.
+    always_ff @(posedge clk_i) begin : proc_assert_write_mask_any
+        if (rst_ni && write_req_i && (write_mask_any_i !== (|write_mask_i))) begin
+            $error("[PDP %m] write_mask_any_i=%0b but |write_mask_i=%0b (mask=0x%0h)",
+                   write_mask_any_i, (|write_mask_i), write_mask_i);
+        end
+    end
+`endif
+
 endmodule : pseudo_dual_port_tcdm_wrapper
 
 
@@ -2380,6 +2459,13 @@ module insitu_cache_bank_access_controller #(
     input  logic                                    upstream_write_req_i,
     input  data_t                                   upstream_write_data_i,
     input  mask_t                                   upstream_write_mask_i,
+    /// T3.6: |upstream_write_mask_i and &upstream_write_mask_i, precomputed
+    /// upstream from registered state.  Only consumed by the single-entry
+    /// forwarding buffer (UseEarlyMaskReduce); the multi-entry buffer still
+    /// reduces internally.
+    input  logic                                    upstream_write_mask_any_i,
+    input  logic                                    upstream_write_mask_all_i,
+    input  logic [((PartSplit>1)?PartSplit:1)-1:0]  upstream_write_mask_parts_i,
     /// Backpressure: when low, the upstream write must NOT be consumed this
     /// cycle (i.e., the cache controller must hold the request and replay
     /// it next cycle).  Phase 1: always 1 (always-ready, behavior identical
@@ -2405,6 +2491,13 @@ module insitu_cache_bank_access_controller #(
     output logic                                    downstream_write_req_o,
     output data_t                                   downstream_write_data_o,
     output mask_t                                   downstream_write_mask_o,
+    /// T3.10: |downstream_write_mask_o.  The pseudo-dual-port wrapper needs it
+    /// for write_has_data; reducing the MaskBits-wide mask THERE puts a 64-input
+    /// OR on the late write mask -- the 0.098 ns / 9-level data-bank segment of
+    /// the critical path.  Every source can be reduced early: upstream supplies
+    /// its own (T3.6), the writeback mask reduces to a PartSplit-wide OR inside
+    /// the buffer, and the stall mask is a register.
+    output logic                                    downstream_write_mask_any_o,
 
     // Bank Access Grant
     input  logic                                    bank_gnt_i,
@@ -2461,6 +2554,7 @@ module insitu_cache_bank_access_controller #(
     addr_t fwd_wb_addr;       // writeback address
     data_t fwd_wb_data;       // writeback data
     mask_t fwd_wb_mask;       // writeback byte mask (only cached parts)
+    logic  fwd_wb_mask_any;   // T3.10: |fwd_wb_mask (early)
 
     // Multi-entry-specific signals (only driven when FwdBufEntries>1).
     // buf_has_free_clean: at least one entry is invalid or clean, so the
@@ -2519,7 +2613,8 @@ module insitu_cache_bank_access_controller #(
             .Enable         (UseForwardingBuffer),
             .PartSplit      (PartSplit),
             .EnableRawForwarding(EnableRawForwarding),
-            .EnableInflightWriteMerge(EnableInflightWriteMerge)
+            .EnableInflightWriteMerge(EnableInflightWriteMerge),
+            .UseEarlyMaskReduce(1'b1)
         ) i_fwd_buf (
             .clk_i,
             .rst_ni,
@@ -2531,6 +2626,9 @@ module insitu_cache_bank_access_controller #(
             .wr_addr_i      (upstream_write_addr_i),
             .wr_data_i      (upstream_write_data_i),
             .wr_mask_i      (upstream_write_mask_i),
+            .wr_mask_any_i  (upstream_write_mask_any_i),
+            .wr_mask_all_i  (upstream_write_mask_all_i),
+            .wr_mask_parts_i(upstream_write_mask_parts_i),
             .wr_req_i       (upstream_write_req_i),
             .sram_rd_issued_i(downstream_read_valid_o & downstream_read_ready_i),
             .sram_rdata_i    (downstream_read_data_i),
@@ -2543,6 +2641,7 @@ module insitu_cache_bank_access_controller #(
             .wb_addr_o      (fwd_wb_addr),
             .wb_data_o      (fwd_wb_data),
             .wb_mask_o      (fwd_wb_mask),
+            .wb_mask_any_o  (fwd_wb_mask_any),
             .wb_done_i      (fwd_wb_done),
             .wr_target_valid_i (upstream_write_target_valid_i),
             .fwd_rdata_o    (fwd_rdata),
@@ -2557,6 +2656,9 @@ module insitu_cache_bank_access_controller #(
             .stat_wb_o      ()
         );
     end else begin : gen_fwd_buf_multi
+        // T3.10: the multi-entry buffer does not export the reduction; reduce
+        // locally (this path is not the one under timing pressure today).
+        assign fwd_wb_mask_any = |fwd_wb_mask;
         // Multi-entry module -- drives buf_has_free_clean so SpecWb only
         // fires when the buffer is actually pressured (all entries dirty).
         logic buf_near_full_unused;
@@ -2671,6 +2773,7 @@ module insitu_cache_bank_access_controller #(
         downstream_write_addr_o = upstream_write_addr_i;
         downstream_write_data_o = upstream_write_data_i;
         downstream_write_mask_o = upstream_write_mask_i;
+        downstream_write_mask_any_o = upstream_write_mask_any_i;
 
         // -- Writeback overlay: takes priority over the main FSM --
         // Writes proceed unconditionally -- with the tile-level grant
@@ -2688,6 +2791,7 @@ module insitu_cache_bank_access_controller #(
             downstream_write_addr_o = fwd_wb_addr;
             downstream_write_data_o = fwd_wb_data;
             downstream_write_mask_o = fwd_wb_mask;
+            downstream_write_mask_any_o = fwd_wb_mask_any;
             wb_active_d = 1'b0;
             if (wb_has_stall_q) begin
                 access_status_d = ACCESS_STALL;
@@ -2746,6 +2850,9 @@ module insitu_cache_bank_access_controller #(
                             downstream_write_addr_o = fwd_wb_addr;
                             downstream_write_data_o = fwd_wb_data;
                             downstream_write_mask_o = fwd_wb_mask;
+                        downstream_write_mask_any_o = fwd_wb_mask_any;
+                            downstream_write_mask_any_o = fwd_wb_mask_any;
+            downstream_write_mask_any_o = fwd_wb_mask_any;
                         end else if (upstream_read_valid_i && !fwd_rd_hit) begin
                             // (b) Block read to avoid clobbering dirty buffer.
                             upstream_read_ready_o   = '0;
@@ -2761,6 +2868,8 @@ module insitu_cache_bank_access_controller #(
                         downstream_write_addr_o = fwd_wb_addr;
                         downstream_write_data_o = fwd_wb_data;
                         downstream_write_mask_o = fwd_wb_mask;
+                        downstream_write_mask_any_o = fwd_wb_mask_any;
+            downstream_write_mask_any_o = fwd_wb_mask_any;
                     end else if (fwd_wb_needed && upstream_read_valid_i
                                  && !fwd_rd_hit
                                  && (upstream_read_addr_i != fwd_wb_addr)
@@ -2807,6 +2916,7 @@ module insitu_cache_bank_access_controller #(
                     downstream_write_addr_o = access_stall_addr_q;
                     downstream_write_data_o = access_stall_data_q;
                     downstream_write_mask_o = access_stall_mask_q;
+                    downstream_write_mask_any_o = |access_stall_mask_q;
                     access_status_d = ACCESS_THROUGH;
                 end
 
