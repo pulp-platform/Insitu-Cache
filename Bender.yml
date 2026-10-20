@@ -52,6 +52,7 @@ sources:
     - src/insitu_cache/insitu_cache_tcdm_wrapper_partitionable_flushable.sv
     #level4
     - src/flamingo/flamingo_spatz_cache_ctrl.sv
+    - src/cachepool/cachepool_addr_unrotate.sv
     - src/cachepool/cachepool_cache_ctrl.sv
     #verif (passive scoreboard, guarded by `ifndef TARGET_SYNTHESIS)
     - src/verif/insitu_cache_scoreboard.sv
