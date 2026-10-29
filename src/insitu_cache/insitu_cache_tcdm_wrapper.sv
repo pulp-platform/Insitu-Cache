@@ -991,72 +991,60 @@ module insitu_cache_tcdm_wrapper
                     // ~dvalid_q` sub-state inside the dirty branch (which
                     // also gates on read alignment via flush_full_*_q).
                     if (sync_ctrl_has_dirty_line || flush_full_wait_q || flush_full_data_valid_q) begin
-                        if (PartSplit > 1) begin
-                            flush_full_read_active = 1'b1;
-                            if (~flush_full_wait_q && ~flush_full_data_valid_q) begin
-                                // READ-COMPLETION GUARD: we need the meta
-                                // SRAM read for sync_ctrl_ptr_q to be valid
-                                // before we can latch the tag/mask for the
-                                // writeback.  If the read isn't aligned
-                                // (proc-side contention or first cycle),
-                                // re-issue and wait.
-                                if (~(flush_read_select_q
-                                      && (bank_read_cache_addr_q == sync_ctrl_ptr_q))) begin
-                                    flush_read_cache_addr = sync_ctrl_ptr_q;
-                                    flush_read_cache_valid = 1'b1;
-                                    // Don't advance into wait state yet.
-                                end else begin
-                                    flush_full_way_d = sync_ctrl_dirty_line;
-                                    flush_full_tag_d = flush_read_cache_tag[sync_ctrl_dirty_line];
-                                    flush_full_mask_d = flush_read_cache_mask[sync_ctrl_dirty_line];
-                                    flush_full_addr_d = sync_ctrl_ptr_q;
-                                    flush_read_cache_addr = sync_ctrl_ptr_q;
-                                    flush_read_cache_valid = 1'b1;
-                                    flush_read_all_parts = 1'b1;
-                                    flush_read_way_mask = '0;
-                                    flush_read_way_mask[sync_ctrl_dirty_line] = 1'b1;
-                                    if (flush_read_cache_ready) begin
-                                        flush_full_wait_d = 1'b1;
-                                    end
+                        // Folded and unfolded alike: the cleanup write of every
+                        // clean set takes the bank write port, so the background
+                        // read of the next set is usually refused.  Without this
+                        // guard the writeback used a stale read (tag/mask of
+                        // another set) and dropped the dirty line.
+                        flush_full_read_active = 1'b1;
+                        if (~flush_full_wait_q && ~flush_full_data_valid_q) begin
+                            // READ-COMPLETION GUARD: we need the meta
+                            // SRAM read for sync_ctrl_ptr_q to be valid
+                            // before we can latch the tag/mask for the
+                            // writeback.  If the read isn't aligned
+                            // (proc-side contention or first cycle),
+                            // re-issue and wait.
+                            if (~(flush_read_select_q
+                                  && (bank_read_cache_addr_q == sync_ctrl_ptr_q))) begin
+                                flush_read_cache_addr = sync_ctrl_ptr_q;
+                                flush_read_cache_valid = 1'b1;
+                                // Don't advance into wait state yet.
+                            end else begin
+                                flush_full_way_d = sync_ctrl_dirty_line;
+                                flush_full_tag_d = flush_read_cache_tag[sync_ctrl_dirty_line];
+                                flush_full_mask_d = flush_read_cache_mask[sync_ctrl_dirty_line];
+                                flush_full_addr_d = sync_ctrl_ptr_q;
+                                flush_read_cache_addr = sync_ctrl_ptr_q;
+                                flush_read_cache_valid = 1'b1;
+                                flush_read_all_parts = 1'b1;
+                                flush_read_way_mask = '0;
+                                flush_read_way_mask[sync_ctrl_dirty_line] = 1'b1;
+                                if (flush_read_cache_ready) begin
+                                    flush_full_wait_d = 1'b1;
                                 end
-                            end else if (flush_full_wait_q) begin
-                                flush_full_data_d = bank_read_cache_data[flush_full_way_q];
-                                flush_full_data_valid_d = 1'b1;
-                                flush_full_wait_d = 1'b0;
                             end
+                        end else if (flush_full_wait_q) begin
+                            flush_full_data_d = bank_read_cache_data[flush_full_way_q];
+                            flush_full_data_valid_d = 1'b1;
+                            flush_full_wait_d = 1'b0;
+                        end
 
-                            if (flush_full_data_valid_q) begin
-                                //Try to evict dirty line
-                                write_through_req_payload.addr  = {flush_full_tag_q, flush_full_addr_q, sync_ctrl_ofst};
-                                write_through_req_payload.info  = '0;
-                                write_through_req_payload.write = 1'b1;
-                                write_through_req_payload.wdata = flush_full_data_q;
-                                write_through_req_payload.wmask = flush_full_mask_q;
-                                write_through_valid = 1'b1;
-                                if (write_through_ready) begin
-                                    //clean up the dirty line
-                                    flush_write_cache_addr                          = flush_full_addr_q;
-                                    flush_write_cache_status[flush_full_way_q]      = INVALID;
-                                    flush_write_cache_dirty[flush_full_way_q]       = 1'b0;
-                                    flush_write_cache_req_valid                     = 1'b1;
-                                    flush_full_data_valid_d                         = 1'b0;
-                                    flush_full_wait_d                               = 1'b0;
-                                end
-                            end
-                        end else begin
+                        if (flush_full_data_valid_q) begin
                             //Try to evict dirty line
-                            write_through_req_payload.addr  = {flush_read_cache_tag[sync_ctrl_dirty_line], sync_ctrl_ptr_q, sync_ctrl_ofst};
+                            write_through_req_payload.addr  = {flush_full_tag_q, flush_full_addr_q, sync_ctrl_ofst};
                             write_through_req_payload.info  = '0;
                             write_through_req_payload.write = 1'b1;
-                            write_through_req_payload.wdata = flush_read_cache_data[sync_ctrl_dirty_line];
-                            write_through_req_payload.wmask = flush_read_cache_mask[sync_ctrl_dirty_line];
+                            write_through_req_payload.wdata = flush_full_data_q;
+                            write_through_req_payload.wmask = flush_full_mask_q;
                             write_through_valid = 1'b1;
                             if (write_through_ready) begin
                                 //clean up the dirty line
-                                flush_write_cache_addr                          = sync_ctrl_ptr_q;
-                                flush_write_cache_status[sync_ctrl_dirty_line]  = INVALID;
-                                flush_write_cache_dirty[sync_ctrl_dirty_line]   = 1'b0;
+                                flush_write_cache_addr                          = flush_full_addr_q;
+                                flush_write_cache_status[flush_full_way_q]      = INVALID;
+                                flush_write_cache_dirty[flush_full_way_q]       = 1'b0;
                                 flush_write_cache_req_valid                     = 1'b1;
+                                flush_full_data_valid_d                         = 1'b0;
+                                flush_full_wait_d                               = 1'b0;
                             end
                         end
                     end else begin
