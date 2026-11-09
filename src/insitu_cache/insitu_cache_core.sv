@@ -1025,7 +1025,11 @@ module insitu_cache_core
 
     // Hash-based way selection: deterministic way from address.
     // XOR low tag bits with low set-index bits for good distribution
-    // across ways for sequential access patterns.
+    // across ways for sequential access patterns. The top bits hold the
+    // bank-select bits the tile xbar rotates to the MSB; a partial private
+    // partition leaves some of them varying within one cache, so they are
+    // hashed too (else lines differing only there share set and way).
+    // Keep in sync with gen_hash_way_fsm and insitu_cache_decoder.
     way_ptr_t                                               hash_way_preread;
     if (UseHashWaySelect && SetAssociativity > 1) begin : gen_hash_way
         localparam int unsigned WayBits = $clog2(SetAssociativity);
@@ -1035,7 +1039,9 @@ module insitu_cache_core
             preread_arbiter_payload.task_pay.request.addr[TagLo +: WayBits];
         wire [WayBits-1:0] preread_depth_bits =
             preread_arbiter_payload.task_pay.request.addr[DepthLo +: WayBits];
-        assign hash_way_preread = way_ptr_t'(preread_tag_bits ^ preread_depth_bits);
+        wire [WayBits-1:0] preread_top_bits =
+            preread_arbiter_payload.task_pay.request.addr[ReqAddrWidth-1 -: WayBits];
+        assign hash_way_preread = way_ptr_t'(preread_tag_bits ^ preread_depth_bits ^ preread_top_bits);
     end else begin : gen_no_hash_way
         assign hash_way_preread = '0;
     end
@@ -1474,7 +1480,9 @@ module insitu_cache_core
             preread_task_q.task_pay.request.addr[TagLo +: WayBits];
         wire [WayBits-1:0] fsm_depth_bits =
             preread_task_q.task_pay.request.addr[DepthLo +: WayBits];
-        assign hash_way_fsm = way_ptr_t'(fsm_tag_bits ^ fsm_depth_bits);
+        wire [WayBits-1:0] fsm_top_bits =
+            preread_task_q.task_pay.request.addr[ReqAddrWidth-1 -: WayBits];
+        assign hash_way_fsm = way_ptr_t'(fsm_tag_bits ^ fsm_depth_bits ^ fsm_top_bits);
     end else begin : gen_no_hash_way_fsm
         assign hash_way_fsm = '0;
     end

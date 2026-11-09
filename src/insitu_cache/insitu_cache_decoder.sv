@@ -109,12 +109,15 @@ logic                    _status_s0;     // status[0]
 
 assign {_tag, _depth, _ofst} = cache_task_i.task_pay.request.addr;
 
+// Same hash as insitu_cache_core gen_hash_way: low tag ^ low set index ^ top address bits.
 assign _hash_way = (SetAssociativity > 1)
     ? way_ptr_t'(
         cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8) + $clog2(CacheBankDepth)
                                            +: $clog2(SetAssociativity)] ^
         cache_task_i.task_pay.request.addr[$clog2(CacheLineWidth/8)
-                                           +: $clog2(SetAssociativity)])
+                                           +: $clog2(SetAssociativity)] ^
+        cache_task_i.task_pay.request.addr[$bits(cache_task_i.task_pay.request.addr)-1
+                                           -: $clog2(SetAssociativity)])
     : '0;
 
 assign dec_cache_status_o   = bank_read_cache_status_i[dec_way_o];

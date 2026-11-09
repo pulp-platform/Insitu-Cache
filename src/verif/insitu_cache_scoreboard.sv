@@ -61,8 +61,9 @@ module insitu_cache_scoreboard
     input  logic rst_ni,
 
     // -- Flush / init commits (one entry per cycle when valid && ready) --
-    // Writes ALL ways' meta at the given depth in one shot.
+    // Writes the meta of the ways in flush_commit_way_mask at the given depth in one shot.
     input  logic                                                          flush_commit_valid,
+    input  logic [SetAssociativity-1:0]                                   flush_commit_way_mask,
     input  logic [$clog2(CacheBankDepth)-1:0]                             flush_commit_addr,
     input  cache_status_t [SetAssociativity-1:0]                          flush_commit_status,
     input  logic [SetAssociativity-1:0]                                   flush_commit_dirty,
@@ -310,20 +311,22 @@ module insitu_cache_scoreboard
             n_flush_commits <= 0;
             n_proc_commits  <= 0;
         end else begin
-            // -- Flush / init: writes ALL ways at the given depth. --
+            // -- Flush / init: writes the masked ways at the given depth. --
             // For init (insn=2'b11), all flush_commit_status[w] are
             // INVALID and flush_commit_dirty[w]=0, so the line gets
             // invalidated.
             if (flush_commit_valid) begin
                 for (int w = 0; w < SetAssociativity; w++) begin
-                    sb_meta[flush_commit_addr][w] <= '{
-                        valid: (flush_commit_status[w] == VALID),
-                        dirty: flush_commit_dirty[w],
-                        tag:   flush_commit_tag[w]
-                    };
-                    // Flush moves the line out of READ_PEND -- clear MSHR
-                    // tracker so a later allocation starts from 0.
-                    sb_mshr_count[flush_commit_addr][w] <= 0;
+                    if (flush_commit_way_mask[w]) begin
+                        sb_meta[flush_commit_addr][w] <= '{
+                            valid: (flush_commit_status[w] == VALID),
+                            dirty: flush_commit_dirty[w],
+                            tag:   flush_commit_tag[w]
+                        };
+                        // Flush moves the line out of READ_PEND -- clear MSHR
+                        // tracker so a later allocation starts from 0.
+                        sb_mshr_count[flush_commit_addr][w] <= 0;
+                    end
                 end
                 n_flush_commits <= n_flush_commits + 1;
                 // -- Trace --

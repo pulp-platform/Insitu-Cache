@@ -415,6 +415,9 @@ module insitu_cache_tcdm_wrapper
     // Per-way upstream_write_ready_o (Phase 1 handshake; always-1 in Phase 1).
     logic                   [SetAssociativity - 1 : 0]      data_bank_write_ready;
     logic                   [SetAssociativity - 1 : 0]      meta_bank_write_ready;
+    // Ways whose meta and data banks both take a write this cycle (registered state only).
+    logic                   [SetAssociativity - 1 : 0]      flush_way_wr_ready;
+    assign flush_way_wr_ready = data_bank_write_ready & meta_bank_write_ready;
     logic                   [SetAssociativity - 1 : 0]      data_bank_write_hit;
     logic                   [SetAssociativity - 1 : 0]      data_bank_write_full_cov;
 
@@ -548,6 +551,9 @@ module insitu_cache_tcdm_wrapper
     logic          [PartIdxWidth-1:0]                       flush_read_part_idx;
     logic                                                   flush_read_all_parts;
     logic                   [SetAssociativity - 1 : 0]      flush_read_way_mask;
+    // Ways a flush write updates. The per-way cleanup after a dirty writeback only reads the
+    // target way (one-hot flush_read_way_mask), so writing the other ways would zero them.
+    logic                   [SetAssociativity - 1 : 0]      flush_write_way_mask;
 
     logic                                                   sync_ctrl_still_pending;
     logic                                                   sync_ctrl_has_dirty_line;
@@ -598,6 +604,9 @@ module insitu_cache_tcdm_wrapper
     `FFARN (flush_full_way_q, flush_full_way_d,              '0, clk_i, rst_ni)
     `FFARN (flush_full_data_valid_q, flush_full_data_valid_d,'0, clk_i, rst_ni)
     `FFARN (flush_full_wait_q, flush_full_wait_d,            '0, clk_i, rst_ni)
+    // Dirty line written back, its cleanup write still waiting for the target way.
+    logic                                                   flush_full_wb_sent_q, flush_full_wb_sent_d;
+    `FFARN (flush_full_wb_sent_q, flush_full_wb_sent_d,      '0, clk_i, rst_ni)
     logic                                                   flush_full_read_active;
     byte_offset_t                                           sync_ctrl_ofst;
 
@@ -776,6 +785,7 @@ module insitu_cache_tcdm_wrapper
             flush_full_way_d            = flush_full_way_q;
             flush_full_data_valid_d     = flush_full_data_valid_q;
             flush_full_wait_d           = flush_full_wait_q;
+            flush_full_wb_sent_d        = flush_full_wb_sent_q;
             flush_full_read_active      = 1'b0;
             sync_ctrl_ofst              = '0;
 
@@ -786,6 +796,7 @@ module insitu_cache_tcdm_wrapper
             flush_read_part_idx         = '0;
             flush_read_all_parts        = 1'b0;
             flush_read_way_mask         = {SetAssociativity{1'b1}};
+            flush_write_way_mask        = {SetAssociativity{1'b1}};
 
             flush_write_cache_status    = flush_read_cache_status;
             flush_write_cache_dirty     = flush_read_cache_dirty;
@@ -846,7 +857,7 @@ module insitu_cache_tcdm_wrapper
                     flush_write_cache_LRU       = '0;
 
                     flush_write_cache_req_valid = 1'b1;
-                    if (flush_write_cache_req_ready) begin
+                    if (~proc_write_select & (&flush_way_wr_ready)) begin
                         sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
                         if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
                             sync_ctrl_status_d = SYNC_CTRL_FINISH;
@@ -1003,9 +1014,12 @@ module insitu_cache_tcdm_wrapper
                             // before we can latch the tag/mask for the
                             // writeback.  If the read isn't aligned
                             // (proc-side contention or first cycle),
-                            // re-issue and wait.
+                            // re-issue and wait.  The read must also have
+                            // covered the dirty way: after a previous way's
+                            // one-hot data read the others read as zero.
                             if (~(flush_read_select_q
-                                  && (bank_read_cache_addr_q == sync_ctrl_ptr_q))) begin
+                                  && (bank_read_cache_addr_q == sync_ctrl_ptr_q)
+                                  && bank_read_way_mask_q[sync_ctrl_dirty_line])) begin
                                 flush_read_cache_addr = sync_ctrl_ptr_q;
                                 flush_read_cache_valid = 1'b1;
                                 // Don't advance into wait state yet.
@@ -1030,21 +1044,31 @@ module insitu_cache_tcdm_wrapper
                         end
 
                         if (flush_full_data_valid_q) begin
-                            //Try to evict dirty line
-                            write_through_req_payload.addr  = {flush_full_tag_q, flush_full_addr_q, sync_ctrl_ofst};
-                            write_through_req_payload.info  = '0;
-                            write_through_req_payload.write = 1'b1;
-                            write_through_req_payload.wdata = flush_full_data_q;
-                            write_through_req_payload.wmask = flush_full_mask_q;
-                            write_through_valid = 1'b1;
-                            if (write_through_ready) begin
-                                //clean up the dirty line
+                            //Try to evict dirty line (once)
+                            if (~flush_full_wb_sent_q) begin
+                                write_through_req_payload.addr  = {flush_full_tag_q, flush_full_addr_q, sync_ctrl_ofst};
+                                write_through_req_payload.info  = '0;
+                                write_through_req_payload.write = 1'b1;
+                                write_through_req_payload.wdata = flush_full_data_q;
+                                write_through_req_payload.wmask = flush_full_mask_q;
+                                write_through_valid = 1'b1;
+                                if (write_through_ready) begin
+                                    flush_full_wb_sent_d = 1'b1;
+                                end
+                            end
+                            //clean up the dirty line, retried until the target way accepts it
+                            if (flush_full_wb_sent_q || write_through_ready) begin
                                 flush_write_cache_addr                          = flush_full_addr_q;
                                 flush_write_cache_status[flush_full_way_q]      = INVALID;
                                 flush_write_cache_dirty[flush_full_way_q]       = 1'b0;
+                                flush_write_way_mask                            = '0;
+                                flush_write_way_mask[flush_full_way_q]          = 1'b1;
                                 flush_write_cache_req_valid                     = 1'b1;
-                                flush_full_data_valid_d                         = 1'b0;
-                                flush_full_wait_d                               = 1'b0;
+                                if (~proc_write_select & flush_way_wr_ready[flush_full_way_q]) begin
+                                    flush_full_data_valid_d                     = 1'b0;
+                                    flush_full_wait_d                           = 1'b0;
+                                    flush_full_wb_sent_d                        = 1'b0;
+                                end
                             end
                         end
                     end else begin
@@ -1058,11 +1082,15 @@ module insitu_cache_tcdm_wrapper
                         flush_write_cache_LRU       = '0;
 
                         flush_write_cache_req_valid = 1'b1;
-                        sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
                         flush_full_data_valid_d = 1'b0;
                         flush_full_wait_d = 1'b0;
-                        if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
-                            sync_ctrl_status_d = SYNC_CTRL_FINISH;
+                        flush_full_wb_sent_d = 1'b0;
+                        // Advance only once every way has taken the write (a busy way drops it)
+                        if (~proc_write_select & (&flush_way_wr_ready)) begin
+                            sync_ctrl_ptr_d = sync_ctrl_ptr_q + 1'b1;
+                            if (sync_ctrl_ptr_q == (CacheBankDepth - 1)) begin
+                                sync_ctrl_status_d = SYNC_CTRL_FINISH;
+                            end
                         end
                     end
 
@@ -1505,7 +1533,9 @@ module insitu_cache_tcdm_wrapper
     assign proc_write_select           = proc_write_cache_req | proc_write_LRU_req;
     assign bank_write_cache_req        = proc_write_select? proc_write_cache_req : flush_write_cache_req_valid;
     assign bank_write_LRU_req          = proc_write_select? proc_write_LRU_req : flush_write_cache_req_valid;
-    assign flush_write_cache_req_ready = ~proc_write_select;
+    // A flush write lands only when every way it targets takes it.
+    assign flush_write_cache_req_ready = ~proc_write_select
+                                       & (&(flush_way_wr_ready | ~flush_write_way_mask));
 
     assign bank_write_cache_addr       = proc_write_select? proc_write_cache_addr : flush_write_cache_addr;
     assign bank_write_cache_status     = proc_write_select? proc_write_cache_status : flush_write_cache_status;
@@ -1618,7 +1648,7 @@ module insitu_cache_tcdm_wrapper
     // With hash way select, only update the TARGET way's dirty bit
     // to prevent the encoder's passthrough from corrupting non-target
     // ways (which were not read from SRAM and may carry stale data).
-    // Flush writes still update all ways (proc_write_select = 0).
+    // Flush writes update the ways in flush_write_way_mask (proc_write_select = 0).
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
             dirty_rf <= '0;
@@ -1626,8 +1656,14 @@ module insitu_cache_tcdm_wrapper
             if (UseHashWaySelect && proc_write_select) begin
                 dirty_rf[bank_write_cache_addr][proc_write_cache_way] <=
                     bank_write_cache_dirty[proc_write_cache_way];
-            end else begin
+            end else if (proc_write_select) begin
                 dirty_rf[bank_write_cache_addr] <= bank_write_cache_dirty;
+            end else if (flush_write_cache_req_ready) begin
+                for (int unsigned w = 0; w < SetAssociativity; w++) begin
+                    if (flush_write_way_mask[w]) begin
+                        dirty_rf[bank_write_cache_addr][w] <= bank_write_cache_dirty[w];
+                    end
+                end
             end
         end
     end
@@ -1709,9 +1745,10 @@ module insitu_cache_tcdm_wrapper
             .upstream_write_addr_i       (bank_write_cache_addr),
             // T2.6: flat (proc-arm | flush-broadcast). proc_write_cache_req is 0
             // whenever proc_write_select=0, so the proc term vanishes and flush
-            // broadcasts to every way -- equivalent to the prior nested mux.
+            // broadcasts to the ways in flush_write_way_mask (all, except per-way cleanup).
             .upstream_write_req_i        ((proc_write_cache_req & (proc_write_cache_way == way_ptr_t'(i)))
-                                          | (~proc_write_select & flush_write_cache_req_valid)),
+                                          | (~proc_write_select & flush_write_cache_req_valid
+                                             & flush_write_way_mask[i])),
             .upstream_write_data_i       (bank_write_cache_data[i]),
             .upstream_write_mask_i       (bank_write_data_mask_sel[i]),
             .upstream_write_mask_any_i   (bank_write_data_mask_any_sel[i]),
@@ -1816,7 +1853,8 @@ module insitu_cache_tcdm_wrapper
             // kept verbatim; proc_write_cache_req=0 when proc_write_select=0.
             .upstream_write_req_i        ((proc_write_cache_req & ~bank_write_meta_skip & ~mc_suppress_meta_write
                                            & (proc_write_cache_way == way_ptr_t'(i)))
-                                          | (~proc_write_select & flush_write_cache_req_valid)),
+                                          | (~proc_write_select & flush_write_cache_req_valid
+                                             & flush_write_way_mask[i])),
             .upstream_write_data_i       (cache_meta_write_data[i]),
             .upstream_write_mask_i       ('1    ),
             .upstream_write_mask_any_i   (1'b1  ),
@@ -1949,8 +1987,8 @@ module insitu_cache_tcdm_wrapper
         .clk_i               (clk_i ),
         .rst_ni              (rst_ni),
 
-        .flush_commit_valid  (flush_write_cache_req_valid &&  bank_write_cache_ready
-                                                       && !proc_write_select),
+        .flush_commit_valid  (flush_write_cache_req_valid && flush_write_cache_req_ready),
+        .flush_commit_way_mask (flush_write_way_mask   ),
         .flush_commit_addr   (flush_write_cache_addr   ),
         .flush_commit_status (flush_write_cache_status ),
         .flush_commit_dirty  (flush_write_cache_dirty  ),
