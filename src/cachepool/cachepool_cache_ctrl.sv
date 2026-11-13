@@ -20,6 +20,8 @@ module cachepool_cache_ctrl #(
   parameter int unsigned NumPorts                                         = 10,
   /// Coalescer Extned Factor
   parameter int unsigned CoalExtFactor                                    = 1,
+  /// Number of ports at the top of the port list that skip the coalescer (one per scalar core)
+  parameter int unsigned NumBypassPorts                                   = 1,
   /// Meta information payload from spatz/snitch
   parameter type         core_meta_t                                      = logic[7:0],
   /// Address width of both narrow request from spatz
@@ -194,13 +196,18 @@ module cachepool_cache_ctrl #(
   localparam int unsigned                                                 LineOfstBits = $clog2(CacheLineWidth/8);
   localparam int unsigned                                                 CoalescerLineOfstBits = $clog2(CoalescerDataWidth/8);
   localparam int unsigned                                                 WordOfstBits = $clog2(WordWidth/8);
-  localparam int unsigned                                                 CoalPorts = (NumPorts - 1) * CoalExtFactor;
+  // Ports [NumCoalPorts-1:0] go through the coalescer, the NumBypassPorts above them bypass it
+  localparam int unsigned                                                 NumCoalPorts = NumPorts - NumBypassPorts;
+  localparam int unsigned                                                 CoalPorts = NumCoalPorts * CoalExtFactor;
+  localparam int unsigned                                                 BypassPortWidth =
+    (NumBypassPorts > 1) ? $clog2(NumBypassPorts) : 1;
+  typedef logic [BypassPortWidth-1:0]                                     bypass_port_t;
 
   typedef struct packed {
     logic                                                                 id;
-    logic       [(NumPorts-1) * CoalExtFactor - 1:0]                      hitmap;
-    coal_ofst_t [(NumPorts-1) * CoalExtFactor - 1:0]                      ofsts;
-    core_meta_t [(NumPorts-1) * CoalExtFactor - 1:0]                      infos;
+    logic       [CoalPorts-1:0]                                           hitmap;
+    coal_ofst_t [CoalPorts-1:0]                                           ofsts;
+    core_meta_t [CoalPorts-1:0]                                           infos;
     logic                                                                 bypass_coalescer;
   } coalescing_info_t;
 
@@ -226,9 +233,11 @@ module cachepool_cache_ctrl #(
   localparam int unsigned                                                 BypassAddrOfstWidth = $clog2(CoalescerDataWidth/WordWidth);
   typedef logic [BypassAddrOfstWidth-1:0]                                 bypass_addr_ofst_t;
   // part_idx overlays coal_cache_info_t.part_idx, so both union members share it
+  // port: the bypass port the request came from, which its response returns to
   typedef struct packed {
     part_idx_t                                                            part_idx;
-    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-1-1:0] padding;
+    logic [$bits(coalescing_info_t)-$bits(core_meta_t)-BypassAddrOfstWidth-BypassPortWidth-1-1:0] padding;
+    bypass_port_t                                                         port;
     core_meta_t                                                           core_meta;
     bypass_addr_ofst_t                                                    addr_offset;
     logic                                                                 bypass_coalescer;
@@ -246,6 +255,9 @@ module cachepool_cache_ctrl #(
   `ifndef SYNTHESIS
   // Ensure the packed union members overlay cleanly
   initial begin
+    if (NumBypassPorts < 1 || NumBypassPorts >= NumPorts) begin
+      $error("NumBypassPorts=%0d must be in [1, NumPorts-1], NumPorts=%0d", NumBypassPorts, NumPorts);
+    end
     if ($bits(bypass_info_t) != $bits(coal_cache_info_t)) begin
       $error("Width mismatch: bypass_info_t=%0d, coal_cache_info_t=%0d",
             $bits(bypass_info_t), $bits(coal_cache_info_t));
@@ -318,24 +330,26 @@ module cachepool_cache_ctrl #(
     return strb;
   endfunction
 
-  coal_data_t bypass_pad_data;
-  bypass_addr_ofst_t bypass_word_index;
-  part_idx_t bypass_part_idx;
+  coal_data_t        [NumBypassPorts-1:0] bypass_pad_data;
+  bypass_addr_ofst_t [NumBypassPorts-1:0] bypass_word_index;
+  part_idx_t         [NumBypassPorts-1:0] bypass_part_idx;
   coal_ofst_t coalescing_first_ofst;
   logic [CoalescerLineOfstBits-1:0] coalescing_line_ofst;
   addr_t coalescing_req_addr_with_ofst;
 
-  // Snitch word position inside its CoalescerDataWidth part
-  assign bypass_word_index =
-    core_req_addr_i[NumPorts-1][CoalescerLineOfstBits-1:WordOfstBits];
-  assign bypass_part_idx =
-    (PartSplit > 1) ? core_req_addr_i[NumPorts-1][CoalescerLineOfstBits +: PartIdxWidth] : '0;
+  for (genvar b = 0; b < NumBypassPorts; b++) begin : gen_bypass_word
+    // Snitch word position inside its CoalescerDataWidth part
+    assign bypass_word_index[b] =
+      core_req_addr_i[NumCoalPorts+b][CoalescerLineOfstBits-1:WordOfstBits];
+    assign bypass_part_idx[b] =
+      (PartSplit > 1) ? core_req_addr_i[NumCoalPorts+b][CoalescerLineOfstBits +: PartIdxWidth] : '0;
 
-  always_comb begin
-    bypass_pad_data = '0;
-    // Data from the core is already aligned to the byte lane indicated by strb.
-    bypass_pad_data[bypass_word_index * WordWidth +: WordWidth] =
-      core_req_wdata_i[NumPorts-1];
+    always_comb begin
+      bypass_pad_data[b] = '0;
+      // Data from the core is already aligned to the byte lane indicated by strb.
+      bypass_pad_data[b][bypass_word_index[b] * WordWidth +: WordWidth] =
+        core_req_wdata_i[NumCoalPorts+b];
+    end
   end
   always_comb begin
     logic found;
@@ -367,7 +381,7 @@ module cachepool_cache_ctrl #(
   //0.Coalescer
   par_coalescer_top #(
     .ReqAddrWidth           (AddrWidth            ),
-    .NumPorts               (NumPorts - 1         ), // Only spatz vlsu goes through coalescer
+    .NumPorts               (NumCoalPorts         ), // Only spatz vlsu goes through coalescer
     .ExtFactor              (CoalExtFactor        ),
     .info_t                 (core_meta_t          ),
     .down_id_t              (logic                ),
@@ -379,19 +393,19 @@ module cachepool_cache_ctrl #(
     .rst_ni,
     .id_i                   ('0                   ),
 
-    .upstream_req_valid_i   (core_req_valid_i [NumPorts-2:0]    ),
-    .upstream_req_ready_o   (core_req_ready_o [NumPorts-2:0]    ),
-    .upstream_req_addr_i    (core_req_addr_i  [NumPorts-2:0]    ),
-    .upstream_req_info_i    (core_req_meta_i  [NumPorts-2:0]    ),
-    .upstream_req_write_i   (core_req_write_i [NumPorts-2:0]    ),
-    .upstream_req_wdata_i   (core_req_wdata_i [NumPorts-2:0]    ),
-    .upstream_req_wstrb_i   (core_req_wstrb_i [NumPorts-2:0]    ),
+    .upstream_req_valid_i   (core_req_valid_i [NumCoalPorts-1:0]),
+    .upstream_req_ready_o   (core_req_ready_o [NumCoalPorts-1:0]),
+    .upstream_req_addr_i    (core_req_addr_i  [NumCoalPorts-1:0]),
+    .upstream_req_info_i    (core_req_meta_i  [NumCoalPorts-1:0]),
+    .upstream_req_write_i   (core_req_write_i [NumCoalPorts-1:0]),
+    .upstream_req_wdata_i   (core_req_wdata_i [NumCoalPorts-1:0]),
+    .upstream_req_wstrb_i   (core_req_wstrb_i [NumCoalPorts-1:0]),
 
-    .upstream_resp_valid_o  (core_resp_valid_o[NumPorts-2:0]    ),
-    .upstream_resp_ready_i  (core_resp_ready_i[NumPorts-2:0]    ),
-    .upstream_resp_write_o  (core_resp_write_o[NumPorts-2:0]    ),
-    .upstream_resp_data_o   (core_resp_data_o [NumPorts-2:0]    ),
-    .upstream_resp_info_o   (core_resp_meta_o [NumPorts-2:0]    ),
+    .upstream_resp_valid_o  (core_resp_valid_o[NumCoalPorts-1:0]),
+    .upstream_resp_ready_i  (core_resp_ready_i[NumCoalPorts-1:0]),
+    .upstream_resp_write_o  (core_resp_write_o[NumCoalPorts-1:0]),
+    .upstream_resp_data_o   (core_resp_data_o [NumCoalPorts-1:0]),
+    .upstream_resp_info_o   (core_resp_meta_o [NumCoalPorts-1:0]),
 
     .downstream_req_valid_o (coalescing_req_valid ),
     .downstream_req_ready_i (coalescing_req_ready ),
@@ -423,8 +437,10 @@ module cachepool_cache_ctrl #(
     logic                       write;
   } drsp_chan_t;
 
-  dreq_chan_t coalescer_req, bypass_req, bypass_xbar_req;
-  drsp_chan_t bypass_xbar_resp, coalescer_resp, bypass_resp;
+  dreq_chan_t coalescer_req, bypass_xbar_req;
+  drsp_chan_t bypass_xbar_resp, coalescer_resp;
+  dreq_chan_t [NumBypassPorts-1:0] bypass_req;
+  drsp_chan_t [NumBypassPorts-1:0] bypass_resp;
 
   assign coalescer_req = '{
     addr    : coalescing_req_addr_with_ofst,
@@ -440,23 +456,26 @@ module cachepool_cache_ctrl #(
   };
 
   // Snitch always accepts a word-width aligned response
-  assign bypass_req = '{
-    addr    : core_req_addr_i [NumPorts-1],
-    info    : coalescer_xbar_info_union_t'(
-      bypass_info_t'{
-        part_idx   : bypass_part_idx,
-        padding    : '0,
-        core_meta  : core_req_meta_i[NumPorts-1],
-        addr_offset: bypass_word_index,
-        bypass_coalescer: 1'b1
-      }
-    ),
-    write   : core_req_write_i[NumPorts-1],
-    wdata   : bypass_pad_data,
-    wmask   :
-      core_req_wstrb_i[NumPorts-1][WordWidth/ByteWidth-1:0] <<
-        (WordWidth/ByteWidth * bypass_word_index)
-  };
+  for (genvar b = 0; b < NumBypassPorts; b++) begin : gen_bypass_req
+    assign bypass_req[b] = '{
+      addr    : core_req_addr_i [NumCoalPorts+b],
+      info    : coalescer_xbar_info_union_t'(
+        bypass_info_t'{
+          part_idx   : bypass_part_idx[b],
+          padding    : '0,
+          port       : bypass_port_t'(b),
+          core_meta  : core_req_meta_i[NumCoalPorts+b],
+          addr_offset: bypass_word_index[b],
+          bypass_coalescer: 1'b1
+        }
+      ),
+      write   : core_req_write_i[NumCoalPorts+b],
+      wdata   : bypass_pad_data[b],
+      wmask   :
+        core_req_wstrb_i[NumCoalPorts+b][WordWidth/ByteWidth-1:0] <<
+          (WordWidth/ByteWidth * bypass_word_index[b])
+    };
+  end
 
   // Expand the xbar output to the cache line at its part; extract the part on the response
   always_comb begin
@@ -475,13 +494,11 @@ module cachepool_cache_ctrl #(
     write   : bypass_xbar_resp_write,
     meta    : bypass_xbar_resp_info
   };
-  logic bypass_xbar_resp_sel;
-  always_comb begin
-    bypass_xbar_resp_sel = 1'b0;
-    if (bypass_xbar_resp_info.bypass.bypass_coalescer === 1'b1) begin
-      bypass_xbar_resp_sel = 1'b1;
-    end
-  end
+  // xbar input a response returns to: 0 for the coalescer, 1 + port for a bypass port
+  localparam int unsigned NumXbarInp = 1 + NumBypassPorts;
+  typedef logic [$clog2(NumXbarInp)-1:0] xbar_inp_sel_t;
+
+  xbar_inp_sel_t bypass_xbar_resp_sel, l1_bypass_rsp_sel;
 
   // L1 bypass output of the xbar (to the refill port)
   dreq_chan_t l1_bypass_req;
@@ -489,19 +506,44 @@ module cachepool_cache_ctrl #(
   drsp_chan_t l1_bypass_rsp;
   logic       l1_bypass_rsp_valid, l1_bypass_rsp_ready;
 
-  // Bypass decision per xbar input (0: coalescer, 1: snitch), on the un-rotated address
-  addr_t [1:0] xbar_in_addr, xbar_in_addr_unrot;
-  logic  [1:0] xbar_in_l1_bypass;
+  assign bypass_xbar_resp_sel = (bypass_xbar_resp_info.bypass.bypass_coalescer === 1'b1) ?
+                                xbar_inp_sel_t'(bypass_xbar_resp_info.bypass.port) + 1'b1 : '0;
+  assign l1_bypass_rsp_sel    = (l1_bypass_rsp.meta.bypass.bypass_coalescer === 1'b1) ?
+                                xbar_inp_sel_t'(l1_bypass_rsp.meta.bypass.port) + 1'b1 : '0;
 
-  assign xbar_in_addr = {bypass_req.addr, coalescer_req.addr};
+  // xbar inputs: 0 is the coalescer, 1 + b is bypass port b
+  dreq_chan_t [NumXbarInp-1:0] xbar_in_req;
+  drsp_chan_t [NumXbarInp-1:0] xbar_in_rsp;
+  logic       [NumXbarInp-1:0] xbar_in_req_valid, xbar_in_req_ready;
+  logic       [NumXbarInp-1:0] xbar_in_rsp_valid, xbar_in_rsp_ready;
 
-  for (genvar i = 0; i < 2; i++) begin : gen_l1_bypass_sel
+  assign xbar_in_req      [0]  = coalescer_req;
+  assign xbar_in_req_valid[0]  = coalescing_req_valid;
+  assign coalescing_req_ready  = xbar_in_req_ready[0];
+  assign coalescer_resp        = xbar_in_rsp[0];
+  assign coalescing_resp_valid = xbar_in_rsp_valid[0];
+  assign xbar_in_rsp_ready[0]  = coalescing_resp_ready;
+
+  for (genvar b = 0; b < NumBypassPorts; b++) begin : gen_bypass_xbar_in
+    assign xbar_in_req      [1+b]           = bypass_req[b];
+    assign xbar_in_req_valid[1+b]           = core_req_valid_i[NumCoalPorts+b];
+    assign core_req_ready_o [NumCoalPorts+b] = xbar_in_req_ready[1+b];
+    assign bypass_resp      [b]             = xbar_in_rsp[1+b];
+    assign core_resp_valid_o[NumCoalPorts+b] = xbar_in_rsp_valid[1+b];
+    assign xbar_in_rsp_ready[1+b]           = core_resp_ready_i[NumCoalPorts+b];
+  end
+
+  // Bypass decision per xbar input, on the un-rotated address
+  addr_t [NumXbarInp-1:0] xbar_in_addr_unrot;
+  logic  [NumXbarInp-1:0] xbar_in_l1_bypass;
+
+  for (genvar i = 0; i < NumXbarInp; i++) begin : gen_l1_bypass_sel
     cachepool_addr_unrotate #(
       .AddrWidth (AddrWidth       ),
       .RotWidth  (AddrRotWidth    ),
       .OfstWidth (AddrRotOfstWidth)
     ) i_addr_unrotate (
-      .addr_i     (xbar_in_addr[i]      ),
+      .addr_i     (xbar_in_req[i].addr  ),
       .rot_bits_i (addr_rot_bits_i      ),
       .ofst_i     (addr_rot_ofst_i      ),
       .addr_o     (xbar_in_addr_unrot[i])
@@ -512,7 +554,7 @@ module cachepool_cache_ctrl #(
   end
 
   reqrsp_xbar #(
-    .NumInp           (2                ),
+    .NumInp           (NumXbarInp       ),
     .NumOut           (2                ),
     .PipeReg          (1'b0             ),
     .ExtReqPrio       (1'b0             ),
@@ -522,12 +564,12 @@ module cachepool_cache_ctrl #(
   ) i_bypass_xbar (
     .clk_i            (clk_i            ),
     .rst_ni           (rst_ni           ),
-    .slv_req_i        ({bypass_req                   , coalescer_req       } ),
-    .slv_req_valid_i  ({core_req_valid_i[NumPorts-1] , coalescing_req_valid} ),
-    .slv_req_ready_o  ({core_req_ready_o[NumPorts-1] , coalescing_req_ready} ),
-    .slv_rsp_o        ({bypass_resp                  , coalescer_resp      } ),
-    .slv_rsp_valid_o  ({core_resp_valid_o[NumPorts-1], coalescing_resp_valid} ),
-    .slv_rsp_ready_i  ({core_resp_ready_i[NumPorts-1], coalescing_resp_ready} ),
+    .slv_req_i        (xbar_in_req      ),
+    .slv_req_valid_i  (xbar_in_req_valid),
+    .slv_req_ready_o  (xbar_in_req_ready),
+    .slv_rsp_o        (xbar_in_rsp      ),
+    .slv_rsp_valid_o  (xbar_in_rsp_valid),
+    .slv_rsp_ready_i  (xbar_in_rsp_ready),
     .slv_sel_i        (xbar_in_l1_bypass),
     .slv_rr_i         ('0               ),
     .slv_selected_o   (                 ),
@@ -537,7 +579,7 @@ module cachepool_cache_ctrl #(
     .mst_rsp_i        ({l1_bypass_rsp       , bypass_xbar_resp      } ),
     .mst_rsp_valid_i  ({l1_bypass_rsp_valid , bypass_xbar_resp_valid} ),
     .mst_rsp_ready_o  ({l1_bypass_rsp_ready , bypass_xbar_resp_ready} ),
-    .mst_sel_i        ({l1_bypass_rsp.meta.bypass.bypass_coalescer, bypass_xbar_resp_sel}),
+    .mst_sel_i        ({l1_bypass_rsp_sel, bypass_xbar_resp_sel}),
     .mst_rr_i         ('0               )
   );
 
@@ -546,9 +588,12 @@ module cachepool_cache_ctrl #(
   assign coalescing_resp_info  = coalescer_resp.meta.coal.coal;
   assign coalescing_resp_write = coalescer_resp.write;
     // resp xbar to snitch
-  assign core_resp_write_o[NumPorts-1]    = bypass_resp.write;
-  assign core_resp_data_o [NumPorts-1]    = bypass_resp.data[bypass_resp.meta.bypass.addr_offset * WordWidth +: WordWidth];
-  assign core_resp_meta_o [NumPorts-1]    = bypass_resp.meta.bypass.core_meta;
+  for (genvar b = 0; b < NumBypassPorts; b++) begin : gen_bypass_resp
+    assign core_resp_write_o[NumCoalPorts+b] = bypass_resp[b].write;
+    assign core_resp_data_o [NumCoalPorts+b] =
+      bypass_resp[b].data[bypass_resp[b].meta.bypass.addr_offset * WordWidth +: WordWidth];
+    assign core_resp_meta_o [NumCoalPorts+b] = bypass_resp[b].meta.bypass.core_meta;
+  end
 
   //2.Insitu-Cache controller
   insitu_cache_tcdm_wrapper #(
