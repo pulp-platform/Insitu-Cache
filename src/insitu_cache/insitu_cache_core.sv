@@ -841,7 +841,12 @@ module insitu_cache_core
         .ready_i (downstream_refill_ready_raw),
         .data_o  (downstream_refill_payload)
     );
-    assign evict_full_block = (cache_status_q == EVIC_STALL) && (PartSplit > 1);
+    // Refills are held off only while the victim line is read through the bank port. Once it is
+    // captured, the wait for eviction FIFO space depends on the refill port, so blocking refills
+    // there would deadlock the refill network. The EVIC_STALL exit waits for a cycle without a
+    // refill bank write (see t39_defer_arm).
+    assign evict_full_block = (cache_status_q == EVIC_STALL) && (PartSplit > 1) &&
+                              !evict_full_data_valid_q;
     assign preread_refill_allowed = ~preread_arbiter_payload.is_refill |
                                     (~evict_full_block &
                                      (preread_arbiter_payload.task_pay.refill.info.for_write_pend |
@@ -1418,7 +1423,7 @@ module insitu_cache_core
     //       guard preread_task_q.valid & is_refill      -> .refill.info.way/.depth
     //   deferred (EVIC_STALL case arm):
     //       guard cache_status_q==EVIC_STALL & PartSplit>1 & evict_full_data_valid_q
-    //             & ~evic_fifo_full & deferred_bank_write_q.valid
+    //             & ~evic_fifo_full & ~refill arm & deferred_bank_write_q.valid
     //                                                  -> deferred_bank_write_q.way/.addr
     //   request  (REQ_PROC case arm):
     //       guard cache_status_q==REQ_PROC & preread_task_q.valid & ~is_refill
@@ -1437,7 +1442,7 @@ module insitu_cache_core
 
     assign t39_refill_arm = preread_task_q.valid & preread_task_q.is_refill;
     assign t39_defer_arm  = (cache_status_q == EVIC_STALL) & (PartSplit > 1)
-                          & evict_full_data_valid_q & ~evic_fifo_full
+                          & evict_full_data_valid_q & ~evic_fifo_full & ~t39_refill_arm
                           & deferred_bank_write_q.valid;
     assign t39_req_arm    = (cache_status_q == REQ_PROC) & preread_task_q.valid
                           & ~preread_task_q.is_refill;
@@ -2444,7 +2449,9 @@ module insitu_cache_core
                     end
 
                     if (evict_full_data_valid_q) begin
-                        if (~evic_fifo_full) begin
+                        // A refill bank write this cycle has the port, so the exit with its
+                        // deferred write waits for the next cycle
+                        if (~evic_fifo_full && ~t39_refill_arm) begin
                             evic_fifo_in.addr = fsm_evic_stall_q.addr;
                             evic_fifo_in.wdata = evict_full_data_q;
                             evic_fifo_in.wmask = fsm_evic_stall_q.wmask;

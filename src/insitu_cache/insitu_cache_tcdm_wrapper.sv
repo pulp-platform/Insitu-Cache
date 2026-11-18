@@ -2061,6 +2061,7 @@ module insitu_cache_tcdm_wrapper
     );
 `endif
 
+
 endmodule
 
 
@@ -2948,6 +2949,16 @@ module insitu_cache_bank_access_controller #(
 
                 default : access_status_d = ACCESS_THROUGH;
             endcase
+
+            // A read that goes to the SRAM must also hold the skewed-column grant, including when
+            // this way writes in the same cycle (read during write, concurrent writeback). A write of
+            // another way to the same column wins it, and the column then reads that way's row:
+            // squash only the read so it retries. The grant depends on the writes only, so this adds
+            // no loop.
+            if (downstream_read_valid_o && (bank_gnt_i == '0)) begin
+                upstream_read_ready_o   = '0;
+                downstream_read_valid_o = '0;
+            end
         end
     end
 
