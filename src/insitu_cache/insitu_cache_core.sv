@@ -2340,6 +2340,7 @@ module insitu_cache_core
                             //13 Process to all-pend stall
                             //13.1 Prepare all-pend meta-data
                             fsm_refill_stall_d = preread_task_q.task_pay.request;
+                            fsm_refill_way_d = req_way_tmp;
 
                             //13.2 Change status and stop preread for request
                             cache_status_d = ALL_PEND_STALL;
@@ -2734,8 +2735,11 @@ module insitu_cache_core
             Process ALL-Pend stall when refill match pending request depth
             ***
             */
-            if (cache_status_q == ALL_PEND_STALL && 
-                preread_task_q.task_pay.refill.info.depth == refill_req_depth_tmp ) begin : proc_refill_all_pend
+            // With hash way select the stalled request may only take its own (hash) way
+            if (cache_status_q == ALL_PEND_STALL &&
+                preread_task_q.task_pay.refill.info.depth == refill_req_depth_tmp &&
+                (!UseHashWaySelect ||
+                 preread_task_q.task_pay.refill.info.way == fsm_refill_way_q)) begin : proc_refill_all_pend
 
                 /*Use the refilled cache line to replace*/
                 //7. Generate pending line
